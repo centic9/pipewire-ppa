@@ -1,3 +1,10 @@
+pipewire (0.3.48-1ubuntu3~ppa1) jammy; urgency=medium
+
+  * Revert patch https://gitlab.freedesktop.org/pipewire/pipewire/-/commit/c4997fc46d4846e3d11eb7e1b9374614348c6666
+    to allow moving sources even if they declare DONT_MOVE
+
+ -- Dominik Stadler (Ubuntu key) <dominik.stadler@gmx.at>  Mon, 23 Jan 2023 09:27:11 +0100
+
 pipewire (0.3.48-1ubuntu3) jammy; urgency=medium
 
   * Revert the previous change to resolve a regression with screencasting.
