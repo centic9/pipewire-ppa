@@ -1,0 +1,28 @@
+Index: git/src/modules/module-protocol-pulse/pulse-server.c
+===================================================================
+--- git.orig/src/modules/module-protocol-pulse/pulse-server.c	2023-01-23 09:24:22.543487033 +0100
++++ git/src/modules/module-protocol-pulse/pulse-server.c	2023-01-23 09:26:20.227802727 +0100
+@@ -4630,7 +4630,6 @@
+ 	int target_id;
+ 	int64_t target_serial;
+ 	const char *name_device;
+-	struct pw_node_info *info;
+ 	struct selector sel;
+ 	int res;
+ 	bool sink = command == COMMAND_MOVE_SINK_INPUT;
+@@ -4657,15 +4656,6 @@
+ 	if (o == NULL)
+ 		return -ENOENT;
+ 
+-	info = o->info;
+-	if (info == NULL || info->props == NULL)
+-		return -EINVAL;
+-	if (spa_atob(spa_dict_lookup(info->props, PW_KEY_NODE_DONT_RECONNECT)))
+-		return -EINVAL;
+-
+-	if ((dev = find_device(client, index_device, name_device, sink, NULL)) == NULL)
+-		return -ENOENT;
+-
+ 	dev_default = find_device(client, SPA_ID_INVALID, NULL, sink, NULL);
+ 	if (dev == dev_default) {
+ 		/*
