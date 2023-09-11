@@ -1,26 +1,8 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#include "config.h"
 
 #include <unistd.h>
 #include <errno.h>
@@ -28,13 +10,16 @@
 #include <signal.h>
 #include <string.h>
 #include <ctype.h>
-#ifndef __FreeBSD__
+#if !defined(__FreeBSD__) && !defined(__MidnightBSD__)
 #include <alloca.h>
 #endif
 #include <getopt.h>
 #include <fnmatch.h>
+#ifdef HAVE_READLINE
 #include <readline/readline.h>
 #include <readline/history.h>
+#endif
+#include <locale.h>
 
 #if !defined(FNM_EXTMATCH)
 #define FNM_EXTMATCH 0
@@ -132,25 +117,10 @@ struct command {
 	bool (*func) (struct data *data, const char *cmd, char *args, char **error);
 };
 
-static int pw_split_ip(char *str, const char *delimiter, int max_tokens, char *tokens[])
-{
-	const char *state = NULL;
-	char *s, *t;
-	size_t len, l2;
-	int n = 0;
-
-	s = (char *)pw_split_walk(str, delimiter, &len, &state);
-	while (s && n + 1 < max_tokens) {
-		t = (char*)pw_split_walk(str, delimiter, &l2, &state);
-		s[len] = '\0';
-		tokens[n++] = s;
-		s = t;
-		len = l2;
-	}
-	if (s)
-		tokens[n++] = s;
-	return n;
-}
+static struct spa_dict * global_props(struct global *global);
+static struct global * obj_global(struct remote_data *rd, uint32_t id);
+static int children_of(struct remote_data *rd, uint32_t parent_id,
+	const char *child_type, uint32_t **children);
 
 static void print_properties(struct spa_dict *props, char mark, bool header)
 {
@@ -216,7 +186,6 @@ static bool do_set_param(struct data *data, const char *cmd, char *args, char **
 static bool do_permissions(struct data *data, const char *cmd, char *args, char **error);
 static bool do_get_permissions(struct data *data, const char *cmd, char *args, char **error);
 static bool do_send_command(struct data *data, const char *cmd, char *args, char **error);
-static bool do_dump(struct data *data, const char *cmd, char *args, char **error);
 static bool do_quit(struct data *data, const char *cmd, char *args, char **error);
 
 #define DUMP_NAMES "Core|Module|Device|Node|Port|Factory|Client|Link|Session|Endpoint|EndpointStream"
@@ -241,8 +210,6 @@ static const struct command command_list[] = {
 	{ "permissions", "sp", "Set permissions for a client <client-id> <object> <permission>", do_permissions },
 	{ "get-permissions", "gp", "Get permissions of a client <client-id>", do_get_permissions },
 	{ "send-command", "c", "Send a command <object-id>", do_send_command },
-	{ "dump", "D", "Dump objects in ways that are cleaner for humans to understand "
-		 "[short|deep|resolve|notype] [-sdrt] [all|"DUMP_NAMES"|<id>]", do_dump },
 	{ "quit", "q", "Quit", do_quit },
 };
 
@@ -255,11 +222,11 @@ static bool do_quit(struct data *data, const char *cmd, char *args, char **error
 
 static bool do_help(struct data *data, const char *cmd, char *args, char **error)
 {
-	size_t i;
-
 	printf("Available commands:\n");
-	for (i = 0; i < SPA_N_ELEMENTS(command_list); i++) {
-		printf("\t%-20.20s\t%s\n", command_list[i].name, command_list[i].description);
+	SPA_FOR_EACH_ELEMENT_VAR(command_list, c) {
+		char cmd[256];
+		snprintf(cmd, sizeof(cmd), "%s | %s", c->name, c->alias);
+		printf("\t%-20.20s\t%s\n", cmd, c->description);
 	}
 	return true;
 }
@@ -284,7 +251,8 @@ static bool do_load_module(struct data *data, const char *cmd, char *args, char 
 	}
 
 	id = pw_map_insert_new(&data->vars, module);
-	printf("%d = @module:%d\n", id, pw_global_get_id(pw_impl_module_get_global(module)));
+	if (data->interactive)
+		printf("%d = @module:%d\n", id, pw_global_get_id(pw_impl_module_get_global(module)));
 
 	return true;
 }
@@ -301,7 +269,12 @@ static void on_core_info(void *_data, const struct pw_core_info *info)
 static void set_prompt(struct remote_data *rd)
 {
 	snprintf(prompt, sizeof(prompt), "%s>> ", rd->name);
+#ifdef HAVE_READLINE
 	rl_set_prompt(prompt);
+#else
+	printf("%s", prompt);
+	fflush(stdout);
+#endif
 }
 
 static void on_core_done(void *_data, uint32_t id, int seq)
@@ -800,11 +773,11 @@ static void info_endpoint_stream(struct proxy_data *pd)
 	info->change_mask = 0;
 }
 
-static void core_event_info(void *object, const struct pw_core_info *info)
+static void core_event_info(void *data, const struct pw_core_info *info)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
-	if (pd->info)
+	if (pd->info && rd->data->monitoring)
 		printf("remote %d core %d changed\n", rd->id, info->id);
 	pd->info = pw_core_info_update(pd->info, info);
 	if (pd->global == NULL)
@@ -821,11 +794,11 @@ static const struct pw_core_events core_events = {
 };
 
 
-static void module_event_info(void *object, const struct pw_module_info *info)
+static void module_event_info(void *data, const struct pw_module_info *info)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
-	if (pd->info)
+	if (pd->info && rd->data->monitoring)
 		printf("remote %d module %d changed\n", rd->id, info->id);
 	pd->info = pw_module_info_update(pd->info, info);
 	if (pd->global == NULL)
@@ -841,11 +814,11 @@ static const struct pw_module_events module_events = {
 	.info = module_event_info
 };
 
-static void node_event_info(void *object, const struct pw_node_info *info)
+static void node_event_info(void *data, const struct pw_node_info *info)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
-	if (pd->info)
+	if (pd->info && rd->data->monitoring)
 		printf("remote %d node %d changed\n", rd->id, info->id);
 	pd->info = pw_node_info_update(pd->info, info);
 	if (pd->global == NULL)
@@ -856,10 +829,10 @@ static void node_event_info(void *object, const struct pw_node_info *info)
 	}
 }
 
-static void event_param(void *object, int seq, uint32_t id,
+static void event_param(void *_data, int seq, uint32_t id,
 		uint32_t index, uint32_t next, const struct spa_pod *param)
 {
-        struct proxy_data *data = object;
+        struct proxy_data *data = _data;
 	struct remote_data *rd = data->rd;
 
 	if (rd->data->interactive)
@@ -876,11 +849,11 @@ static const struct pw_node_events node_events = {
 };
 
 
-static void port_event_info(void *object, const struct pw_port_info *info)
+static void port_event_info(void *data, const struct pw_port_info *info)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
-	if (pd->info)
+	if (pd->info && rd->data->monitoring)
 		printf("remote %d port %d changed\n", rd->id, info->id);
 	pd->info = pw_port_info_update(pd->info, info);
 	if (pd->global == NULL)
@@ -897,11 +870,11 @@ static const struct pw_port_events port_events = {
 	.param = event_param
 };
 
-static void factory_event_info(void *object, const struct pw_factory_info *info)
+static void factory_event_info(void *data, const struct pw_factory_info *info)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
-	if (pd->info)
+	if (pd->info && rd->data->monitoring)
 		printf("remote %d factory %d changed\n", rd->id, info->id);
 	pd->info = pw_factory_info_update(pd->info, info);
 	if (pd->global == NULL)
@@ -917,11 +890,11 @@ static const struct pw_factory_events factory_events = {
 	.info = factory_event_info
 };
 
-static void client_event_info(void *object, const struct pw_client_info *info)
+static void client_event_info(void *data, const struct pw_client_info *info)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
-	if (pd->info)
+	if (pd->info && rd->data->monitoring)
 		printf("remote %d client %d changed\n", rd->id, info->id);
 	pd->info = pw_client_info_update(pd->info, info);
 	if (pd->global == NULL)
@@ -932,10 +905,10 @@ static void client_event_info(void *object, const struct pw_client_info *info)
 	}
 }
 
-static void client_event_permissions(void *object, uint32_t index,
+static void client_event_permissions(void *_data, uint32_t index,
 		uint32_t n_permissions, const struct pw_permission *permissions)
 {
-        struct proxy_data *data = object;
+        struct proxy_data *data = _data;
 	struct remote_data *rd = data->rd;
 	uint32_t i;
 
@@ -958,11 +931,11 @@ static const struct pw_client_events client_events = {
 	.permissions = client_event_permissions
 };
 
-static void link_event_info(void *object, const struct pw_link_info *info)
+static void link_event_info(void *data, const struct pw_link_info *info)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
-	if (pd->info)
+	if (pd->info && rd->data->monitoring)
 		printf("remote %d link %d changed\n", rd->id, info->id);
 	pd->info = pw_link_info_update(pd->info, info);
 	if (pd->global == NULL)
@@ -979,11 +952,11 @@ static const struct pw_link_events link_events = {
 };
 
 
-static void device_event_info(void *object, const struct pw_device_info *info)
+static void device_event_info(void *data, const struct pw_device_info *info)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
-	if (pd->info)
+	if (pd->info && rd->data->monitoring)
 		printf("remote %d device %d changed\n", rd->id, info->id);
 	pd->info = pw_device_info_update(pd->info, info);
 	if (pd->global == NULL)
@@ -1007,10 +980,10 @@ static void session_info_free(struct pw_session_info *info)
 	free(info);
 }
 
-static void session_event_info(void *object,
+static void session_event_info(void *data,
 				const struct pw_session_info *update)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
 	struct pw_session_info *info = pd->info;
 
@@ -1054,10 +1027,10 @@ static void endpoint_info_free(struct pw_endpoint_info *info)
 	free(info);
 }
 
-static void endpoint_event_info(void *object,
+static void endpoint_event_info(void *data,
 				const struct pw_endpoint_info *update)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
 	struct pw_endpoint_info *info = pd->info;
 
@@ -1108,10 +1081,10 @@ static void endpoint_stream_info_free(struct pw_endpoint_stream_info *info)
 	free(info);
 }
 
-static void endpoint_stream_event_info(void *object,
+static void endpoint_stream_event_info(void *data,
 				const struct pw_endpoint_stream_info *update)
 {
-	struct proxy_data *pd = object;
+	struct proxy_data *pd = data;
 	struct remote_data *rd = pd->rd;
 	struct pw_endpoint_stream_info *info = pd->info;
 
@@ -1297,11 +1270,10 @@ static const struct class *classes[] =
 
 static const struct class *find_class(const char *type, uint32_t version)
 {
-	size_t i;
-	for (i = 0; i < SPA_N_ELEMENTS(classes); i++) {
-		if (spa_streq(classes[i]->type, type) &&
-		    classes[i]->version <= version)
-			return classes[i];
+	SPA_FOR_EACH_ELEMENT_VAR(classes, c) {
+		if (spa_streq((*c)->type, type) &&
+		    (*c)->version <= version)
+			return *c;
 	}
 	return NULL;
 }
@@ -1431,7 +1403,8 @@ static bool do_create_device(struct data *data, const char *cmd, char *args, cha
 	pw_proxy_add_listener(proxy, &pd->proxy_listener, &proxy_events, pd);
 
 	id = pw_map_insert_new(&data->vars, proxy);
-	printf("%d = @proxy:%d\n", id, pw_proxy_get_id(proxy));
+	if (rd->data->interactive)
+		printf("%d = @proxy:%d\n", id, pw_proxy_get_id(proxy));
 
 	return true;
 }
@@ -1470,7 +1443,8 @@ static bool do_create_node(struct data *data, const char *cmd, char *args, char 
         pw_proxy_add_listener(proxy, &pd->proxy_listener, &proxy_events, pd);
 
 	id = pw_map_insert_new(&data->vars, proxy);
-	printf("%d = @proxy:%d\n", id, pw_proxy_get_id(proxy));
+	if (rd->data->interactive)
+		printf("%d = @proxy:%d\n", id, pw_proxy_get_id(proxy));
 
 	return true;
 }
@@ -1497,15 +1471,70 @@ static bool do_destroy(struct data *data, const char *cmd, char *args, char **er
 	return true;
 }
 
+static struct global *
+obj_global_port(struct remote_data *rd, struct global *global, const char *port_direction, const char *port_id)
+{
+	struct global *global_port_found = NULL;
+	uint32_t *ports = NULL;
+	int port_count;
+
+	port_count = children_of(rd, global->id, PW_TYPE_INTERFACE_Port, &ports);
+
+	if (port_count <= 0)
+		return NULL;
+
+	for (int i = 0; i < port_count; i++) {
+		struct global *global_port = obj_global(rd, ports[i]);
+
+		if (!global_port)
+			continue;
+
+		struct spa_dict *props_port = global_props(global_port);
+
+		if (spa_streq(spa_dict_lookup(props_port, "port.direction"), port_direction)
+				&& spa_streq(spa_dict_lookup(props_port, "port.id"), port_id)) {
+			global_port_found = global_port;
+			break;
+		}
+	}
+
+	free(ports);
+	return global_port_found;
+}
+
+static void create_link_with_properties(struct data *data, const struct pw_properties *props)
+{
+	struct remote_data *rd = data->current;
+	uint32_t id;
+	struct pw_proxy *proxy;
+	struct proxy_data *pd;
+
+	proxy = (struct pw_proxy*)pw_core_create_object(rd->core,
+					  "link-factory",
+					  PW_TYPE_INTERFACE_Link,
+					  PW_VERSION_LINK,
+					  props ? &props->dict : NULL,
+					  sizeof(struct proxy_data));
+
+	pd = pw_proxy_get_user_data(proxy);
+	pd->rd = rd;
+	pd->proxy = proxy;
+	pd->class = &link_class;
+	pw_proxy_add_object_listener(proxy, &pd->object_listener, &link_events, pd);
+	pw_proxy_add_listener(proxy, &pd->proxy_listener, &proxy_events, pd);
+
+	id = pw_map_insert_new(&data->vars, proxy);
+	if (rd->data->interactive)
+		printf("%d = @proxy:%d\n", id, pw_proxy_get_id((struct pw_proxy*)proxy));
+}
+
 static bool do_create_link(struct data *data, const char *cmd, char *args, char **error)
 {
 	struct remote_data *rd = data->current;
 	char *a[5];
-        int n;
-	uint32_t id;
-	struct pw_proxy *proxy;
+	int n;
 	struct pw_properties *props = NULL;
-	struct proxy_data *pd;
+	bool res = false;
 
 	n = pw_split_ip(args, WHITESPACE, 5, a);
 	if (n < 4) {
@@ -1526,26 +1555,59 @@ static bool do_create_link(struct data *data, const char *cmd, char *args, char 
 	if (!spa_streq(a[3], "-"))
 		pw_properties_set(props, PW_KEY_LINK_INPUT_PORT, a[3]);
 
-	proxy = (struct pw_proxy*)pw_core_create_object(rd->core,
-					  "link-factory",
-					  PW_TYPE_INTERFACE_Link,
-					  PW_VERSION_LINK,
-					  props ? &props->dict : NULL,
-					  sizeof(struct proxy_data));
+	if (spa_streq(a[1], "*") && spa_streq(a[3], "*")) {
+		struct global *global_out, *global_in;
+		struct proxy_data *pd_out, *pd_in;
+		uint32_t n_output_ports, n_input_ports;
 
+		global_out = find_global(rd, a[0]);
+		if (global_out == NULL) {
+			*error = spa_aprintf("%s: unknown global '%s'", cmd, a[0]);
+			goto done;
+		}
+		global_in = find_global(rd, a[2]);
+		if (global_in == NULL) {
+			*error = spa_aprintf("%s: unknown global '%s'", cmd, a[2]);
+			goto done;
+		}
+
+		pd_out = pw_proxy_get_user_data(global_out->proxy);
+		pd_in = pw_proxy_get_user_data(global_in->proxy);
+
+		n_output_ports = ((struct pw_node_info *)pd_out->info)->n_output_ports;
+		n_input_ports = ((struct pw_node_info *)pd_in->info)->n_input_ports;
+
+		if (n_output_ports != n_input_ports) {
+			*error = spa_aprintf("%s: Number of ports don't match (%u != %u)", cmd, n_output_ports, n_input_ports);
+			goto done;
+		}
+
+		for (uint32_t i = 0; i < n_output_ports; i++) {
+			char port_id[4];
+			struct global *global_port_out, *global_port_in;
+
+			snprintf(port_id, 4, "%d", i);
+
+			global_port_out = obj_global_port(rd, global_out, "out", port_id);
+			global_port_in = obj_global_port(rd, global_in, "in", port_id);
+
+			if (!global_port_out || !global_port_in)
+				continue;
+
+			pw_properties_setf(props, PW_KEY_LINK_OUTPUT_PORT, "%d", global_port_out->id);
+			pw_properties_setf(props, PW_KEY_LINK_INPUT_PORT, "%d", global_port_in->id);
+
+			create_link_with_properties(data, props);
+		}
+	} else
+		create_link_with_properties(data, props);
+
+	res = true;
+
+done:
 	pw_properties_free(props);
 
-	pd = pw_proxy_get_user_data(proxy);
-	pd->rd = rd;
-	pd->proxy = proxy;
-        pd->class = &link_class;
-        pw_proxy_add_object_listener(proxy, &pd->object_listener, &link_events, pd);
-        pw_proxy_add_listener(proxy, &pd->proxy_listener, &proxy_events, pd);
-
-	id = pw_map_insert_new(&data->vars, proxy);
-	printf("%d = @proxy:%d\n", id, pw_proxy_get_id((struct pw_proxy*)proxy));
-
-	return true;
+	return res;
 }
 
 static bool do_export_node(struct data *data, const char *cmd, char *args, char **error)
@@ -1583,7 +1645,8 @@ static bool do_export_node(struct data *data, const char *cmd, char *args, char 
 	proxy = pw_core_export(rd->core, PW_TYPE_INTERFACE_Node, NULL, node, 0);
 
 	id = pw_map_insert_new(&data->vars, proxy);
-	printf("%d = @proxy:%d\n", id, pw_proxy_get_id((struct pw_proxy*)proxy));
+	if (rd->data->interactive)
+		printf("%d = @proxy:%d\n", id, pw_proxy_get_id((struct pw_proxy*)proxy));
 
 	return true;
 
@@ -1736,8 +1799,9 @@ static bool do_permissions(struct data *data, const char *cmd, char *args, char 
 	}
 
 	p = strtol(a[2], NULL, 0);
-	printf("setting permissions: "PW_PERMISSION_FORMAT"\n",
-			PW_PERMISSION_ARGS(p));
+	if (rd->data->interactive)
+		printf("setting permissions: "PW_PERMISSION_FORMAT"\n",
+				PW_PERMISSION_ARGS(p));
 
 	permissions[0] = PW_PERMISSION_INIT(atoi(a[1]), p);
 	pw_client_update_permissions((struct pw_client*)global->proxy,
@@ -1831,20 +1895,6 @@ static bool do_send_command(struct data *data, const char *cmd, char *args, char
 	return true;
 }
 
-static const char *
-pw_interface_short(const char *type)
-{
-	size_t ilen;
-
-	ilen = strlen(PW_TYPE_INFO_INTERFACE_BASE);
-
-	if (!type || strlen(type) <= ilen ||
-	    memcmp(type, PW_TYPE_INFO_INTERFACE_BASE, ilen))
-		return NULL;
-
-	return type + ilen;
-}
-
 static struct global *
 obj_global(struct remote_data *rd, uint32_t id)
 {
@@ -1903,20 +1953,6 @@ global_props(struct global *global)
 	return NULL;
 }
 
-static struct spa_dict *
-obj_props(struct remote_data *rd, uint32_t id)
-{
-	struct global *global;
-
-	if (!rd)
-		return NULL;
-
-	global = obj_global(rd, id);
-	if (!global)
-		return NULL;
-	return global_props(global);
-}
-
 static const char *
 global_lookup(struct global *global, const char *key)
 {
@@ -1928,16 +1964,6 @@ global_lookup(struct global *global, const char *key)
 	return spa_dict_lookup(dict, key);
 }
 
-static const char *
-obj_lookup(struct remote_data *rd, uint32_t id, const char *key)
-{
-	struct spa_dict *dict;
-
-	dict = obj_props(rd, id);
-	if (!dict)
-		return NULL;
-	return spa_dict_lookup(dict, key);
-}
 
 static int
 children_of(struct remote_data *rd, uint32_t parent_id,
@@ -2037,67 +2063,6 @@ children_of(struct remote_data *rd, uint32_t parent_id,
 	return count;
 }
 
-#ifndef BIT
-#define BIT(x) (1U << (x))
-#endif
-
-enum dump_flags {
-	is_default = 0,
-	is_short = BIT(0),
-	is_deep = BIT(1),
-	is_resolve = BIT(2),
-	is_notype = BIT(3)
-};
-
-static const char * const dump_types[] = {
-	PW_TYPE_INTERFACE_Core,
-	PW_TYPE_INTERFACE_Module,
-	PW_TYPE_INTERFACE_Device,
-	PW_TYPE_INTERFACE_Node,
-	PW_TYPE_INTERFACE_Port,
-	PW_TYPE_INTERFACE_Factory,
-	PW_TYPE_INTERFACE_Client,
-	PW_TYPE_INTERFACE_Link,
-	PW_TYPE_INTERFACE_Session,
-	PW_TYPE_INTERFACE_Endpoint,
-	PW_TYPE_INTERFACE_EndpointStream,
-};
-
-int dump_type_index(const char *type)
-{
-	unsigned int i;
-
-	if (!type)
-		return -1;
-
-	for (i = 0; i < SPA_N_ELEMENTS(dump_types); i++) {
-		if (spa_streq(dump_types[i], type))
-			return (int)i;
-	}
-
-	return -1;
-}
-
-static inline unsigned int dump_type_count(void)
-{
-	return SPA_N_ELEMENTS(dump_types);
-}
-
-static const char *name_to_dump_type(const char *name)
-{
-	unsigned int i;
-
-	if (!name)
-		return NULL;
-
-	for (i = 0; i < SPA_N_ELEMENTS(dump_types); i++) {
-		if (!strcasecmp(name, pw_interface_short(dump_types[i])))
-			return dump_types[i];
-	}
-
-	return NULL;
-}
-
 #define INDENT(_level) \
 	({ \
 		int __level = (_level); \
@@ -2107,822 +2072,10 @@ static const char *name_to_dump_type(const char *name)
 		(const char *)_indent; \
 	})
 
-static void
-dump(struct data *data, struct global *global,
-     enum dump_flags flags, int level);
-
-static void
-dump_properties(struct data *data, struct global *global,
-		enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct spa_dict *props;
-	const struct spa_dict_item *item;
-	const char *ind;
-	int id;
-	const char *extra;
-
-	if (!global)
-		return;
-
-	props = global_props(global);
-	if (!props || !props->n_items)
-		return;
-
-	ind = INDENT(level + 2);
-	spa_dict_for_each(item, props) {
-		printf("%s%s = \"%s\"",
-				ind, item->key, item->value);
-
-		extra = NULL;
-		if (spa_streq(global->type, PW_TYPE_INTERFACE_Port) && spa_streq(item->key, PW_KEY_NODE_ID)) {
-			id = atoi(item->value);
-			if (id >= 0)
-				extra = obj_lookup(rd, id, PW_KEY_NODE_NAME);
-		} else if (spa_streq(global->type, PW_TYPE_INTERFACE_Factory) && spa_streq(item->key, PW_KEY_MODULE_ID)) {
-			id = atoi(item->value);
-			if (id >= 0)
-				extra = obj_lookup(rd, id, PW_KEY_MODULE_NAME);
-		} else if (spa_streq(global->type, PW_TYPE_INTERFACE_Device) && spa_streq(item->key, PW_KEY_FACTORY_ID)) {
-			id = atoi(item->value);
-			if (id >= 0)
-				extra = obj_lookup(rd, id, PW_KEY_FACTORY_NAME);
-		} else if (spa_streq(global->type, PW_TYPE_INTERFACE_Device) && spa_streq(item->key, PW_KEY_CLIENT_ID)) {
-			id = atoi(item->value);
-			if (id >= 0)
-				extra = obj_lookup(rd, id, PW_KEY_CLIENT_NAME);
-		}
-
-		if (extra)
-			printf(" (\"%s\")", extra);
-
-		printf("\n");
-	}
-}
-
-static void
-dump_params(struct data *data, struct global *global,
-	    struct spa_param_info *params, uint32_t n_params,
-	    enum dump_flags flags, int level)
-{
-	uint32_t i;
-	const char *ind;
-
-	if (params == NULL || n_params == 0)
-		return;
-
-	ind = INDENT(level + 1);
-	for (i = 0; i < n_params; i++) {
-		const struct spa_type_info *type_info = spa_type_param;
-
-		printf("%s  %d (%s) %c%c\n", ind,
-			params[i].id,
-			spa_debug_type_find_name(type_info, params[i].id),
-			params[i].flags & SPA_PARAM_INFO_READ ? 'r' : '-',
-			params[i].flags & SPA_PARAM_INFO_WRITE ? 'w' : '-');
-	}
-}
-
-
-static void
-dump_global_common(struct data *data, struct global *global,
-	    enum dump_flags flags, int level)
-{
-	const char *ind;
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sid: %"PRIu32"\n", ind, global->id);
-		printf("%spermissions: "PW_PERMISSION_FORMAT"\n", ind,
-			PW_PERMISSION_ARGS(global->permissions));
-		printf("%stype: %s/%d\n", ind,
-				global->type, global->version);
-	} else {
-		ind = INDENT(level);
-		printf("%s%"PRIu32":", ind, global->id);
-		if (!(flags & is_notype))
-			printf(" %s", pw_interface_short(global->type));
-	}
-}
-
-static bool
-dump_core(struct data *data, struct global *global,
-	  enum dump_flags flags, int level)
-{
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_core_info *info;
-	const char *ind;
-
-	if (!pd->info)
-		return false;
-
-	dump_global_common(data, global, flags, level);
-
-	info = pd->info;
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%scookie: %u\n", ind, info->cookie);
-		printf("%suser-name: \"%s\"\n", ind, info->user_name);
-		printf("%shost-name: \"%s\"\n", ind, info->host_name);
-		printf("%sversion: \"%s\"\n", ind, info->version);
-		printf("%sname: \"%s\"\n", ind, info->name);
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-	} else {
-		printf(" u=\"%s\" h=\"%s\" v=\"%s\" n=\"%s\"",
-				info->user_name, info->host_name, info->version, info->name);
-		printf("\n");
-	}
-
-	return true;
-}
-
-static bool
-dump_module(struct data *data, struct global *global,
-	    enum dump_flags flags, int level)
-{
-	struct remote_data *rd = global->rd;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_module_info *info;
-	const char *args, *desc;
-	const char *ind;
-	uint32_t *factories = NULL;
-	int i, factory_count;
-	struct global *global_factory;
-
-	if (!pd->info)
-		return false;
-
-	info = pd->info;
-
-	dump_global_common(data, global, flags, level);
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sname: \"%s\"\n", ind, info->name);
-		printf("%sfilename: \"%s\"\n", ind, info->filename);
-		printf("%sargs: \"%s\"\n", ind, info->args);
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-	} else {
-		desc = spa_dict_lookup(info->props, PW_KEY_MODULE_DESCRIPTION);
-		args = info->args && strcmp(info->args, "(null)") ? info->args : NULL;
-		printf(" n=\"%s\" f=\"%s\"" "%s%s%s" "%s%s%s",
-				info->name, info->filename,
-				args ? " a=\"" : "",
-				args ? args : "",
-				args ? "\"" : "",
-				desc ? " d=\"" : "",
-				desc ? desc : "",
-				desc ? "\"" : "");
-		printf("\n");
-	}
-
-	if (!(flags & is_deep))
-		return true;
-
-	factory_count = children_of(rd, global->id, PW_TYPE_INTERFACE_Factory, &factories);
-	if (factory_count >= 0) {
-		ind = INDENT(level + 1);
-		printf("%sfactories:\n", ind);
-		for (i = 0; i < factory_count; i++) {
-			global_factory = obj_global(rd, factories[i]);
-			if (!global_factory)
-				continue;
-			dump(data, global_factory, flags | is_notype, level + 1);
-		}
-		free(factories);
-	}
-
-	return true;
-}
-
-static bool
-dump_device(struct data *data, struct global *global,
-	    enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_device_info *info;
-	const char *media_class, *api, *desc, *name;
-	const char *alsa_path, *alsa_card_id;
-	const char *ind;
-	uint32_t *nodes = NULL;
-	int i, node_count;
-	struct global *global_node;
-
-	if (!pd->info)
-		return false;
-
-	info = pd->info;
-
-	dump_global_common(data, global, flags, level);
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-		printf("%sparams:\n", ind);
-		dump_params(data, global, info->params, info->n_params, flags, level);
-	} else {
-		media_class = spa_dict_lookup(info->props, PW_KEY_MEDIA_CLASS);
-		name = spa_dict_lookup(info->props, PW_KEY_DEVICE_NAME);
-		desc = spa_dict_lookup(info->props, PW_KEY_DEVICE_DESCRIPTION);
-		api = spa_dict_lookup(info->props, PW_KEY_DEVICE_API);
-
-		printf("%s%s%s" "%s%s%s" "%s%s%s" "%s%s%s",
-				media_class ? " c=\"" : "",
-				media_class ? media_class : "",
-				media_class ? "\"" : "",
-				name ? " n=\"" : "",
-				name ? name : "",
-				name ? "\"" : "",
-				desc ? " d=\"" : "",
-				desc ? desc : "",
-				desc ? "\"" : "",
-				api ? " a=\"" : "",
-				api ? api : "",
-				api ? "\"" : "");
-
-		if (media_class && spa_streq(media_class, "Audio/Device") &&
-		    api && spa_streq(api, "alsa:pcm")) {
-
-			alsa_path = spa_dict_lookup(info->props, SPA_KEY_API_ALSA_PATH);
-			alsa_card_id = spa_dict_lookup(info->props, SPA_KEY_API_ALSA_CARD_ID);
-
-			printf("%s%s%s" "%s%s%s",
-					alsa_path ? " p=\"" : "",
-					alsa_path ? alsa_path : "",
-					alsa_path ? "\"" : "",
-					alsa_card_id ? " id=\"" : "",
-					alsa_card_id ? alsa_card_id : "",
-					alsa_card_id ? "\"" : "");
-		}
-
-		printf("\n");
-	}
-
-	if (!(flags & is_deep))
-		return true;
-
-	node_count = children_of(rd, global->id, PW_TYPE_INTERFACE_Node, &nodes);
-	if (node_count >= 0) {
-		ind = INDENT(level + 1);
-		printf("%snodes:\n", ind);
-		for (i = 0; i < node_count; i++) {
-			global_node = obj_global(rd, nodes[i]);
-			if (!global_node)
-				continue;
-			dump(data, global_node, flags | is_notype, level + 1);
-		}
-		free(nodes);
-	}
-
-	return true;
-}
-
-static bool
-dump_node(struct data *data, struct global *global,
-	  enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_node_info *info;
-	const char *name, *path;
-	const char *ind;
-	uint32_t *ports = NULL;
-	int i, port_count;
-	struct global *global_port;
-
-	if (!pd->info)
-		return false;
-
-	dump_global_common(data, global, flags, level);
-
-	info = pd->info;
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sinput ports: %u/%u\n", ind, info->n_input_ports, info->max_input_ports);
-		printf("%soutput ports: %u/%u\n", ind, info->n_output_ports, info->max_output_ports);
-		printf("%sstate: \"%s\"", ind, pw_node_state_as_string(info->state));
-		if (info->state == PW_NODE_STATE_ERROR && info->error)
-			printf(" \"%s\"\n", info->error);
-		else
-			printf("\n");
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-		printf("%sparams:\n", ind);
-		dump_params(data, global, info->params, info->n_params, flags, level);
-	} else {
-		name = spa_dict_lookup(info->props, PW_KEY_NODE_NAME);
-		path = spa_dict_lookup(info->props, SPA_KEY_OBJECT_PATH);
-
-		printf(" s=\"%s\"", pw_node_state_as_string(info->state));
-
-		if (info->max_input_ports) {
-			printf(" i=%u/%u", info->n_input_ports, info->max_input_ports);
-		}
-		if (info->max_output_ports) {
-			printf(" o=%u/%u", info->n_output_ports, info->max_output_ports);
-		}
-
-		printf("%s%s%s" "%s%s%s",
-				name ? " n=\"" : "",
-				name ? name : "",
-				name ? "\"" : "",
-				path ? " p=\"" : "",
-				path ? path : "",
-				path ? "\"" : "");
-
-		printf("\n");
-	}
-
-	if (!(flags & is_deep))
-		return true;
-
-	port_count = children_of(rd, global->id, PW_TYPE_INTERFACE_Port, &ports);
-	if (port_count >= 0) {
-		ind = INDENT(level + 1);
-		printf("%sports:\n", ind);
-		for (i = 0; i < port_count; i++) {
-			global_port = obj_global(rd, ports[i]);
-			if (!global_port)
-				continue;
-			dump(data, global_port, flags | is_notype, level + 1);
-		}
-		free(ports);
-	}
-	return true;
-}
-
-static bool
-dump_port(struct data *data, struct global *global,
-	  enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_port_info *info;
-	const char *ind;
-	const char *name, *format;
-
-	if (!pd->info)
-		return false;
-
-	dump_global_common(data, global, flags, level);
-
-	info = pd->info;
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sdirection: \"%s\"\n", ind,
-				pw_direction_as_string(info->direction));
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-		printf("%sparams:\n", ind);
-		dump_params(data, global, info->params, info->n_params, flags, level);
-	} else {
-		printf(" d=\"%s\"", pw_direction_as_string(info->direction));
-
-		name = spa_dict_lookup(info->props, PW_KEY_PORT_NAME);
-		format = spa_dict_lookup(info->props, PW_KEY_FORMAT_DSP);
-
-		printf("%s%s%s" "%s%s%s",
-				name ? " n=\"" : "",
-				name ? name : "",
-				name ? "\"" : "",
-				format ? " f=\"" : "",
-				format ? format : "",
-				format ? "\"" : "");
-
-		printf("\n");
-	}
-
-	(void)rd;
-
-	return true;
-}
-
-static bool
-dump_factory(struct data *data, struct global *global,
-	     enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_factory_info *info;
-	const char *ind;
-	const char *module_id, *module_name;
-
-	if (!pd->info)
-		return false;
-
-	dump_global_common(data, global, flags, level);
-
-	info = pd->info;
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sname: \"%s\"\n", ind, info->name);
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-	} else {
-		printf(" n=\"%s\"", info->name);
-
-		module_id = spa_dict_lookup(info->props, PW_KEY_MODULE_ID);
-		module_name = module_id ? obj_lookup(rd, atoi(module_id), PW_KEY_MODULE_NAME) : NULL;
-
-		printf("%s%s%s",
-				module_name ? " m=\"" : "",
-				module_name ? module_name : "",
-				module_name ? "\"" : "");
-
-		printf("\n");
-	}
-
-	return true;
-}
-
-static bool
-dump_client(struct data *data, struct global *global,
-	    enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_client_info *info;
-	const char *ind;
-	const char *app_name, *app_pid;
-
-	if (!pd->info)
-		return false;
-
-	dump_global_common(data, global, flags, level);
-
-	info = pd->info;
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-	} else {
-		app_name = spa_dict_lookup(info->props, PW_KEY_APP_NAME);
-		app_pid = spa_dict_lookup(info->props, PW_KEY_APP_PROCESS_ID);
-
-		printf("%s%s%s" "%s%s%s",
-				app_name ? " ap=\"" : "",
-				app_name ? app_name : "",
-				app_name ? "\"" : "",
-				app_pid ? " ai=\"" : "",
-				app_pid ? app_pid : "",
-				app_pid ? "\"" : "");
-
-		printf("\n");
-	}
-
-	(void)rd;
-
-	return true;
-}
-
-static bool
-dump_link(struct data *data, struct global *global,
-	  enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_link_info *info;
-	const char *ind;
-	const char *in_node_name, *in_port_name;
-	const char *out_node_name, *out_port_name;
-
-	if (!pd->info)
-		return false;
-
-	dump_global_common(data, global, flags, level);
-
-	info = pd->info;
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%soutput-node-id: %u\n", ind, info->output_node_id);
-		printf("%soutput-port-id: %u\n", ind, info->output_port_id);
-		printf("%sinput-node-id: %u\n", ind, info->input_node_id);
-		printf("%sinput-port-id: %u\n", ind, info->input_port_id);
-
-		printf("%sstate: \"%s\"", ind,
-				pw_link_state_as_string(info->state));
-		if (info->state == PW_LINK_STATE_ERROR && info->error)
-			printf(" \"%s\"\n", info->error);
-		else
-			printf("\n");
-		printf("%sformat:\n", ind);
-		if (info->format)
-			spa_debug_pod(8 * (level + 1) + 2, NULL, info->format);
-		else
-			printf("%s\tnone\n", ind);
-
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-	} else {
-		out_node_name = obj_lookup(rd, info->output_node_id, PW_KEY_NODE_NAME);
-		in_node_name = obj_lookup(rd, info->input_node_id, PW_KEY_NODE_NAME);
-		out_port_name = obj_lookup(rd, info->output_port_id, PW_KEY_PORT_NAME);
-		in_port_name = obj_lookup(rd, info->input_port_id, PW_KEY_PORT_NAME);
-
-		printf(" s=\"%s\"", pw_link_state_as_string(info->state));
-
-		if (out_node_name && out_port_name)
-			printf(" on=\"%s\"" " op=\"%s\"",
-					out_node_name, out_port_name);
-		if (in_node_name && in_port_name)
-			printf(" in=\"%s\"" " ip=\"%s\"",
-					in_node_name, in_port_name);
-
-		printf("\n");
-	}
-
-	(void)rd;
-
-	return true;
-}
-
-static bool
-dump_session(struct data *data, struct global *global,
-	     enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_session_info *info;
-	const char *ind;
-
-	if (!pd->info)
-		return false;
-
-	dump_global_common(data, global, flags, level);
-
-	info = pd->info;
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-		printf("%sparams:\n", ind);
-		dump_params(data, global, info->params, info->n_params, flags, level);
-	} else {
-		printf("\n");
-	}
-
-	(void)rd;
-
-	return true;
-}
-
-static bool
-dump_endpoint(struct data *data, struct global *global,
-	      enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_endpoint_info *info;
-	const char *ind;
-	const char *direction;
-
-	if (!pd->info)
-		return false;
-
-	dump_global_common(data, global, flags, level);
-
-	info = pd->info;
-
-	switch(info->direction) {
-	case PW_DIRECTION_OUTPUT:
-		direction = "source";
-		break;
-	case PW_DIRECTION_INPUT:
-		direction = "sink";
-		break;
-	default:
-		direction = "invalid";
-		break;
-	}
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sname: %s\n", ind, info->name);
-		printf("%smedia-class: %s\n", ind, info->media_class);
-		printf("%sdirection: %s\n", ind, direction);
-		printf("%sflags: 0x%x\n", ind, info->flags);
-		printf("%sstreams: %u\n", ind, info->n_streams);
-		printf("%ssession: %u\n", ind, info->session_id);
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-		printf("%sparams:\n", ind);
-		dump_params(data, global, info->params, info->n_params, flags, level);
-	} else {
-		printf(" n=\"%s\" c=\"%s\" d=\"%s\" s=%u si=%"PRIu32"",
-				info->name, info->media_class, direction,
-				info->n_streams, info->session_id);
-		printf("\n");
-	}
-
-	(void)rd;
-
-	return true;
-}
-
-static bool
-dump_endpoint_stream(struct data *data, struct global *global,
-		     enum dump_flags flags, int level)
-{
-	struct remote_data *rd = data->current;
-	struct proxy_data *pd = pw_proxy_get_user_data(global->proxy);
-	struct pw_endpoint_stream_info *info;
-	const char *ind;
-
-	if (!pd->info)
-		return false;
-
-	dump_global_common(data, global, flags, level);
-
-	info = pd->info;
-
-	if (!(flags & is_short)) {
-		ind = INDENT(level + 1);
-		printf("%sid: %u\n", ind, info->id);
-		printf("%sendpoint-id: %u\n", ind, info->endpoint_id);
-		printf("%sname: %s\n", ind, info->name);
-		printf("%sproperties:\n", ind);
-		dump_properties(data, global, flags, level);
-		printf("%sparams:\n", ind);
-		dump_params(data, global, info->params, info->n_params, flags, level);
-	} else {
-		printf(" n=\"%s\" i=%"PRIu32" ei=%"PRIu32"",
-				info->name, info->id, info->endpoint_id);
-		printf("\n");
-	}
-
-	(void)rd;
-
-	return true;
-}
-
-static void
-dump(struct data *data, struct global *global,
-     enum dump_flags flags, int level)
-{
-	if (!global)
-		return;
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Core))
-		dump_core(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Module))
-		dump_module(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Device))
-		dump_device(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Node))
-		dump_node(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Port))
-		dump_port(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Factory))
-		dump_factory(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Client))
-		dump_client(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Link))
-		dump_link(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Session))
-		dump_session(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_Endpoint))
-		dump_endpoint(data, global, flags, level);
-
-	if (spa_streq(global->type, PW_TYPE_INTERFACE_EndpointStream))
-		dump_endpoint_stream(data, global, flags, level);
-}
-
-static bool do_dump(struct data *data, const char *cmd, char *args, char **error)
-{
-	struct remote_data *rd = data->current;
-	union pw_map_item *item;
-	struct global *global;
-	char *aa[32], **a;
-	char c;
-	int i, n, idx;
-	enum dump_flags flags = is_default;
-	bool match;
-	unsigned int type_mask;
-
-	n = pw_split_ip(args, WHITESPACE, SPA_N_ELEMENTS(aa), aa);
-	if (n < 0)
-		goto usage;
-
-	a = aa;
-	while (n > 0 &&
-		(spa_streq(a[0], "short") ||
-		 spa_streq(a[0], "deep") ||
-		 spa_streq(a[0], "resolve") ||
-		 spa_streq(a[0], "notype"))) {
-		if (spa_streq(a[0], "short"))
-			flags |= is_short;
-		else if (spa_streq(a[0], "deep"))
-			flags |= is_deep;
-		else if (spa_streq(a[0], "resolve"))
-			flags |= is_resolve;
-		else if (spa_streq(a[0], "notype"))
-			flags |= is_notype;
-		n--;
-		a++;
-	}
-
-	while (n > 0 && a[0][0] == '-') {
-		for (i = 1; (c = a[0][i]) != '\0'; i++) {
-			if (c == 's')
-				flags |= is_short;
-			else if (c == 'd')
-				flags |= is_deep;
-			else if (c == 'r')
-				flags |= is_resolve;
-			else if (c == 't')
-				flags |= is_notype;
-			else
-				goto usage;
-		}
-		n--;
-		a++;
-	}
-
-	if (n == 0 || spa_streq(a[0], "all")) {
-		type_mask = (1U << dump_type_count()) - 1;
-		flags &= ~is_notype;
-	} else {
-		type_mask = 0;
-		for (i = 0; i < n; i++) {
-			/* skip direct IDs */
-			if (isdigit(a[i][0]))
-				continue;
-			idx = dump_type_index(name_to_dump_type(a[i]));
-			if (idx < 0)
-				goto usage;
-			type_mask |= 1U << idx;
-		}
-
-		/* single bit set? disable type */
-		if ((type_mask & (type_mask - 1)) == 0)
-			flags |= is_notype;
-	}
-
-	pw_array_for_each(item, &rd->globals.items) {
-		if (pw_map_item_is_free(item) || item->data == NULL)
-			continue;
-
-		global = item->data;
-
-		/* unknown type, ignore completely */
-		idx = dump_type_index(global->type);
-		if (idx < 0)
-			continue;
-
-		match = false;
-
-		/* first check direct ids */
-		for (i = 0; i < n; i++) {
-			/* skip non direct IDs */
-			if (!isdigit(a[i][0]))
-				continue;
-			if (atoi(a[i]) == (int)global->id) {
-				match = true;
-				break;
-			}
-		}
-
-		/* if type match */
-		if (!match && (type_mask & (1U << idx)))
-			match = true;
-
-		if (!match)
-			continue;
-
-		dump(data, global, flags, 0);
-	}
-
-	return true;
-usage:
-	*error = spa_aprintf("%s [short|deep|resolve|notype] [-sdrt] [all|%s|<id>]",
-			cmd, DUMP_NAMES);
-	return false;
-}
-
 static bool parse(struct data *data, char *buf, char **error)
 {
 	char *a[2];
 	int n;
-	size_t i;
 	char *p, *cmd, *args;
 
 	if ((p = strchr(buf, '#')))
@@ -2940,10 +2093,10 @@ static bool parse(struct data *data, char *buf, char **error)
 	cmd = a[0];
 	args = n > 1 ? a[1] : "";
 
-	for (i = 0; i < SPA_N_ELEMENTS(command_list); i++) {
-		if (spa_streq(command_list[i].name, cmd) ||
-		    spa_streq(command_list[i].alias, cmd)) {
-			return command_list[i].func(data, cmd, args, error);
+	SPA_FOR_EACH_ELEMENT_VAR(command_list, c) {
+		if (spa_streq(c->name, cmd) ||
+		    spa_streq(c->alias, cmd)) {
+			return c->func(data, cmd, args, error);
 		}
 	}
         *error = spa_aprintf("Command \"%s\" does not exist. Type 'help' for usage.", cmd);
@@ -2951,18 +2104,20 @@ static bool parse(struct data *data, char *buf, char **error)
 }
 
 /* We need a global variable, readline doesn't have a closure arg */
-static struct data *readline_dataptr;
+static struct data *input_dataptr;
 
-static void readline_process_line(char *line)
+static void input_process_line(char *line)
 {
-	struct data *d = readline_dataptr;
+	struct data *d = input_dataptr;
 	char *error;
 
 	if (!line)
 		line = strdup("quit");
 
 	if (line[0] != '\0') {
+#ifdef HAVE_READLINE
 		add_history(line);
+#endif
 		if (!parse(d, line, &error)) {
 			fprintf(stderr, "Error: \"%s\"\n", error);
 			free(error);
@@ -2976,8 +2131,21 @@ static void do_input(void *data, int fd, uint32_t mask)
 	struct data *d = data;
 
 	if (mask & SPA_IO_IN) {
-		readline_dataptr = d;
+		input_dataptr = d;
+#ifdef HAVE_READLINE
 		rl_callback_read_char();
+#else
+		{
+			char *line = NULL;
+			size_t s = 0;
+
+			if (getline(&line, &s, stdin) < 0) {
+				free(line);
+				line = NULL;
+			}
+			input_process_line(line);
+		}
+#endif
 
 		if (d->current == NULL)
 			pw_main_loop_quit(d->loop);
@@ -2989,6 +2157,7 @@ static void do_input(void *data, int fd, uint32_t mask)
 	}
 }
 
+#ifdef HAVE_READLINE
 static char *
 readline_match_command(const char *text, int state)
 {
@@ -3027,16 +2196,17 @@ readline_command_completion(const char *text, int start, int end)
 	return matches;
 }
 
-static void readline_init()
+static void readline_init(void)
 {
 	rl_attempted_completion_function = readline_command_completion;
-	rl_callback_handler_install(">> ", readline_process_line);
+	rl_callback_handler_install(">> ", input_process_line);
 }
 
-static void readline_cleanup()
+static void readline_cleanup(void)
 {
 	rl_callback_handler_remove();
 }
+#endif
 
 static void do_quit_on_signal(void *data, int signal_number)
 {
@@ -3051,7 +2221,8 @@ static void show_help(struct data *data, const char *name, bool error)
 		"  -h, --help                            Show this help\n"
 		"      --version                         Show version\n"
 		"  -d, --daemon                          Start as daemon (Default false)\n"
-		"  -r, --remote                          Remote daemon name\n\n"),
+		"  -r, --remote                          Remote daemon name\n"
+		"  -m, --monitor                         Monitor activity\n\n"),
 		name);
 
 	do_help(data, "help", "", NULL);
@@ -3063,22 +2234,24 @@ int main(int argc, char *argv[])
 	struct pw_loop *l;
 	char *opt_remote = NULL;
 	char *error;
-	bool daemon = false;
+	bool daemon = false, monitor = false;
 	struct remote_data *rd;
 	static const struct option long_options[] = {
-		{ "help",	no_argument,		 NULL, 'h' },
-		{ "version",	no_argument,		 NULL, 'V' },
-		{ "daemon",	no_argument,		 NULL, 'd' },
-		{ "remote",	required_argument,	 NULL, 'r' },
+		{ "help",	no_argument,		NULL, 'h' },
+		{ "version",	no_argument,		NULL, 'V' },
+		{ "monitor",	no_argument,		NULL, 'm' },
+		{ "daemon",	no_argument,		NULL, 'd' },
+		{ "remote",	required_argument,	NULL, 'r' },
 		{ NULL,	0, NULL, 0}
 	};
 	int c, i;
 
 	setlinebuf(stdout);
 
+	setlocale(LC_ALL, "");
 	pw_init(&argc, &argv);
 
-	while ((c = getopt_long(argc, argv, "hVdr:", long_options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "hVmdr:", long_options, NULL)) != -1) {
 		switch (c) {
 		case 'h':
 			show_help(&data, argv[0], false);
@@ -3093,6 +2266,9 @@ int main(int argc, char *argv[])
 			return 0;
 		case 'd':
 			daemon = true;
+			break;
+		case 'm':
+			monitor = true;
 			break;
 		case 'r':
 			opt_remote = optarg;
@@ -3138,13 +2314,17 @@ int main(int argc, char *argv[])
 		printf("Welcome to PipeWire version %s. Type 'help' for usage.\n",
 				pw_get_library_version());
 
+#ifdef HAVE_READLINE
 		readline_init();
+#endif
 
 		pw_loop_add_io(l, STDIN_FILENO, SPA_IO_IN|SPA_IO_HUP, false, do_input, &data);
 
 		pw_main_loop_run(data.loop);
 
+#ifdef HAVE_READLINE
 		readline_cleanup();
+#endif
 	} else {
 		char buf[4096], *p, *error;
 
@@ -3160,9 +2340,13 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Error: \"%s\"\n", error);
 			free(error);
 		}
-		if (!data.quit && data.current) {
+		if (data.current != NULL)
 			data.current->prompt_pending = pw_core_sync(data.current->core, 0, 0);
+
+		while (!data.quit && data.current != NULL) {
 			pw_main_loop_run(data.loop);
+			if (!monitor)
+				break;
 		}
 	}
 	spa_list_consume(rd, &data.remotes, link)

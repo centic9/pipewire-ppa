@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #ifndef PULSER_SERVER_STREAM_H
 #define PULSER_SERVER_STREAM_H
@@ -60,6 +40,8 @@ struct stream {
 	uint32_t id;		/* id of global */
 	uint32_t index;		/* index */
 
+	uint32_t peer_index;
+
 	struct impl *impl;
 	struct client *client;
 	enum stream_type type;
@@ -70,7 +52,6 @@ struct stream {
 	struct pw_stream *stream;
 	struct spa_hook stream_listener;
 
-	struct spa_io_rate_match *rate_match;
 	struct spa_io_position *position;
 	struct spa_ringbuffer ring;
 	void *buffer;
@@ -81,6 +62,7 @@ struct stream {
 	uint64_t playing_for;
 	uint64_t ticks_base;
 	uint64_t timestamp;
+	uint64_t idle_time;
 	int64_t delay;
 
 	uint32_t last_quantum;
@@ -92,12 +74,14 @@ struct stream {
 	struct spa_fraction default_frag;
 	struct spa_fraction default_tlength;
 	struct spa_fraction min_quantum;
+	uint32_t idle_timeout_sec;
 
 	struct sample_spec ss;
 	struct channel_map map;
 	struct buffer_attr attr;
 	uint32_t frame_size;
 	uint32_t rate;
+	uint64_t lat_usec;
 
 	struct volume volume;
 	bool muted;
@@ -113,6 +97,8 @@ struct stream {
 	unsigned int in_prebuf:1;
 	unsigned int killed:1;
 	unsigned int pending:1;
+	unsigned int is_idle:1;
+	unsigned int is_paused:1;
 };
 
 struct stream *stream_new(struct client *client, enum stream_type type, uint32_t create_tag,
@@ -122,11 +108,14 @@ void stream_free(struct stream *stream);
 void stream_flush(struct stream *stream);
 uint32_t stream_pop_missing(struct stream *stream);
 
+void stream_set_paused(struct stream *stream, bool paused, const char *reason);
+
 int stream_send_underflow(struct stream *stream, int64_t offset);
 int stream_send_overflow(struct stream *stream);
 int stream_send_killed(struct stream *stream);
 int stream_send_started(struct stream *stream);
 int stream_send_request(struct stream *stream);
 int stream_update_minreq(struct stream *stream, uint32_t minreq);
+int stream_send_moved(struct stream *stream, uint32_t peer_index, const char *peer_name);
 
 #endif /* PULSER_SERVER_STREAM_H */

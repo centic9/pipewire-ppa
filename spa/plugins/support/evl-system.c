@@ -1,26 +1,6 @@
-/* Spa
- *
- * Copyright © 2019 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Spa */
+/* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <unistd.h>
 #include <errno.h>
@@ -38,6 +18,7 @@
 #include <spa/support/log.h>
 #include <spa/support/system.h>
 #include <spa/support/plugin.h>
+#include <spa/utils/names.h>
 #include <spa/utils/type.h>
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
@@ -153,7 +134,7 @@ static int impl_pollfd_add(void *object, int pfd, int fd, uint32_t events, void 
 	e->fd = fd;
 	e->events = events;
 	e->data = data;
-	return evl_add_pollfd(pfd, fd, e->events);
+	return evl_add_pollfd(pfd, fd, e->events, evl_nil);
 }
 
 static int impl_pollfd_mod(void *object, int pfd, int fd, uint32_t events, void *data)
@@ -167,7 +148,7 @@ static int impl_pollfd_mod(void *object, int pfd, int fd, uint32_t events, void 
 
 	e->events = events;
 	e->data = data;
-	return evl_mod_pollfd(pfd, fd, e->events);
+	return evl_mod_pollfd(pfd, fd, e->events, evl_nil);
 }
 
 static int impl_pollfd_del(void *object, int pfd, int fd)
@@ -268,10 +249,8 @@ static int impl_timerfd_gettime(void *object,
 }
 static int impl_timerfd_read(void *object, int fd, uint64_t *expirations)
 {
-	uint32_t ticks;
-	if (oob_read(fd, &ticks, sizeof(ticks)) != sizeof(ticks))
+	if (oob_read(fd, expirations, sizeof(uint64_t)) != sizeof(uint64_t))
 		return -errno;
-	*expirations = ticks;
 	return 0;
 }
 
@@ -279,16 +258,17 @@ static int impl_timerfd_read(void *object, int fd, uint64_t *expirations)
 static int impl_eventfd_create(void *object, int flags)
 {
 	struct impl *impl = object;
-	int res;
+	int res, fl;
 
-	res = evl_new_xbuf(1024, 1024, "xbuf-%d-%p-%d", impl->pid, impl, impl->n_xbuf);
+	fl = EVL_CLONE_PRIVATE;
+	if (flags & SPA_FD_NONBLOCK)
+		fl |= EVL_CLONE_NONBLOCK;
+
+	res = evl_create_xbuf(1024, 1024, fl, "xbuf-%d-%p-%d", impl->pid, impl, impl->n_xbuf);
 	if (res < 0)
 		return res;
 
 	impl->n_xbuf++;
-
-	if (flags & SPA_FD_NONBLOCK)
-		fcntl(res, F_SETFL, fcntl(res, F_GETFL) | O_NONBLOCK);
 
 	return res;
 }

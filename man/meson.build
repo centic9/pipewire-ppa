@@ -12,11 +12,14 @@ manpages = [
   'pipewire.conf.5.rst.in',
   'pw-cat.1.rst.in',
   'pw-cli.1.rst.in',
+  'pw-config.1.rst.in',
   'pw-dot.1.rst.in',
+  'pw-link.1.rst.in',
   'pw-metadata.1.rst.in',
   'pw-mididump.1.rst.in',
   'pw-mon.1.rst.in',
   'pw-profiler.1.rst.in',
+  'pw-top.1.rst.in',
 ]
 
 if get_option('pipewire-jack').allowed()

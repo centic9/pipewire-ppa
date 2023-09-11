@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2022 Wim Taymans <wim.taymans@gmail.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2022 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
 
 #include <string.h>
 #include <stdio.h>
@@ -46,7 +26,6 @@
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
-#include <pipewire/private.h>
 
 /** \page page_module_x11_bell PipeWire Module: X11 Bell
  *
@@ -83,6 +62,10 @@
 PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
 
+/* libcanberra is not thread safe when doing ca_context_create()
+ * and so we need a global lock */
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
 struct impl {
 	struct pw_context *context;
 	struct pw_thread_loop *thread_loop;
@@ -104,12 +87,13 @@ static int play_sample(struct impl *impl)
 	ca_context *ca;
 	int res;
 
+	pthread_mutex_lock(&lock);
 	if (impl->properties)
 		sample = pw_properties_get(impl->properties, "sample.name");
 	if (sample == NULL)
 		sample = "bell-window-system";
 
-	pw_log_debug("play sample %s", sample);
+	pw_log_info("play sample %s", sample);
 
 	if ((res = ca_context_create(&ca)) < 0) {
 		pw_log_error("canberra context create error: %s", ca_strerror(res));
@@ -134,6 +118,7 @@ static int play_sample(struct impl *impl)
 exit_destroy:
 	ca_context_destroy(ca);
 exit:
+	pthread_mutex_unlock(&lock);
 	return res;
 }
 
@@ -180,8 +165,8 @@ static int x11_connect(struct impl *impl, const char *name)
 	unsigned int auto_ctrls, auto_values;
 
 	if (!(impl->display = XOpenDisplay(name))) {
-		pw_log_error("XOpenDisplay() failed");
-		return -EIO;
+		pw_log_info("XOpenDisplay() failed. Uninstall or disable the module-x11-bell module");
+		return -EHOSTDOWN;
 	}
 
 	impl->source = pw_loop_add_io(impl->loop,
@@ -251,10 +236,10 @@ static const struct pw_impl_module_events module_events = {
 static const struct spa_dict_item module_x11_bell_info[] = {
 	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
 	{ PW_KEY_MODULE_DESCRIPTION, "X11 Bell interceptor" },
-	{ PW_KEY_MODULE_USAGE,	"sink.name=<name for the sink> "
-				"sample.name=<the sample name> "
-				"x11.display=<the X11 display> "
-				"x11.xauthority=<the X11 XAuthority> " },
+	{ PW_KEY_MODULE_USAGE,	"( sink.name=<name for the sink> ) "
+				"( sample.name=<the sample name> ) "
+				"( x11.display=<the X11 display> ) "
+				".x11.xauthority=<the X11 XAuthority> )" },
 	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
 };
 SPA_EXPORT

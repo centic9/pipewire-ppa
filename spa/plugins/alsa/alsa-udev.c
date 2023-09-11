@@ -1,26 +1,6 @@
-/* Spa ALSA udev
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Spa ALSA udev */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <stddef.h>
 #include <stdio.h>
@@ -34,6 +14,7 @@
 #include <libudev.h>
 #include <alsa/asoundlib.h>
 
+#include <spa/utils/cleanup.h>
 #include <spa/utils/type.h>
 #include <spa/utils/keys.h>
 #include <spa/utils/names.h>
@@ -248,27 +229,24 @@ static void unescape(const char *src, char *dst)
 
 static int check_device_pcm_class(const char *devname)
 {
-	FILE *f;
 	char path[PATH_MAX];
 	char buf[16];
 	size_t sz;
 
 	/* Check device class */
-	spa_scnprintf(path, sizeof(path), "/sys/class/sound/%s/pcm_class",
-			devname);
-	f = fopen(path, "r");
+	spa_scnprintf(path, sizeof(path), "/sys/class/sound/%s/pcm_class", devname);
+
+	spa_autoptr(FILE) f = fopen(path, "re");
 	if (f == NULL)
 		return -errno;
 	sz = fread(buf, 1, sizeof(buf) - 1, f);
 	buf[sz] = '\0';
-	fclose(f);
 	return spa_strstartswith(buf, "modem") ? -ENXIO : 0;
 }
 
 static int get_num_pcm_devices(unsigned int card_id)
 {
 	char prefix[32];
-	DIR *snd = NULL;
 	struct dirent *entry;
 	int num_dev = 0;
 	int res;
@@ -277,7 +255,8 @@ static int get_num_pcm_devices(unsigned int card_id)
 
 	spa_scnprintf(prefix, sizeof(prefix), "pcmC%uD", card_id);
 
-	if ((snd = opendir("/dev/snd")) == NULL)
+	spa_autoptr(DIR) snd = opendir("/dev/snd");
+	if (snd == NULL)
 		return -errno;
 
 	while ((errno = 0, entry = readdir(snd)) != NULL) {
@@ -291,20 +270,13 @@ static int get_num_pcm_devices(unsigned int card_id)
 			++num_dev;
 		}
 	}
-	if (errno != 0)
-		res = -errno;
-	else
-		res = num_dev;
 
-	closedir(snd);
-	return res;
+	return errno != 0 ? -errno : num_dev;
 }
 
 static int check_device_available(struct impl *this, struct device *device, int *num_pcm)
 {
 	char path[PATH_MAX];
-	DIR *card = NULL, *pcm = NULL;
-	FILE *f;
 	char buf[16];
 	size_t sz;
 	struct dirent *entry, *entry_pcm;
@@ -334,7 +306,8 @@ static int check_device_available(struct impl *this, struct device *device, int 
 
 	spa_scnprintf(path, sizeof(path), "/proc/asound/card%u", (unsigned int)device->id);
 
-	if ((card = opendir(path)) == NULL)
+	spa_autoptr(DIR) card = opendir(path);
+	if (card == NULL)
 		goto done;
 
 	while ((errno = 0, entry = readdir(card)) != NULL) {
@@ -350,7 +323,9 @@ static int check_device_available(struct impl *this, struct device *device, int 
 		/* Check busy status */
 		spa_scnprintf(path, sizeof(path), "/proc/asound/card%u/%s",
 				(unsigned int)device->id, entry->d_name);
-		if ((pcm = opendir(path)) == NULL)
+
+		spa_autoptr(DIR) pcm = opendir(path);
+		if (pcm == NULL)
 			goto done;
 
 		while ((errno = 0, entry_pcm = readdir(pcm)) != NULL) {
@@ -361,12 +336,11 @@ static int check_device_available(struct impl *this, struct device *device, int 
 			spa_scnprintf(path, sizeof(path), "/proc/asound/card%u/%s/%s/status",
 					(unsigned int)device->id, entry->d_name, entry_pcm->d_name);
 
-			f = fopen(path, "r");
+			spa_autoptr(FILE) f = fopen(path, "re");
 			if (f == NULL)
 				goto done;
 			sz = fread(buf, 1, 6, f);
 			buf[sz] = '\0';
-			fclose(f);
 
 			if (!spa_strstartswith(buf, "closed")) {
 				spa_log_debug(this->log, "card %u pcm device %s busy",
@@ -379,9 +353,6 @@ static int check_device_available(struct impl *this, struct device *device, int 
 		}
 		if (errno != 0)
 			goto done;
-
-		closedir(pcm);
-		pcm = NULL;
 	}
 	if (errno != 0)
 		goto done;
@@ -391,10 +362,7 @@ done:
 		spa_log_info(this->log, "card %u: failed to find busy status (%s)",
 				(unsigned int)device->id, spa_strerror(-errno));
 	}
-	if (card)
-		closedir(card);
-	if (pcm)
-		closedir(pcm);
+
 	return res;
 }
 
@@ -465,7 +433,7 @@ static int emit_object_info(struct impl *this, struct device *device)
 	if (str && *str) {
 		items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_BUS_PATH, str);
 	}
-	if ((str = udev_device_get_syspath(dev)) && *str) {
+	if ((str = udev_device_get_devpath(dev)) && *str) {
 		items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_SYSFS_PATH, str);
 	}
 	if ((str = udev_device_get_property_value(dev, "ID_ID")) && *str) {
@@ -478,11 +446,10 @@ static int emit_object_info(struct impl *this, struct device *device)
 		items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_SUBSYSTEM, str);
 	}
 	if ((str = udev_device_get_property_value(dev, "ID_VENDOR_ID")) && *str) {
-		char *dec = alloca(6); /* 65535 is max */
 		int32_t val;
-
 		if (spa_atoi32(str, &val, 16)) {
-			snprintf(dec, 6, "%d", val);
+			char *dec = alloca(12); /* 0xffffffff is max */
+			snprintf(dec, 12, "0x%04x", val);
 			items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_VENDOR_ID, dec);
 		}
 	}
@@ -501,11 +468,10 @@ static int emit_object_info(struct impl *this, struct device *device)
 		items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_VENDOR_NAME, str);
 	}
 	if ((str = udev_device_get_property_value(dev, "ID_MODEL_ID")) && *str) {
-		char *dec = alloca(6); /* 65535 is max */
 		int32_t val;
-
 		if (spa_atoi32(str, &val, 16)) {
-			snprintf(dec, 6, "%d", val);
+			char *dec = alloca(12); /* 0xffffffff is max */
+			snprintf(dec, 12, "0x%04x", val);
 			items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_PRODUCT_ID, dec);
 		}
 	}
@@ -540,11 +506,34 @@ static int emit_object_info(struct impl *this, struct device *device)
 
 static bool check_access(struct impl *this, struct device *device)
 {
-	char path[128];
-	bool accessible;
+	char path[128], prefix[32];
+	spa_autoptr(DIR) snd = NULL;
+	struct dirent *entry;
+	bool accessible = false;
 
 	snprintf(path, sizeof(path), "/dev/snd/controlC%u", device->id);
-	accessible = access(path, R_OK|W_OK) >= 0;
+	if (access(path, R_OK|W_OK) >= 0 && (snd = opendir("/dev/snd"))) {
+		/*
+		 * It's possible that controlCX is accessible before pcmCX* or
+		 * the other way around. Return true only if all devices are
+                 * accessible.
+		 */
+
+		accessible = true;
+		spa_scnprintf(prefix, sizeof(prefix), "pcmC%uD", device->id);
+		while ((entry = readdir(snd)) != NULL) {
+			if (!(entry->d_type == DT_CHR &&
+					spa_strstartswith(entry->d_name, prefix)))
+				continue;
+
+			snprintf(path, sizeof(path), "/dev/snd/%.32s", entry->d_name);
+			if (access(path, R_OK|W_OK) < 0) {
+				accessible = false;
+				break;
+			}
+		}
+	}
+
 	if (accessible != device->accessible)
 		spa_log_debug(this->log, "%s accessible:%u", path, accessible);
 	device->accessible = accessible;
@@ -629,9 +618,9 @@ static void impl_on_notify_events(struct spa_source *source)
 {
 	bool deleted = false;
 	struct impl *this = source->data;
-	struct {
+	union {
 		struct inotify_event e;
-		char name[NAME_MAX+1];
+		char name[NAME_MAX+1+sizeof(struct inotify_event)];
 	} buf;
 
 	while (true) {
@@ -648,21 +637,20 @@ static void impl_on_notify_events(struct spa_source *source)
 		e = SPA_PTROFF(&buf, len, void);
 
 		for (p = &buf; p < e;
-		    p = SPA_PTROFF(p, sizeof(struct inotify_event) + event->len, void)) {
+		     p = SPA_PTROFF(p, sizeof(struct inotify_event) + event->len, void)) {
 			unsigned int id;
 			struct device *device;
 
 			event = (const struct inotify_event *) p;
+			spa_assert_se(SPA_PTRDIFF(e, p) >= (ptrdiff_t)sizeof(struct inotify_event) &&
+			              SPA_PTRDIFF(e, p) - sizeof(struct inotify_event) >= event->len &&
+			              "bad event from kernel");
 
 			/* Device becomes accessible or not busy */
 			if ((event->mask & (IN_ATTRIB | IN_CLOSE_WRITE))) {
 				bool access;
-
-				if ((event->mask & IN_ATTRIB) &&
-						spa_strstartswith(event->name, "pcm"))
-					continue;
 				if (sscanf(event->name, "controlC%u", &id) != 1 &&
-						sscanf(event->name, "pcmC%uD", &id) != 1)
+				    sscanf(event->name, "pcmC%uD", &id) != 1)
 					continue;
 				if ((device = find_device(this, id)) == NULL)
 					continue;

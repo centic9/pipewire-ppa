@@ -1,33 +1,12 @@
-/* PipeWire
- *
- * Copyright © 2021 Wim Taymans <wim.taymans@gmail.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
 
 #include <pipewire/impl.h>
 #include <pipewire/pipewire.h>
 
 #include "../defs.h"
 #include "../module.h"
-#include "registry.h"
 
 #define NAME "simple-protocol-tcp"
 
@@ -59,31 +38,18 @@ static const struct pw_impl_module_events module_events = {
 	.destroy = module_destroy
 };
 
-static int module_simple_protocol_tcp_load(struct client *client, struct module *module)
+static int module_simple_protocol_tcp_load(struct module *module)
 {
 	struct module_simple_protocol_tcp_data *data = module->user_data;
-	struct impl *impl = client->impl;
+	struct impl *impl = module->impl;
 	char *args;
 	size_t size;
-	uint32_t i;
 	FILE *f;
 
 	if ((f = open_memstream(&args, &size)) == NULL)
 		return -errno;
 
 	fprintf(f, "{");
-	if (data->info.rate != 0)
-		fprintf(f, " \"audio.rate\": %u,", data->info.rate);
-	if (data->info.channels != 0) {
-		fprintf(f, " \"audio.channels\": %u,", data->info.channels);
-		if (!(data->info.flags & SPA_AUDIO_FLAG_UNPOSITIONED)) {
-			fprintf(f, " \"audio.position\": [ ");
-			for (i = 0; i < data->info.channels; i++)
-				fprintf(f, "%s\"%s\"", i == 0 ? "" : ",",
-					channel_id2name(data->info.position[i]));
-			fprintf(f, " ],");
-		}
-	}
 	pw_properties_serialize_dict(f, &data->module_props->dict, 0);
 	fprintf(f, "}");
 	fclose(f);
@@ -115,12 +81,6 @@ static int module_simple_protocol_tcp_unload(struct module *module)
 	return 0;
 }
 
-static const struct module_methods module_simple_protocol_tcp_methods = {
-	VERSION_MODULE_METHODS,
-	.load = module_simple_protocol_tcp_load,
-	.unload = module_simple_protocol_tcp_unload,
-};
-
 static const struct spa_dict_item module_simple_protocol_tcp_info[] = {
 	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
 	{ PW_KEY_MODULE_DESCRIPTION, "Simple protocol (TCP sockets)" },
@@ -137,24 +97,16 @@ static const struct spa_dict_item module_simple_protocol_tcp_info[] = {
 	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
 };
 
-struct module *create_module_simple_protocol_tcp(struct impl *impl, const char *argument)
+static int module_simple_protocol_tcp_prepare(struct module * const module)
 {
-	struct module *module;
-	struct module_simple_protocol_tcp_data *d;
-	struct pw_properties *props = NULL, *module_props = NULL;
+	struct module_simple_protocol_tcp_data * const d = module->user_data;
+	struct pw_properties * const props = module->props;
+	struct pw_properties *module_props = NULL;
 	const char *str, *port, *listen;
 	struct spa_audio_info_raw info = { 0 };
 	int res;
 
 	PW_LOG_TOPIC_INIT(mod_topic);
-
-	props = pw_properties_new_dict(&SPA_DICT_INIT_ARRAY(module_simple_protocol_tcp_info));
-	if (props == NULL) {
-		res = -errno;
-		goto out;
-	}
-	if (argument)
-		module_args_add_props(props, argument);
 
 	module_props = pw_properties_new(NULL, NULL);
 	if (module_props == NULL) {
@@ -162,15 +114,13 @@ struct module *create_module_simple_protocol_tcp(struct impl *impl, const char *
 		goto out;
 	}
 
-	if ((str = pw_properties_get(props, "format")) != NULL) {
-		pw_properties_set(module_props, "audio.format",
-				format_id2name(format_paname2id(str, strlen(str))));
-		pw_properties_set(props, "format", NULL);
-	}
-	if (module_args_to_audioinfo(impl, props, &info) < 0) {
+	if (module_args_to_audioinfo_keys(module->impl, props,
+			"format", "rate", "channels", "channel_map", &info) < 0) {
 		res = -EINVAL;
 		goto out;
 	}
+	audioinfo_to_properties(&info, module_props);
+
 	if ((str = pw_properties_get(props, "playback")) != NULL) {
 		pw_properties_set(module_props, "playback", str);
 		pw_properties_set(props, "playback", NULL);
@@ -204,22 +154,22 @@ struct module *create_module_simple_protocol_tcp(struct impl *impl, const char *
 	pw_properties_setf(module_props, "server.address", "[ \"tcp:%s%s%s\" ]",
 			listen ? listen : "", listen ? ":" : "", port);
 
-	module = module_new(impl, &module_simple_protocol_tcp_methods, sizeof(*d));
-	if (module == NULL) {
-		res = -errno;
-		goto out;
-	}
-
-	module->props = props;
-	d = module->user_data;
 	d->module = module;
 	d->module_props = module_props;
 	d->info = info;
 
-	return module;
+	return 0;
 out:
 	pw_properties_free(module_props);
-	pw_properties_free(props);
-	errno = -res;
-	return NULL;
+
+	return res;
 }
+
+DEFINE_MODULE_INFO(module_simple_protocol_tcp) = {
+	.name = "module-simple-protocol-tcp",
+	.prepare = module_simple_protocol_tcp_prepare,
+	.load = module_simple_protocol_tcp_load,
+	.unload = module_simple_protocol_tcp_unload,
+	.properties = &SPA_DICT_INIT_ARRAY(module_simple_protocol_tcp_info),
+	.data_size = sizeof(struct module_simple_protocol_tcp_data),
+};

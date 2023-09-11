@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
-export DEB_LDFLAGS_MAINT_APPEND = -Wl,-z,defs -Wl,--as-needed
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,-z,defs
 
 %:
 	dh $@
@@ -12,17 +12,37 @@ else
 DOCS=enabled
 endif
 
+built_binaries := $(shell dh_listpackages)
+
+ifneq ($(filter %-tests,$(built_binaries)),)
+INSTTEST=enabled
+SDL2=enabled
+else
+INSTTEST=disabled
+SDL2=disabled
+endif
+
 ifneq (,$(filter s390x hppa m68k powerpc ppc64 sparc64,$(DEB_HOST_ARCH)))
 BLUEZ5_CODEC_LDAC=disabled
 else
 BLUEZ5_CODEC_LDAC=enabled
 endif
 
+ifneq (,$(filter m68k,$(DEB_HOST_ARCH)))
+LIBCAMERA=disabled
+else
+LIBCAMERA=enabled
+endif
+
 # lilv and some of its dependencies are in universe
 ifeq (yes,$(shell dpkg-vendor --derives-from Ubuntu && echo yes))
 LV2=disabled
+LIBMYSOFA=disabled
+LIBFFADO=disabled
 else
 LV2=enabled
+LIBMYSOFA=enabled
+LIBFFADO=enabled
 endif
 
 override_dh_auto_configure:
@@ -30,20 +50,26 @@ override_dh_auto_configure:
 		-Daudiotestsrc=enabled \
 		-Dauto_features=enabled \
 		-Davahi=enabled \
+		-Dbluez5-backend-native-mm=enabled \
 		-Dbluez5-codec-aac=disabled \
-		-Dbluez5-codec-aptx=disabled \
+		-Dbluez5-codec-aptx=enabled \
+		-Dbluez5-codec-lc3=enabled \
+		-Dbluez5-codec-lc3plus=disabled \
 		-Dbluez5-codec-ldac=$(BLUEZ5_CODEC_LDAC) \
-		-Dlibcamera=disabled \
+		-Dbluez5-codec-opus=enabled \
+		-Dlibcamera=$(LIBCAMERA) \
+		-Dlibffado=$(LIBFFADO) \
+		-Dlibmysofa=$(LIBMYSOFA) \
 		-Ddocs=$(DOCS) \
 		-Dffmpeg=disabled \
-		-Dinstalled_tests=enabled \
+		-Dinstalled_tests=$(INSTTEST) \
 		-Dlv2=$(LV2) \
 		-Dman=enabled \
 		-Droc=disabled \
+		-Dsdl2=$(SDL2) \
 		-Dsession-managers= \
 		-Dtest=enabled \
 		-Dvideotestsrc=enabled \
-		-Dvolume=enabled \
 		-Dvulkan=disabled \
 		$(NULL)
 	install -d debian/ld.so.conf.d
@@ -77,10 +103,10 @@ override_dh_makeshlibs:
 
 override_dh_shlibdeps-arch:
 	dh_shlibdeps \
-		-ppipewire-audio-client-libraries \
+		-ppipewire-jack \
 		-l/usr/lib/$(DEB_HOST_MULTIARCH)/pipewire-0.3 \
 		-- \
-		-Ldebian/pipewire-audio-client-libraries.shlibs.local \
+		-Ldebian/pipewire-jack.shlibs.local \
 		$(NULL)
 	dh_shlibdeps \
 		--remaining-packages \

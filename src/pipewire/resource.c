@@ -1,28 +1,9 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <string.h>
+#include <assert.h>
 
 #include "pipewire/private.h"
 #include "pipewire/protocol.h"
@@ -57,6 +38,7 @@ struct pw_resource *pw_resource_new(struct pw_impl_client *client,
 		return NULL;
 
 	this = &impl->this;
+	this->refcount = 1;
 	this->context = client->context;
 	this->client = client;
 	this->permissions = permissions;
@@ -212,9 +194,19 @@ int pw_resource_set_bound_id(struct pw_resource *resource, uint32_t global_id)
 	struct pw_impl_client *client = resource->client;
 
 	resource->bound_id = global_id;
+
 	if (client->core_resource != NULL) {
-		pw_log_debug("%p: %u global_id:%u", resource, resource->id, global_id);
-		pw_core_resource_bound_id(client->core_resource, resource->id, global_id);
+		struct pw_global *global = pw_map_lookup(&resource->context->globals, global_id);
+		const struct spa_dict *dict = global ? &global->properties->dict : NULL;
+
+		pw_log_debug("%p: %u global_id:%u %d", resource, resource->id, global_id,
+				client->core_resource->version);
+
+		if (client->core_resource->version >= 4)
+			pw_core_resource_bound_props(client->core_resource, resource->id, global_id,
+					dict);
+		else
+			pw_core_resource_bound_id(client->core_resource, resource->id, global_id);
 	}
 	return 0;
 }
@@ -279,16 +271,57 @@ void pw_resource_error(struct pw_resource *resource, int res, const char *error)
 }
 
 SPA_EXPORT
+void pw_resource_ref(struct pw_resource *resource)
+{
+	assert(resource->refcount > 0);
+	resource->refcount++;
+}
+
+SPA_EXPORT
+void pw_resource_unref(struct pw_resource *resource)
+{
+	assert(resource->refcount > 0);
+	if (--resource->refcount > 0)
+		return;
+
+	pw_log_debug("%p: free %u", resource, resource->id);
+	assert(resource->destroyed);
+
+#if DEBUG_LISTENERS
+	{
+		struct spa_hook *h;
+		spa_list_for_each(h, &resource->object_listener_list.list, link) {
+			pw_log_warn("%p: resource %u: leaked object listener %p",
+					resource, resource->id, h);
+			break;
+		}
+		spa_list_for_each(h, &resource->listener_list.list, link) {
+			pw_log_warn("%p: resource %u: leaked listener %p",
+					resource, resource->id, h);
+			break;
+		}
+	}
+#endif
+	spa_hook_list_clean(&resource->listener_list);
+	spa_hook_list_clean(&resource->object_listener_list);
+
+	free(resource);
+}
+
+SPA_EXPORT
 void pw_resource_destroy(struct pw_resource *resource)
 {
 	struct pw_impl_client *client = resource->client;
+
+	pw_log_debug("%p: destroy %u", resource, resource->id);
+	assert(!resource->destroyed);
+	resource->destroyed = true;
 
 	if (resource->global) {
 		spa_list_remove(&resource->link);
 		resource->global = NULL;
 	}
 
-	pw_log_debug("%p: destroy %u", resource, resource->id);
 	pw_resource_emit_destroy(resource);
 
 	pw_map_insert_at(&client->objects, resource->id, NULL);
@@ -297,12 +330,7 @@ void pw_resource_destroy(struct pw_resource *resource)
 	if (client->core_resource && !resource->removed)
 		pw_core_resource_remove_id(client->core_resource, resource->id);
 
-	pw_log_debug("%p: free %u", resource, resource->id);
-
-	spa_hook_list_clean(&resource->listener_list);
-	spa_hook_list_clean(&resource->object_listener_list);
-
-	free(resource);
+	pw_resource_unref(resource);
 }
 
 SPA_EXPORT

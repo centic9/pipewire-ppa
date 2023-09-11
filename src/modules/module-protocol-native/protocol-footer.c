@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <stdio.h>
 #include <errno.h>
@@ -45,7 +25,7 @@ struct footer_builder {
 	unsigned int started:1;
 };
 
-#define FOOTER_BUILDER_INIT(builder) (struct footer_builder) { builder }
+#define FOOTER_BUILDER_INIT(builder) ((struct footer_builder) { (builder) })
 
 static void start_footer_entry(struct footer_builder *fb, uint32_t opcode)
 {
@@ -109,7 +89,7 @@ void marshal_client_footers(struct footer_client_global_state *state, struct pw_
 	end_footer(&fb);
 }
 
-int demarshal_core_generation(void *object, struct spa_pod_parser *parser)
+static int demarshal_core_generation(void *object, struct spa_pod_parser *parser)
 {
 	struct pw_core *core = object;
 	int64_t generation;
@@ -126,7 +106,7 @@ int demarshal_core_generation(void *object, struct spa_pod_parser *parser)
 	return 0;
 }
 
-int demarshal_client_generation(void *object, struct spa_pod_parser *parser)
+static int demarshal_client_generation(void *object, struct spa_pod_parser *parser)
 {
 	struct pw_impl_client *client = object;
 	int64_t generation;

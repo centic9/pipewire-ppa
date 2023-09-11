@@ -1,26 +1,6 @@
-/* Spa ALSA Source
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Spa ALSA Source */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <stddef.h>
 
@@ -57,9 +37,9 @@ static void emit_node_info(struct state *this, bool full)
 	if (full)
 		this->info.change_mask = this->info_all;
 	if (this->info.change_mask) {
-		struct spa_dict_item items[4];
+		struct spa_dict_item items[7];
 		uint32_t i, n_items = 0;
-		char latency[64];
+		char latency[64], period[64], nperiods[64], headroom[64];
 
 		items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_API, "alsa");
 		items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_MEDIA_CLASS, "Audio/Source");
@@ -67,6 +47,13 @@ static void emit_node_info(struct state *this, bool full)
 		if (this->have_format) {
 			snprintf(latency, sizeof(latency), "%lu/%d", this->buffer_frames / 2, this->rate);
 			items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_NODE_MAX_LATENCY, latency);
+			snprintf(period, sizeof(period), "%lu", this->period_frames);
+			items[n_items++] = SPA_DICT_ITEM_INIT("api.alsa.period-size", period);
+			snprintf(nperiods, sizeof(nperiods), "%lu",
+					this->period_frames != 0 ? this->buffer_frames / this->period_frames : 0);
+			items[n_items++] = SPA_DICT_ITEM_INIT("api.alsa.period-num", nperiods);
+			snprintf(headroom, sizeof(headroom), "%u", this->headroom);
+			items[n_items++] = SPA_DICT_ITEM_INIT("api.alsa.headroom", headroom);
 		}
 		this->info.props = &SPA_DICT_INIT(items, n_items);
 
@@ -160,7 +147,7 @@ static int impl_node_enum_params(void *object, int seq,
 				SPA_TYPE_OBJECT_PropInfo, id,
 				SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_latencyOffsetNsec),
 				SPA_PROP_INFO_description, SPA_POD_String("Latency offset (ns)"),
-				SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Long(0LL, 0LL, INT64_MAX));
+				SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Long(0LL, 0LL, 2 * SPA_NSEC_PER_SEC));
 			break;
 		default:
 			param = spa_alsa_enum_propinfo(this, result.index - 4, &b);
@@ -290,24 +277,27 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 	case SPA_PARAM_Props:
 	{
 		struct props *p = &this->props;
-		struct spa_process_latency_info info;
 		struct spa_pod *params = NULL;
+		int64_t lat_ns = -1;
 
 		if (param == NULL) {
 			reset_props(p);
 			return 0;
 		}
 
-		info = this->process_latency;
-
 		spa_pod_parse_object(param,
 			SPA_TYPE_OBJECT_Props, NULL,
 			SPA_PROP_device,       SPA_POD_OPT_Stringn(p->device, sizeof(p->device)),
-			SPA_PROP_latencyOffsetNsec,   SPA_POD_OPT_Long(&info.ns),
+			SPA_PROP_latencyOffsetNsec,   SPA_POD_OPT_Long(&lat_ns),
 			SPA_PROP_params,       SPA_POD_OPT_Pod(&params));
 
 		spa_alsa_parse_prop_params(this, params);
-		handle_process_latency(this, &info);
+		if (lat_ns != -1) {
+			struct spa_process_latency_info info;
+			info = this->process_latency;
+			info.ns = lat_ns;
+			handle_process_latency(this, &info);
+		}
 
 		emit_node_info(this, false);
 		emit_port_info(this, false);
@@ -316,7 +306,9 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 	case SPA_PARAM_ProcessLatency:
 	{
 		struct spa_process_latency_info info;
-		if ((res = spa_process_latency_parse(param, &info)) < 0)
+		if (param == NULL)
+			spa_zero(info);
+		else if ((res = spa_process_latency_parse(param, &info)) < 0)
 			return res;
 
 		handle_process_latency(this, &info);
@@ -561,7 +553,7 @@ static int port_set_format(void *object,
 			   uint32_t flags, const struct spa_pod *format)
 {
 	struct state *this = object;
-	int err;
+	int err = 0;
 
 	if (format == NULL) {
 		if (!this->have_format)
@@ -605,7 +597,7 @@ static int port_set_format(void *object,
 	}
 	emit_port_info(this, false);
 
-	return 0;
+	return err;
 }
 
 static int
@@ -628,7 +620,9 @@ impl_node_port_set_param(void *object,
 	case SPA_PARAM_Latency:
 	{
 		struct spa_latency_info info;
-		if ((res = spa_latency_parse(param, &info)) < 0)
+		if (param == NULL)
+			info = SPA_LATENCY_INFO(SPA_DIRECTION_REVERSE(direction));
+		else if ((res = spa_latency_parse(param, &info)) < 0)
 			return res;
 		if (direction == info.direction)
 			return -EINVAL;
@@ -637,6 +631,7 @@ impl_node_port_set_param(void *object,
 		this->port_info.change_mask |= SPA_PORT_CHANGE_MASK_PARAMS;
 		this->port_params[PORT_Latency].user++;
 		emit_port_info(this, false);
+		res = 0;
 		break;
 	}
 	default:
@@ -660,9 +655,6 @@ impl_node_port_use_buffers(void *object,
 
 	spa_return_val_if_fail(CHECK_PORT(this, direction, port_id), -EINVAL);
 
-	if (!this->have_format)
-		return -EIO;
-
 	spa_log_debug(this->log, "%p: use %d buffers", this, n_buffers);
 
 	if (this->n_buffers > 0) {
@@ -670,6 +662,11 @@ impl_node_port_use_buffers(void *object,
 		if ((res = clear_buffers(this)) < 0)
 			return res;
 	}
+	if (n_buffers > 0 && !this->have_format)
+		return -EIO;
+	if (n_buffers > MAX_BUFFERS)
+		return -ENOSPC;
+
 	for (i = 0; i < n_buffers; i++) {
 		struct buffer *b = &this->buffers[i];
 		struct spa_data *d = buffers[i]->datas;
@@ -712,6 +709,7 @@ impl_node_port_set_io(void *object,
 		break;
 	case SPA_IO_RateMatch:
 		this->rate_match = data;
+		spa_alsa_update_rate_match(this);
 		break;
 	default:
 		return -ENOENT;
@@ -746,8 +744,8 @@ static int impl_node_process(void *object)
 
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 
-	io = this->io;
-	spa_return_val_if_fail(io != NULL, -EIO);
+	if ((io = this->io) == NULL)
+		return -EIO;
 
 	spa_log_trace_fp(this->log, "%p; status %d", this, io->status);
 

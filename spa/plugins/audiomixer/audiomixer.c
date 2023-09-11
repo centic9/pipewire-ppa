@@ -1,26 +1,6 @@
-/* Spa
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Spa */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
 #include <string.h>
@@ -45,8 +25,11 @@
 #define SPA_LOG_TOPIC_DEFAULT log_topic
 static struct spa_log_topic *log_topic = &SPA_LOG_TOPIC(0, "spa.audiomixer");
 
+#define DEFAULT_RATE		48000
+#define DEFAULT_CHANNELS	2
+
 #define MAX_BUFFERS     64
-#define MAX_PORTS       128
+#define MAX_PORTS       512
 #define MAX_CHANNELS    64
 #define MAX_ALIGN	MIX_OPS_MAX_ALIGN
 
@@ -119,6 +102,9 @@ struct impl {
 	uint32_t last_port;
 	struct port *in_ports[MAX_PORTS];
 	struct port out_ports[1];
+
+	struct buffer *mix_buffers[MAX_PORTS];
+	const void *mix_datas[MAX_PORTS];
 
 	int n_formats;
 	struct spa_audio_info format;
@@ -353,8 +339,10 @@ static int port_enum_formats(void *object,
 								SPA_AUDIO_FORMAT_U24_32,
 								SPA_AUDIO_FORMAT_F32,
 								SPA_AUDIO_FORMAT_F64),
-				SPA_FORMAT_AUDIO_rate,     SPA_POD_CHOICE_RANGE_Int(44100, 1, INT32_MAX),
-				SPA_FORMAT_AUDIO_channels, SPA_POD_CHOICE_RANGE_Int(2, 1, INT32_MAX));
+				SPA_FORMAT_AUDIO_rate,     SPA_POD_CHOICE_RANGE_Int(
+								DEFAULT_RATE, 1, INT32_MAX),
+				SPA_FORMAT_AUDIO_channels, SPA_POD_CHOICE_RANGE_Int(
+								DEFAULT_CHANNELS, 1, INT32_MAX));
 		}
 		break;
 	default:
@@ -561,6 +549,10 @@ static int port_set_format(void *object,
 			if (memcmp(&info, &this->format, sizeof(struct spa_audio_info)))
 				return -EINVAL;
 		} else {
+			if (info.info.raw.format == 0 ||
+			    info.info.raw.channels == 0)
+				return -EINVAL;
+
 			this->ops.fmt = info.info.raw.format;
 			this->ops.n_channels = info.info.raw.channels;
 			this->ops.cpu_flags = this->cpu_flags;
@@ -640,9 +632,12 @@ impl_node_port_use_buffers(void *object,
 
 	port = GET_PORT(this, direction, port_id);
 
-	spa_return_val_if_fail(port->have_format, -EIO);
-
 	clear_buffers(this, port);
+
+	if (n_buffers > 0 && !port->have_format)
+		return -EIO;
+	if (n_buffers > MAX_BUFFERS)
+		return -ENOSPC;
 
 	for (i = 0; i < n_buffers; i++) {
 		struct buffer *b;
@@ -730,8 +725,8 @@ static int impl_node_process(void *object)
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 
 	outport = GET_OUT_PORT(this, 0);
-	outio = outport->io;
-	spa_return_val_if_fail(outio != NULL, -EIO);
+	if ((outio = outport->io) == NULL)
+		return -EIO;
 
 	spa_log_trace_fp(this->log, "%p: status %p %d %d",
 			this, outio, outio->status, outio->buffer_id);
@@ -745,9 +740,9 @@ static int impl_node_process(void *object)
 		outio->buffer_id = SPA_ID_INVALID;
 	}
 
-	buffers = alloca(MAX_PORTS * sizeof(struct buffer *));
-        datas = alloca(MAX_PORTS * sizeof(void *));
-        n_buffers = 0;
+	buffers = this->mix_buffers;
+	datas = this->mix_datas;
+	n_buffers = 0;
 
 	maxsize = UINT32_MAX;
 
@@ -755,6 +750,8 @@ static int impl_node_process(void *object)
 		struct port *inport = GET_IN_PORT(this, i);
 		struct spa_io_buffers *inio = NULL;
 		struct buffer *inb;
+		struct spa_data *bd;
+		uint32_t size, offs;
 
 		if (SPA_UNLIKELY(!PORT_VALID(inport) ||
 		    (inio = inport->io) == NULL ||
@@ -770,26 +767,34 @@ static int impl_node_process(void *object)
 		}
 
 		inb = &inport->buffers[inio->buffer_id];
-		maxsize = SPA_MIN(inb->buffer->datas[0].chunk->size, maxsize);
+		bd = &inb->buffer->datas[0];
 
-		spa_log_trace_fp(this->log, "%p: mix input %d %p->%p %d %d %d", this,
-				i, inio, outio, inio->status, inio->buffer_id, maxsize);
+		offs = SPA_MIN(bd->chunk->offset, bd->maxsize);
+		size = SPA_MIN(bd->maxsize - offs, bd->chunk->size);
+		maxsize = SPA_MIN(size, maxsize);
 
-		datas[n_buffers] = inb->buffer->datas[0].data;
-		buffers[n_buffers++] = inb;
+		spa_log_trace_fp(this->log, "%p: mix input %d %p->%p %d %d %d:%d/%d", this,
+				i, inio, outio, inio->status, inio->buffer_id,
+				offs, size, this->stride);
+
+		if (!SPA_FLAG_IS_SET(bd->chunk->flags, SPA_CHUNK_FLAG_EMPTY)) {
+			datas[n_buffers] = SPA_PTROFF(bd->data, offs, void);
+			buffers[n_buffers++] = inb;
+		}
 		inio->status = SPA_STATUS_NEED_DATA;
 	}
 
 	outb = dequeue_buffer(this, outport);
         if (SPA_UNLIKELY(outb == NULL)) {
-                spa_log_trace(this->log, "%p: out of buffers", this);
+		if (outport->n_buffers > 0)
+			spa_log_warn(this->log, "%p: out of buffers (%d)", this,
+					outport->n_buffers);
                 return -EPIPE;
         }
 
 	if (n_buffers == 1) {
 		*outb->buffer = *buffers[0]->buffer;
-	}
-	else {
+	} else {
 		struct spa_data *d = outb->buf.datas;
 
 		*outb->buffer = outb->buf;
@@ -799,6 +804,7 @@ static int impl_node_process(void *object)
 		d[0].chunk->offset = 0;
 		d[0].chunk->size = maxsize;
 		d[0].chunk->stride = this->stride;
+		SPA_FLAG_UPDATE(d[0].chunk->flags, SPA_CHUNK_FLAG_EMPTY, n_buffers == 0);
 
 		mix_ops_process(&this->ops, d[0].data,
 				datas, n_buffers, maxsize / this->stride);

@@ -1,9 +1,9 @@
 project('pipewire', ['c' ],
-  version : '0.3.48',
+  version : '0.3.79',
   license : [ 'MIT', 'LGPL-2.1-or-later', 'GPL-2.0-only' ],
-  meson_version : '>= 0.59.0',
+  meson_version : '>= 0.61.1',
   default_options : [ 'warning_level=3',
-                      'c_std=gnu99',
+                      'c_std=gnu11',
                       'cpp_std=c++17',
                       'b_pie=true',
                       #'b_sanitize=address,undefined',
@@ -24,6 +24,15 @@ spaversion = '0.2'
 apiversion = '0.3'
 soversion = 0
 libversion = '@0@.@1@.0'.format(soversion, pipewire_version_minor.to_int() * 100 + pipewire_version_micro.to_int())
+
+# LADI/jack
+# 3, for PipeWire being the third JACK implementation, after JACK1 and jackdmp/JACK2)
+jack_version_major = 3
+jack_version_minor = pipewire_version_minor.to_int() * 100 + pipewire_version_micro.to_int()
+# libjack[server] version has 0 for major (for compatibility with other implementations),
+# 3 for minor, and "100*pipewire_version_minor + pipewire_version_micro"
+# as micro version (the minor libpipewire soversion number)
+libjackversion = '@0@.@1@.@2@'.format(soversion, jack_version_major, jack_version_minor)
 
 pipewire_name = 'pipewire-@0@'.format(apiversion)
 spa_name = 'spa-@0@'.format(spaversion)
@@ -67,6 +76,7 @@ cc = meson.get_compiler('c')
 
 common_flags = [
   '-fvisibility=hidden',
+  '-fno-strict-aliasing',
   '-Werror=suggest-attribute=format',
   '-Wsign-compare',
   '-Wpointer-arith',
@@ -81,15 +91,21 @@ common_flags = [
   '-Wno-missing-field-initializers',
   '-Wno-unused-parameter',
   '-Wno-pedantic',
-  '-Wold-style-declaration',
   '-Wdeprecated-declarations',
   '-Wunused-result',
+  '-Werror=return-type',
 ]
 
 cc_flags = common_flags + [
   '-D_GNU_SOURCE',
   '-DFASTPATH',
 # '-DSPA_DEBUG_MEMCPY',
+  '-Werror=implicit-function-declaration',
+  '-Werror=int-conversion',
+  '-Werror=old-style-declaration',
+  '-Werror=old-style-definition',
+  '-Werror=missing-parameter-type',
+  '-Werror=strict-prototypes',
 ]
 add_project_arguments(cc.get_supported_arguments(cc_flags), language: 'c')
 
@@ -97,7 +113,7 @@ have_cpp = add_languages('cpp', native: false, required : false)
 
 if have_cpp
   cxx = meson.get_compiler('cpp')
-  cxx_flags = common_flags
+  cxx_flags = common_flags + [ '-Wno-c99-designator' ]
   add_project_arguments(cxx.get_supported_arguments(cxx_flags), language: 'cpp')
 endif
 
@@ -188,6 +204,7 @@ versiondata.set('PIPEWIRE_VERSION_NANO', pipewire_version_nano)
 versiondata.set_quoted('PIPEWIRE_API_VERSION', apiversion)
 
 cdata = configuration_data()
+cdata.set_quoted('PREFIX', prefix)
 cdata.set_quoted('PIPEWIRE_CONFDATADIR', pipewire_confdatadir)
 cdata.set_quoted('LOCALEDIR', pipewire_localedir)
 cdata.set_quoted('LIBDIR', pipewire_libdir)
@@ -259,17 +276,38 @@ cdata.set('HAVE_DBUS', dbus_dep.found())
 sdl_dep = dependency('sdl2', required : get_option('sdl2'))
 summary({'SDL2 (video examples)': sdl_dep.found()}, bool_yn: true, section: 'Misc dependencies')
 drm_dep = dependency('libdrm', required : false)
-readline_dep = dependency('readline', required : false)
+readline_dep = dependency('readline', required : get_option('readline'))
 
 if not readline_dep.found()
-  readline_dep = cc.find_library('readline', required: false)
+  readline_dep = cc.find_library('readline', required : get_option('readline'))
 endif
 
+# Both the FFmpeg SPA plugin and the pw-cat FFmpeg integration use libavcodec.
+# But only the latter also needs libavformat and libavutil.
+# Search for these libraries here, globally, so both of these subprojects can reuse the results.
+pw_cat_ffmpeg = get_option('pw-cat-ffmpeg')
+ffmpeg = get_option('ffmpeg')
+if pw_cat_ffmpeg.allowed() or ffmpeg.allowed()
+  avcodec_dep = dependency('libavcodec', required: pw_cat_ffmpeg.enabled() or ffmpeg.enabled())
+  avformat_dep = dependency('libavformat', required: pw_cat_ffmpeg.enabled())
+  avutil_dep = dependency('libavutil', required: pw_cat_ffmpeg.enabled())
+else
+  avcodec_dep = dependency('', required: false)
+endif
+cdata.set('HAVE_PW_CAT_FFMPEG_INTEGRATION', pw_cat_ffmpeg.allowed())
+
+opus_dep = dependency('opus', required : get_option('opus'))
+summary({'opus (Bluetooth, RTP)': opus_dep.found()}, bool_yn: true, section: 'Misc dependencies')
+cdata.set('HAVE_OPUS', opus_dep.found())
+
 summary({'readline (for pw-cli)': readline_dep.found()}, bool_yn: true, section: 'Misc dependencies')
+cdata.set('HAVE_READLINE', readline_dep.found())
 ncurses_dep = dependency('ncursesw', required : false)
 sndfile_dep = dependency('sndfile', version : '>= 1.0.20', required : get_option('sndfile'))
 summary({'sndfile': sndfile_dep.found()}, bool_yn: true, section: 'pw-cat/pw-play/pw-dump/filter-chain')
 cdata.set('HAVE_SNDFILE', sndfile_dep.found())
+libmysofa_dep = dependency('libmysofa', required : get_option('libmysofa'))
+summary({'libmysofa': libmysofa_dep.found()}, bool_yn: true, section: 'filter-chain')
 pulseaudio_dep = dependency('libpulse', required : get_option('libpulse'))
 summary({'libpulse': pulseaudio_dep.found()}, bool_yn: true, section: 'Streaming between daemons')
 avahi_dep = dependency('avahi-client', required : get_option('avahi'))
@@ -293,6 +331,14 @@ cdata.set('HAVE_LIBUSB', libusb_dep.found())
 
 cap_lib = dependency('libcap', required : false)
 cdata.set('HAVE_LIBCAP', cap_lib.found())
+
+glib2_dep = dependency('glib-2.0', required : get_option('flatpak'))
+summary({'GLib-2.0 (Flatpak support)': glib2_dep.found()}, bool_yn: true, section: 'Misc dependencies')
+flatpak_support = glib2_dep.found()
+cdata.set('HAVE_GLIB2', flatpak_support)
+
+gio_dep = dependency('gio-2.0', version : '>= 2.26.0', required : get_option('gsettings'))
+summary({'GIO (GSettings)': gio_dep.found()}, bool_yn: true, section: 'Misc dependencies')
 
 gst_option = get_option('gstreamer')
 gst_deps_def = {
@@ -335,16 +381,16 @@ webrtc_dep = dependency('webrtc-audio-processing',
 summary({'WebRTC Echo Canceling': webrtc_dep.found()}, bool_yn: true, section: 'Misc dependencies')
 cdata.set('HAVE_WEBRTC', webrtc_dep.found())
 
-# On FreeBSD, epoll-shim library is required for eventfd() and timerfd()
-epoll_shim_dep = (build_machine.system() == 'freebsd'
+# On FreeBSD and MidnightBSD, epoll-shim library is required for eventfd() and timerfd()
+epoll_shim_dep = (host_machine.system() == 'freebsd' or host_machine.system() == 'midnightbsd'
     ? dependency('epoll-shim', required: true)
     : dependency('', required: false))
 
-libinotify_dep = (build_machine.system() == 'freebsd'
+libinotify_dep = (host_machine.system() == 'freebsd' or host_machine.system() == 'midnightbsd'
     ? dependency('libinotify', required: true)
     : dependency('', required: false))
 
-# On FreeBSD, libintl library is required for gettext
+# On FreeBSD and MidnightBSD, libintl library is required for gettext
 libintl_dep = cc.find_library('intl', required: false)
 if not libintl_dep.found()
     libintl_dep = dependency('intl', required: false)
@@ -355,8 +401,8 @@ need_alsa = get_option('pipewire-alsa').enabled() or 'media-session' in get_opti
 alsa_dep = dependency('alsa', version : '>=1.1.7', required: need_alsa)
 summary({'pipewire-alsa': alsa_dep.found()}, bool_yn: true)
 
-if build_machine.system() == 'freebsd'
-# On FreeBSD the OpenSSL library may come from base or a package.
+if host_machine.system() == 'freebsd' or host_machine.system() == 'midnightbsd'
+# On FreeBSD and MidnightBSD the OpenSSL library may come from base or a package.
 # Check for a package first and fallback to the base library if we can't find it via pkgconfig
     openssl_lib = dependency('openssl', required: false)
     if not openssl_lib.found()
@@ -369,12 +415,16 @@ summary({'OpenSSL (for raop-sink)': openssl_lib.found()}, bool_yn: true)
 
 lilv_lib = dependency('lilv-0', required: get_option('lv2'))
 summary({'lilv (for lv2 plugins)': lilv_lib.found()}, bool_yn: true)
-cdata.set('HAVE_LILV', lilv_lib.found())
+
+libffado_dep = dependency('libffado', required: get_option('libffado'))
+summary({'ffado': libffado_dep.found()}, bool_yn: true)
 
 check_functions = [
   ['gettid', '#include <unistd.h>', ['-D_GNU_SOURCE'], []],
   ['memfd_create', '#include <sys/mman.h>', ['-D_GNU_SOURCE'], []],
   ['getrandom', '#include <stddef.h>\n#include <sys/random.h>', ['-D_GNU_SOURCE'], []],
+  ['random_r', '#include <stdlib.h>', ['-D_GNU_SOURCE'], []],
+  ['reallocarray', '#include <stdlib.h>', ['-D_GNU_SOURCE'], []],
   ['sigabbrev_np', '#include <string.h>', ['-D_GNU_SOURCE'], []],
   ['XSetIOErrorExitHandler', '#include <X11/Xlib.h>', [], [x11_dep]],
 ]

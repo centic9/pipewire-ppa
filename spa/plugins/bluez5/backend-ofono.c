@@ -1,26 +1,6 @@
-/* Spa oFono backend
- *
- * Copyright © 2020 Collabora Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Spa oFono backend */
+/* SPDX-FileCopyrightText: Copyright © 2020 Collabora Ltd. */
+/* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
 #include <unistd.h>
@@ -38,9 +18,14 @@
 #include <spa/support/plugin.h>
 #include <spa/utils/string.h>
 #include <spa/utils/type.h>
+#include <spa/utils/result.h>
 #include <spa/param/audio/raw.h>
 
 #include "defs.h"
+#include "dbus-helpers.h"
+
+#define INITIAL_INTERVAL_NSEC	(500 * SPA_NSEC_PER_MSEC)
+#define ACTION_INTERVAL_NSEC	(3000 * SPA_NSEC_PER_MSEC)
 
 static struct spa_log_topic log_topic = SPA_LOG_TOPIC(0, "spa.bluez5.ofono");
 #undef SPA_LOG_TOPIC_DEFAULT
@@ -53,10 +38,14 @@ struct impl {
 
 	struct spa_log *log;
 	struct spa_loop *main_loop;
+	struct spa_system *main_system;
 	struct spa_dbus *dbus;
+	struct spa_loop_utils *loop_utils;
 	DBusConnection *conn;
 
 	const struct spa_bt_quirks *quirks;
+
+	struct spa_source *timer;
 
 	unsigned int filters_added:1;
 	unsigned int msbc_supported:1;
@@ -64,6 +53,8 @@ struct impl {
 
 struct transport_data {
 	struct spa_source sco;
+	unsigned int broken:1;
+	unsigned int activated:1;
 };
 
 #define OFONO_HF_AUDIO_MANAGER_INTERFACE OFONO_SERVICE ".HandsfreeAudioManager"
@@ -149,8 +140,8 @@ finish:
 
 static int _audio_acquire(struct impl *backend, const char *path, uint8_t *codec)
 {
-	DBusMessage *m, *r;
-	DBusError err;
+	spa_autoptr(DBusMessage) m = NULL, r = NULL;
+	spa_auto(DBusError) err = DBUS_ERROR_INIT;
 	int ret = 0;
 
 	m = dbus_message_new_method_call(OFONO_SERVICE, path,
@@ -159,23 +150,24 @@ static int _audio_acquire(struct impl *backend, const char *path, uint8_t *codec
 	if (m == NULL)
 		return -ENOMEM;
 
-	dbus_error_init(&err);
 
+	/*
+	 * XXX: We assume here oFono replies. It however can happen that the headset does
+	 * XXX: not properly respond to the codec negotiation RFCOMM commands.
+	 * XXX: oFono (1.34) fails to handle this condition, and will not send DBus reply
+	 * XXX: in this case. The transport acquire API is synchronous, so we can't
+	 * XXX: do better here right now.
+	 */
 	r = dbus_connection_send_with_reply_and_block(backend->conn, m, -1, &err);
-	dbus_message_unref(m);
-	m = NULL;
-
 	if (r == NULL) {
 		spa_log_error(backend->log, "Transport Acquire() failed for transport %s (%s)",
 		              path, err.message);
-		dbus_error_free(&err);
 		return -EIO;
 	}
 
 	if (dbus_message_get_type(r) == DBUS_MESSAGE_TYPE_ERROR) {
 		spa_log_error(backend->log, "Acquire returned error: %s", dbus_message_get_error_name(r));
-		ret = -EIO;
-		goto finish;
+		return -EIO;
 	}
 
 	if (!dbus_message_get_args(r, &err,
@@ -183,25 +175,28 @@ static int _audio_acquire(struct impl *backend, const char *path, uint8_t *codec
 	                           DBUS_TYPE_BYTE, codec,
 	                           DBUS_TYPE_INVALID)) {
 		spa_log_error(backend->log, "Failed to parse Acquire() reply: %s", err.message);
-		dbus_error_free(&err);
-		ret = -EIO;
-		goto finish;
+		return -EIO;
 	}
 
-finish:
-	dbus_message_unref(r);
 	return ret;
 }
 
 static int ofono_audio_acquire(void *data, bool optional)
 {
 	struct spa_bt_transport *transport = data;
+	struct transport_data *td = transport->user_data;
 	struct impl *backend = SPA_CONTAINER_OF(transport->backend, struct impl, this);
 	uint8_t codec;
 	int ret = 0;
 
 	if (transport->fd >= 0)
 		goto finish;
+	if (td->broken) {
+		ret = -EIO;
+		goto finish;
+	}
+
+	spa_bt_device_update_last_bluez_action_time(transport->device);
 
 	ret = _audio_acquire(backend, transport->path, &codec);
 	if (ret < 0)
@@ -210,26 +205,29 @@ static int ofono_audio_acquire(void *data, bool optional)
 	transport->fd = ret;
 
 	if (transport->codec != codec) {
-		struct spa_bt_transport *t = NULL;
+		struct timespec ts;
 
-		spa_log_warn(backend->log, "Acquired codec (%d) differs from transport one (%d)",
-		             codec, transport->codec);
+		spa_log_info(backend->log, "transport %p: acquired codec (%d) differs from transport one (%d)",
+				transport, codec, transport->codec);
 
 		/* shutdown to make sure connection is dropped immediately */
 		shutdown(transport->fd, SHUT_RDWR);
 		close(transport->fd);
 		transport->fd = -1;
 
-		/* Create a new transport which differs only for codec */
-		t = _transport_create(backend, transport->path, transport->device,
-		                      transport->profile, codec, &transport->impl);
-
-		spa_bt_transport_free(transport);
-		spa_bt_device_connect_profile(t->device, t->profile);
+		/* schedule immediate profile update, from main loop */
+		transport->codec = codec;
+		td->broken = true;
+		ts.tv_sec = 0;
+		ts.tv_nsec = 1;
+		spa_loop_utils_update_timer(backend->loop_utils, backend->timer,
+				&ts, NULL, false);
 
 		ret = -EIO;
 		goto finish;
 	}
+
+	td->broken = false;
 
 	spa_log_debug(backend->log, "transport %p: Acquire %s, fd %d codec %d", transport,
 			transport->path, transport->fd, transport->codec);
@@ -238,6 +236,11 @@ static int ofono_audio_acquire(void *data, bool optional)
 	ret = 0;
 
 finish:
+	if (ret < 0)
+		spa_bt_transport_set_state(transport, SPA_BT_TRANSPORT_STATE_ERROR);
+	else
+		spa_bt_transport_set_state(transport, SPA_BT_TRANSPORT_STATE_ACTIVE);
+
 	return ret;
 }
 
@@ -248,6 +251,8 @@ static int ofono_audio_release(void *data)
 
 	spa_log_debug(backend->log, "transport %p: Release %s",
 			transport, transport->path);
+
+	spa_bt_transport_set_state(transport, SPA_BT_TRANSPORT_STATE_IDLE);
 
 	if (transport->sco_io) {
 		spa_bt_sco_io_destroy(transport->sco_io);
@@ -293,14 +298,74 @@ static const struct spa_bt_transport_implementation ofono_transport_impl = {
 	.release = ofono_audio_release,
 };
 
+static bool activate_transport(struct spa_bt_transport *t, const void *data)
+{
+	struct impl *backend = (void *)data;
+	struct transport_data *td = t->user_data;
+	struct timespec ts;
+	uint64_t now, threshold;
+
+	if (t->backend != &backend->this)
+		return false;
+
+	/* Check device-specific rate limit */
+	spa_system_clock_gettime(backend->main_system, CLOCK_MONOTONIC, &ts);
+	now = SPA_TIMESPEC_TO_NSEC(&ts);
+	threshold = t->device->last_bluez_action_time + ACTION_INTERVAL_NSEC;
+	if (now < threshold) {
+		ts.tv_sec = (threshold - now) / SPA_NSEC_PER_SEC;
+		ts.tv_nsec = (threshold - now) % SPA_NSEC_PER_SEC;
+		spa_loop_utils_update_timer(backend->loop_utils, backend->timer,
+				&ts, NULL, false);
+		return false;
+	}
+
+	if (!td->activated) {
+		/* Connect profile */
+		spa_log_debug(backend->log, "Transport %s activated", t->path);
+		td->activated = true;
+		spa_bt_device_connect_profile(t->device, t->profile);
+	}
+
+	if (td->broken) {
+		/* Recreate the transport */
+		struct spa_bt_transport *t_copy;
+
+		t_copy = _transport_create(backend, t->path, t->device,
+				t->profile, t->codec, (struct spa_callbacks *)&ofono_transport_impl);
+		spa_bt_transport_free(t);
+
+		if (t_copy)
+			spa_bt_device_connect_profile(t_copy->device, t_copy->profile);
+
+		return true;
+	}
+
+	return false;
+}
+
+static void activate_transports(struct impl *backend)
+{
+	while (spa_bt_transport_find_full(backend->monitor, activate_transport, backend));
+}
+
+static void activate_timer_event(void *userdata, uint64_t expirations)
+{
+	struct impl *backend = userdata;
+	spa_loop_utils_update_timer(backend->loop_utils, backend->timer, NULL, NULL, false);
+	activate_transports(backend);
+}
+
 static DBusHandlerResult ofono_audio_card_found(struct impl *backend, char *path, DBusMessageIter *props_i)
 {
 	const char *remote_address = NULL;
 	const char *local_address = NULL;
 	struct spa_bt_device *d;
 	struct spa_bt_transport *t;
+	struct transport_data *td;
 	enum spa_bt_profile profile = SPA_BT_PROFILE_HFP_AG;
-	uint8_t codec = HFP_AUDIO_CODEC_CVSD;
+	uint8_t codec = backend->msbc_supported ?
+		HFP_AUDIO_CODEC_MSBC : HFP_AUDIO_CODEC_CVSD;
 
 	spa_assert(backend);
 	spa_assert(path);
@@ -340,24 +405,6 @@ static DBusHandlerResult ofono_audio_card_found(struct impl *backend, char *path
 		dbus_message_iter_next(props_i);
 	}
 
-	/*
-	 * Acquire and close immediately to figure out the codec.
-	 * This is necessary if we are in HF mode, because we need to emit
-	 * nodes and the advertised sample rate of the node depends on the codec.
-	 * For AG mode, we delay the emission of the nodes, so it is not necessary
-	 * to know the codec in advance
-	 */
-	if (profile == SPA_BT_PROFILE_HFP_HF) {
-		int fd = _audio_acquire(backend, path, &codec);
-		if (fd < 0) {
-			spa_log_error(backend->log, "Failed to retrieve codec for %s", path);
-			return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
-		}
-		/* shutdown to make sure connection is dropped immediately */
-		shutdown(fd, SHUT_RDWR);
-		close(fd);
-	}
-
 	if (!remote_address || !local_address) {
 		spa_log_error(backend->log, "Missing addresses for %s", path);
 		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
@@ -371,8 +418,31 @@ static DBusHandlerResult ofono_audio_card_found(struct impl *backend, char *path
 	spa_bt_device_add_profile(d, profile);
 
 	t = _transport_create(backend, path, d, profile, codec, (struct spa_callbacks *)&ofono_transport_impl);
+	if (t == NULL) {
+		spa_log_error(backend->log, "failed to create transport: %s", spa_strerror(-errno));
+		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+	}
 
-	spa_bt_device_connect_profile(t->device, profile);
+	td = t->user_data;
+
+	/*
+	 * For HF profile, delay profile connect, so that we likely don't do it at the
+	 * same time as the device is busy with A2DP connect. This avoids some oFono
+	 * misbehavior (see comment in _audio_acquire above).
+	 *
+	 * For AG mode, we delay the emission of the nodes, so it is not necessary
+	 * to know the codec in advance.
+	 */
+	if (profile == SPA_BT_PROFILE_HFP_HF) {
+		struct timespec ts;
+		ts.tv_sec = INITIAL_INTERVAL_NSEC / SPA_NSEC_PER_SEC;
+		ts.tv_nsec = INITIAL_INTERVAL_NSEC % SPA_NSEC_PER_SEC;
+		spa_loop_utils_update_timer(backend->loop_utils, backend->timer,
+				&ts, NULL, false);
+	} else {
+		td->activated = true;
+		spa_bt_device_connect_profile(t->device, t->profile);
+	}
 
 	spa_log_debug(backend->log, "Transport %s available, codec %d", t->path, t->codec);
 
@@ -382,18 +452,12 @@ static DBusHandlerResult ofono_audio_card_found(struct impl *backend, char *path
 static DBusHandlerResult ofono_release(DBusConnection *conn, DBusMessage *m, void *userdata)
 {
 	struct impl *backend = userdata;
-	DBusMessage *r;
 
 	spa_log_warn(backend->log, "release");
 
-	r = dbus_message_new_error(m, OFONO_HF_AUDIO_AGENT_INTERFACE ".Error.NotImplemented",
-                                            "Method not implemented");
-	if (r == NULL)
-		return DBUS_HANDLER_RESULT_NEED_MEMORY;
-	if (!dbus_connection_send(conn, r, NULL))
+	if (!reply_with_error(conn, m, OFONO_HF_AUDIO_AGENT_INTERFACE ".Error.NotImplemented", "Method not implemented"))
 		return DBUS_HANDLER_RESULT_NEED_MEMORY;
 
-	dbus_message_unref(r);
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
 
@@ -452,7 +516,7 @@ static DBusHandlerResult ofono_new_audio_connection(DBusConnection *conn, DBusMe
 	uint8_t codec;
 	struct spa_bt_transport *t;
 	struct transport_data *td;
-	DBusMessage *r = NULL;
+	spa_autoptr(DBusMessage) r = NULL;
 
 	if (dbus_message_get_args(m, NULL,
 	                          DBUS_TYPE_OBJECT_PATH, &path,
@@ -502,11 +566,9 @@ static DBusHandlerResult ofono_new_audio_connection(DBusConnection *conn, DBusMe
 
 fail:
 	if (r) {
-		DBusHandlerResult res = DBUS_HANDLER_RESULT_HANDLED;
 		if (!dbus_connection_send(backend->conn, r, NULL))
-			res = DBUS_HANDLER_RESULT_NEED_MEMORY;
-		dbus_message_unref(r);
-		return res;
+			return DBUS_HANDLER_RESULT_NEED_MEMORY;
+		return DBUS_HANDLER_RESULT_HANDLED;
 	}
 
 	return DBUS_HANDLER_RESULT_HANDLED;
@@ -516,7 +578,6 @@ static DBusHandlerResult ofono_handler(DBusConnection *c, DBusMessage *m, void *
 {
 	struct impl *backend = userdata;
 	const char *path, *interface, *member;
-	DBusMessage *r;
 	DBusHandlerResult res;
 
 	path = dbus_message_get_path(m);
@@ -527,6 +588,7 @@ static DBusHandlerResult ofono_handler(DBusConnection *c, DBusMessage *m, void *
 
 	if (dbus_message_is_method_call(m, "org.freedesktop.DBus.Introspectable", "Introspect")) {
 		const char *xml = OFONO_INTROSPECT_XML;
+		spa_autoptr(DBusMessage) r = NULL;
 
 		if ((r = dbus_message_new_method_return(m)) == NULL)
 			return DBUS_HANDLER_RESULT_NEED_MEMORY;
@@ -535,7 +597,6 @@ static DBusHandlerResult ofono_handler(DBusConnection *c, DBusMessage *m, void *
 		if (!dbus_connection_send(backend->conn, r, NULL))
 			return DBUS_HANDLER_RESULT_NEED_MEMORY;
 
-		dbus_message_unref(r);
 		res = DBUS_HANDLER_RESULT_HANDLED;
 	}
 	else if (dbus_message_is_method_call(m, OFONO_HF_AUDIO_AGENT_INTERFACE, "Release"))
@@ -551,22 +612,21 @@ static DBusHandlerResult ofono_handler(DBusConnection *c, DBusMessage *m, void *
 static void ofono_getcards_reply(DBusPendingCall *pending, void *user_data)
 {
 	struct impl *backend = user_data;
-	DBusMessage *r;
 	DBusMessageIter i, array_i, struct_i, props_i;
 
-	r = dbus_pending_call_steal_reply(pending);
+	spa_autoptr(DBusMessage) r = steal_reply_and_unref(&pending);
 	if (r == NULL)
 		return;
 
 	if (dbus_message_get_type(r) == DBUS_MESSAGE_TYPE_ERROR) {
 		spa_log_error(backend->log, "Failed to get a list of handsfree audio cards: %s",
 				dbus_message_get_error_name(r));
-		goto finish;
+		return;
 	}
 
 	if (!dbus_message_iter_init(r, &i) || !spa_streq(dbus_message_get_signature(r), "a(oa{sv})")) {
 		spa_log_error(backend->log, "Invalid arguments in GetCards() reply");
-		goto finish;
+		return;
 	}
 
 	dbus_message_iter_recurse(&i, &array_i);
@@ -583,23 +643,16 @@ static void ofono_getcards_reply(DBusPendingCall *pending, void *user_data)
 
 			dbus_message_iter_next(&array_i);
 	}
-
-finish:
-	dbus_message_unref(r);
-	dbus_pending_call_unref(pending);
 }
 
-static int backend_ofono_register(void *data)
+static int ofono_register(struct impl *backend)
 {
-	struct impl *backend = data;
-
-	DBusMessage *m, *r;
+	spa_autoptr(DBusMessage) m = NULL, r = NULL;
 	const char *path = OFONO_AUDIO_CLIENT;
 	uint8_t codecs[2];
 	const uint8_t *pcodecs = codecs;
-	int ncodecs = 0, res;
-	DBusPendingCall *call;
-	DBusError err;
+	int ncodecs = 0;
+	spa_auto(DBusError) err = DBUS_ERROR_INIT;
 
 	spa_log_debug(backend->log, "Registering");
 
@@ -616,72 +669,77 @@ static int backend_ofono_register(void *data)
                                           DBUS_TYPE_ARRAY, DBUS_TYPE_BYTE, &pcodecs, ncodecs,
                                           DBUS_TYPE_INVALID);
 
-	dbus_error_init(&err);
-
 	r = dbus_connection_send_with_reply_and_block(backend->conn, m, -1, &err);
-	dbus_message_unref(m);
-
 	if (r == NULL) {
 		if (dbus_error_has_name(&err, "org.freedesktop.DBus.Error.ServiceUnknown")) {
 			spa_log_info(backend->log, "oFono not available: %s",
 					err.message);
-			res = -ENOTSUP;
+			return -ENOTSUP;
 		} else {
 			spa_log_warn(backend->log, "Registering Profile %s failed: %s (%s)",
 					path, err.message, err.name);
-			res = -EIO;
+			return -EIO;
 		}
-		dbus_error_free(&err);
-		return res;
 	}
 
 	if (dbus_message_is_error(r, OFONO_ERROR_INVALID_ARGUMENTS)) {
 		spa_log_warn(backend->log, "invalid arguments");
-		goto finish;
+		return -EIO;
 	}
 	if (dbus_message_is_error(r, OFONO_ERROR_IN_USE)) {
 		spa_log_warn(backend->log, "already in use");
-		goto finish;
+		return -EIO;
 	}
 	if (dbus_message_is_error(r, DBUS_ERROR_UNKNOWN_METHOD)) {
 		spa_log_warn(backend->log, "Error registering profile");
-		goto finish;
+		return -EIO;
 	}
 	if (dbus_message_is_error(r, DBUS_ERROR_SERVICE_UNKNOWN)) {
 		spa_log_info(backend->log, "oFono not available, disabling");
-		goto finish;
+		return -EIO;
 	}
 	if (dbus_message_get_type(r) == DBUS_MESSAGE_TYPE_ERROR) {
 		spa_log_error(backend->log, "Register() failed: %s",
 				dbus_message_get_error_name(r));
-		goto finish;
+		return -EIO;
 	}
-	dbus_message_unref(r);
 
 	spa_log_debug(backend->log, "registered");
+
+	return 0;
+}
+
+static int ofono_getcards(struct impl *backend)
+{
+	spa_autoptr(DBusMessage) m = NULL;
 
 	m = dbus_message_new_method_call(OFONO_SERVICE, "/",
 			OFONO_HF_AUDIO_MANAGER_INTERFACE, "GetCards");
 	if (m == NULL)
-		goto finish;
+		return -ENOMEM;
 
-	dbus_connection_send_with_reply(backend->conn, m, &call, -1);
-	dbus_pending_call_set_notify(call, ofono_getcards_reply, backend, NULL);
-	dbus_message_unref(m);
+	if (!send_with_reply(backend->conn, m, ofono_getcards_reply, backend))
+		return -EIO;
 
 	return 0;
+}
 
-finish:
-	dbus_message_unref(r);
-	return -EIO;
+static int backend_ofono_register(void *data)
+{
+	int ret = ofono_register(data);
+	if (ret < 0)
+		return ret;
+
+	ret = ofono_getcards(data);
+	if (ret < 0)
+		return ret;
+
+	return 0;
 }
 
 static DBusHandlerResult ofono_filter_cb(DBusConnection *bus, DBusMessage *m, void *user_data)
 {
 	struct impl *backend = user_data;
-	DBusError err;
-
-	dbus_error_init(&err);
 
 	if (dbus_message_is_signal(m, OFONO_HF_AUDIO_MANAGER_INTERFACE, "CardAdded")) {
 			char *p;
@@ -702,6 +760,7 @@ static DBusHandlerResult ofono_filter_cb(DBusConnection *bus, DBusMessage *m, vo
 			return ofono_audio_card_found(backend, p, &props_i);
 	} else if (dbus_message_is_signal(m, OFONO_HF_AUDIO_MANAGER_INTERFACE, "CardRemoved")) {
 			const char *p;
+			spa_auto(DBusError) err = DBUS_ERROR_INIT;
 
 			if (!dbus_message_get_args(m, &err, DBUS_TYPE_OBJECT_PATH, &p, DBUS_TYPE_INVALID)) {
 					spa_log_error(backend->log, "Failed to parse org.ofono.HandsfreeAudioManager.CardRemoved: %s", err.message);
@@ -717,17 +776,15 @@ fail:
 
 static int add_filters(struct impl *backend)
 {
-	DBusError err;
-
 	if (backend->filters_added)
 		return 0;
 
-	dbus_error_init(&err);
-
 	if (!dbus_connection_add_filter(backend->conn, ofono_filter_cb, backend, NULL)) {
 		spa_log_error(backend->log, "failed to add filter function");
-		goto fail;
+		return -EIO;
 	}
+
+	spa_auto(DBusError) err = DBUS_ERROR_INIT;
 
 	dbus_bus_add_match(backend->conn,
 			"type='signal',sender='" OFONO_SERVICE "',"
@@ -739,10 +796,6 @@ static int add_filters(struct impl *backend)
 	backend->filters_added = true;
 
 	return 0;
-
-fail:
-	dbus_error_free(&err);
-	return -EIO;
 }
 
 static int backend_ofono_free(void *data)
@@ -753,6 +806,9 @@ static int backend_ofono_free(void *data)
 		dbus_connection_remove_filter(backend->conn, ofono_filter_cb, backend);
 		backend->filters_added = false;
 	}
+
+	if (backend->timer)
+		spa_loop_utils_destroy_source(backend->loop_utils, backend->timer);
 
 	dbus_connection_unregister_object_path(backend->conn, OFONO_AUDIO_CLIENT);
 
@@ -769,28 +825,19 @@ static const struct spa_bt_backend_implementation backend_impl = {
 
 static bool is_available(struct impl *backend)
 {
-	DBusMessage *m, *r;
-	DBusError err;
-	bool success = false;
+	spa_autoptr(DBusMessage) m = NULL, r = NULL;
+	spa_auto(DBusError) err = DBUS_ERROR_INIT;
 
 	m = dbus_message_new_method_call(OFONO_SERVICE, "/",
 			DBUS_INTERFACE_INTROSPECTABLE, "Introspect");
 	if (m == NULL)
 		return false;
 
-	dbus_error_init(&err);
 	r = dbus_connection_send_with_reply_and_block(backend->conn, m, -1, &err);
-	dbus_message_unref(m);
-
 	if (r && dbus_message_get_type(r) == DBUS_MESSAGE_TYPE_METHOD_RETURN)
-		success = true;
+		return true;
 
-	if (r)
-		dbus_message_unref(r);
-	else
-		dbus_error_free(&err);
-
-	return success;
+	return false;
 }
 
 struct spa_bt_backend *backend_ofono_new(struct spa_bt_monitor *monitor,
@@ -819,6 +866,8 @@ struct spa_bt_backend *backend_ofono_new(struct spa_bt_monitor *monitor,
 	backend->log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log);
 	backend->dbus = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DBus);
 	backend->main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop);
+	backend->main_system = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_System);
+	backend->loop_utils = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_LoopUtils);
 	backend->conn = dbus_connection;
 	if (info && (str = spa_dict_lookup(info, "bluez5.enable-msbc")))
 		backend->msbc_supported = spa_atob(str);
@@ -826,6 +875,12 @@ struct spa_bt_backend *backend_ofono_new(struct spa_bt_monitor *monitor,
 		backend->msbc_supported = false;
 
 	spa_log_topic_init(backend->log, &log_topic);
+
+	backend->timer = spa_loop_utils_add_timer(backend->loop_utils, activate_timer_event, backend);
+	if (backend->timer == NULL) {
+		free(backend);
+		return NULL;
+	}
 
 	if (!dbus_connection_register_object_path(backend->conn,
 						  OFONO_AUDIO_CLIENT,

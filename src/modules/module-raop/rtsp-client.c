@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2021 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <unistd.h>
 #include <sys/socket.h>
@@ -44,9 +24,16 @@ struct message {
 	void *data;
 	size_t len;
 	size_t offset;
-	int cseq;
-	void (*reply) (void *user_data, int status, const struct spa_dict *headers);
+	uint32_t cseq;
+	int (*reply) (void *user_data, int status, const struct spa_dict *headers, const struct pw_array *content);
 	void *user_data;
+};
+
+enum client_recv_state {
+	CLIENT_RECV_NONE,
+	CLIENT_RECV_STATUS,
+	CLIENT_RECV_HEADERS,
+	CLIENT_RECV_CONTENT,
 };
 
 struct pw_rtsp_client {
@@ -67,15 +54,16 @@ struct pw_rtsp_client {
 	struct spa_source *source;
 	unsigned int connecting:1;
 	unsigned int need_flush:1;
-	unsigned int wait_status:1;
 
+	enum client_recv_state recv_state;
 	int status;
 	char line_buf[1024];
 	size_t line_pos;
 	struct pw_properties *headers;
+	struct pw_array content;
+	size_t content_length;
 
-	char *session;
-	int cseq;
+	uint32_t cseq;
 
 	struct spa_list messages;
 	struct spa_list pending;
@@ -102,6 +90,8 @@ struct pw_rtsp_client *pw_rtsp_client_new(struct pw_loop *main_loop,
 	spa_list_init(&client->pending);
 	spa_hook_list_init(&client->listener_list);
 	client->headers = pw_properties_new(NULL, NULL);
+	pw_array_init(&client->content, 4096);
+	client->recv_state = CLIENT_RECV_NONE;
 
 	pw_log_info("new client %p", client);
 
@@ -117,12 +107,18 @@ void pw_rtsp_client_destroy(struct pw_rtsp_client *client)
 	pw_properties_free(client->headers);
 	pw_properties_free(client->props);
 	spa_hook_list_clean(&client->listener_list);
+	pw_array_clear(&client->content);
 	free(client);
 }
 
 void *pw_rtsp_client_get_user_data(struct pw_rtsp_client *client)
 {
 	return client->user_data;
+}
+
+const char *pw_rtsp_client_get_url(struct pw_rtsp_client *client)
+{
+	return client->url;
 }
 
 void pw_rtsp_client_add_listener(struct pw_rtsp_client *client,
@@ -145,7 +141,7 @@ int pw_rtsp_client_get_local_ip(struct pw_rtsp_client *client,
 		if (ip)
 			inet_ntop(client->local_addr.sa.sa_family,
 				&client->local_addr.in.sin_addr, ip, len);
-        } else if (client->local_addr.sa.sa_family == AF_INET6) {
+	} else if (client->local_addr.sa.sa_family == AF_INET6) {
 		*version = 6;
 		if (ip)
 			inet_ntop(client->local_addr.sa.sa_family,
@@ -160,7 +156,7 @@ static int handle_connect(struct pw_rtsp_client *client, int fd)
 {
 	int res, ip_version;
 	socklen_t len;
-        char local_ip[INET6_ADDRSTRLEN];
+	char local_ip[INET6_ADDRSTRLEN];
 
 	len = sizeof(res);
 	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &res, &len) < 0) {
@@ -180,13 +176,19 @@ static int handle_connect(struct pw_rtsp_client *client, int fd)
 
 	if (ip_version == 4)
 		asprintf(&client->url, "rtsp://%s/%s", local_ip, client->session_id);
-        else
+	else
 		asprintf(&client->url, "rtsp://[%s]/%s", local_ip, client->session_id);
 
 	pw_log_info("connected local ip %s", local_ip);
 
 	client->connecting = false;
-	client->wait_status = true;
+
+	client->recv_state = CLIENT_RECV_STATUS;
+	pw_properties_clear(client->headers);
+	client->status = 0;
+	client->line_pos = 0;
+	client->content_length = 0;
+
 	pw_rtsp_client_emit_connected(client);
 
 	return 0;
@@ -226,7 +228,7 @@ static int read_line(struct pw_rtsp_client *client, char **buf)
 	return 0;
 }
 
-static struct message *find_pending(struct pw_rtsp_client *client, int cseq)
+static struct message *find_pending(struct pw_rtsp_client *client, uint32_t cseq)
 {
 	struct message *msg;
 	spa_list_for_each(msg, &client->pending, link) {
@@ -236,74 +238,157 @@ static struct message *find_pending(struct pw_rtsp_client *client, int cseq)
 	return NULL;
 }
 
+static int process_status(struct pw_rtsp_client *client, char *buf)
+{
+	const char *state = NULL, *s;
+	size_t len;
+
+	pw_log_info("status: %s", buf);
+
+	s = pw_split_walk(buf, " ", &len, &state);
+	if (!spa_strstartswith(s, "RTSP/"))
+		return -EPROTO;
+
+	s = pw_split_walk(buf, " ", &len, &state);
+	if (s == NULL)
+		return -EPROTO;
+
+	client->status = atoi(s);
+	if (client->status == 0)
+		return -EPROTO;
+
+	s = pw_split_walk(buf, " ", &len, &state);
+	if (s == NULL)
+		return -EPROTO;
+
+	pw_properties_clear(client->headers);
+	client->recv_state = CLIENT_RECV_HEADERS;
+
+	return 0;
+}
+
+static void dispatch_handler(struct pw_rtsp_client *client)
+{
+	uint32_t cseq;
+	int res;
+	struct message *msg;
+
+	if (pw_properties_fetch_uint32(client->headers, "CSeq", &cseq) < 0)
+		return;
+
+	pw_log_info("received reply to request with cseq:%" PRIu32, cseq);
+
+	msg = find_pending(client, cseq);
+	if (msg) {
+		res = msg->reply(msg->user_data, client->status, &client->headers->dict, &client->content);
+		spa_list_remove(&msg->link);
+		free(msg);
+
+		if (res < 0)
+			pw_log_warn("client %p: handle reply cseq:%u error: %s",
+					client, cseq, spa_strerror(res));
+	}
+	else {
+		pw_rtsp_client_emit_message(client, client->status, &client->headers->dict);
+	}
+
+	pw_array_reset(&client->content);
+}
+
+static void process_received_message(struct pw_rtsp_client *client)
+{
+	client->recv_state = CLIENT_RECV_STATUS;
+	dispatch_handler(client);
+}
+
+static int process_header(struct pw_rtsp_client *client, char *buf)
+{
+	if (strlen(buf) > 0) {
+		char *key = buf, *value;
+
+		value = strstr(buf, ":");
+		if (value == NULL)
+			return -EPROTO;
+
+		*value++ = '\0';
+
+		value = pw_strip(value, " ");
+
+		pw_properties_set(client->headers, key, value);
+	}
+	else {
+		const struct spa_dict_item *it;
+		spa_dict_for_each(it, &client->headers->dict)
+			pw_log_info(" %s: %s", it->key, it->value);
+
+		client->content_length = pw_properties_get_uint32(client->headers, "Content-Length", 0);
+		if (client->content_length > 0)
+			client->recv_state = CLIENT_RECV_CONTENT;
+		else
+			process_received_message(client);
+	}
+
+	return 0;
+}
+
+static int process_content(struct pw_rtsp_client *client)
+{
+	uint8_t buf[4096];
+
+	while (client->content_length > 0) {
+		const size_t max_recv = SPA_MIN(sizeof(buf), client->content_length);
+
+		ssize_t res = read(client->source->fd, buf, max_recv);
+		if (res == 0)
+			return -EPIPE;
+
+		if (res < 0) {
+			res = -errno;
+			if (res == -EAGAIN || res == -EWOULDBLOCK)
+				return 0;
+
+			return res;
+		}
+
+		void *p = pw_array_add(&client->content, res);
+		memcpy(p, buf, res);
+
+		spa_assert((size_t) res <= client->content_length);
+		client->content_length -= res;
+	}
+
+	if (client->content_length == 0)
+		process_received_message(client);
+
+	return 0;
+}
+
 static int process_input(struct pw_rtsp_client *client)
 {
-	char *buf = NULL;
-	int res;
+	if (client->recv_state == CLIENT_RECV_STATUS || client->recv_state == CLIENT_RECV_HEADERS) {
+		char *buf = NULL;
+		int res;
 
-	if ((res = read_line(client, &buf)) <= 0)
-		return res;
+		if ((res = read_line(client, &buf)) <= 0)
+			return res;
 
-	pw_log_debug("%s", buf);
+		pw_log_debug("received line: %s", buf);
 
-	if (client->wait_status) {
-		const char *state = NULL, *s;
-		size_t len;
-
-		pw_log_info("status: %s", buf);
-
-		s = pw_split_walk(buf, " ", &len, &state);
-		if (!spa_strstartswith(s, "RTSP/"))
-			goto error;
-
-		s = pw_split_walk(buf, " ", &len, &state);
-		if (s == NULL)
-			goto error;
-
-		client->status = atoi(s);
-
-		s = pw_split_walk(buf, " ", &len, &state);
-		if (s == NULL)
-			goto error;
-
-		client->wait_status = false;
-		pw_properties_clear(client->headers);
-	} else {
-		if (strlen(buf) == 0) {
-			int cseq;
-			struct message *msg;
-			const struct spa_dict_item *it;
-
-			spa_dict_for_each(it, &client->headers->dict)
-				pw_log_info(" %s: %s", it->key, it->value);
-
-			cseq = pw_properties_get_int32(client->headers, "CSeq", 0);
-
-			if ((msg = find_pending(client, cseq)) != NULL) {
-				msg->reply(msg->user_data, client->status, &client->headers->dict);
-				spa_list_remove(&msg->link);
-				free(msg);
-			} else {
-				pw_rtsp_client_emit_message(client, client->status,
-					&client->headers->dict);
-			}
-			client->wait_status = true;
-		} else {
-			char *key, *value;
-
-			key = buf;
-			value = strstr(buf, ":");
-			if (value == NULL)
-				goto error;
-			*value++ = '\0';
-			while (*value == ' ')
-				value++;
-			pw_properties_set(client->headers, key, value);
+		switch (client->recv_state) {
+		case CLIENT_RECV_STATUS:
+			return process_status(client, buf);
+		case CLIENT_RECV_HEADERS:
+			return process_header(client, buf);
+		default:
+			spa_assert_not_reached();
 		}
 	}
-	return 0;
-error:
-	return -EPROTO;
+	else if (client->recv_state == CLIENT_RECV_CONTENT) {
+		return process_content(client);
+	}
+	else {
+		spa_assert_not_reached();
+	}
 }
 
 static int flush_output(struct pw_rtsp_client *client)
@@ -366,19 +451,19 @@ on_source_io(void *data, int fd, uint32_t mask)
 	if (mask & SPA_IO_IN) {
 		if ((res = process_input(client)) < 0)
 			goto error;
-        }
+	}
 	if (mask & SPA_IO_OUT || client->need_flush) {
 		if (client->connecting) {
 			if ((res = handle_connect(client, fd)) < 0)
 				goto error;
 		}
 		res = flush_output(client);
-                if (res >= 0) {
+		if (res >= 0) {
 			pw_loop_update_io(client->loop, client->source,
 				client->source->mask & ~SPA_IO_OUT);
 		} else if (res != -EAGAIN)
 			goto error;
-        }
+	}
 done:
 	return;
 error:
@@ -413,6 +498,7 @@ int pw_rtsp_client_connect(struct pw_rtsp_client *client,
 		pw_log_error("getaddrinfo: %s", gai_strerror(res));
 		return -EINVAL;
 	}
+	res = -ENOENT;
 	for (rp = result; rp != NULL; rp = rp->ai_next) {
 		fd = socket(rp->ai_family,
 				rp->ai_socktype | SOCK_CLOEXEC | SOCK_NONBLOCK,
@@ -424,12 +510,14 @@ int pw_rtsp_client_connect(struct pw_rtsp_client *client,
 		if (res == 0 || (res < 0 && errno == EINPROGRESS))
 			break;
 
+		res = -errno;
 		close(fd);
 	}
 	freeaddrinfo(result);
 
 	if (rp == NULL) {
-		pw_log_error("Could not connect to %s:%u", hostname, port);
+		pw_log_error("Could not connect to %s:%u: %s", hostname, port,
+				spa_strerror(res));
 		return -EINVAL;
 	}
 
@@ -453,6 +541,8 @@ int pw_rtsp_client_connect(struct pw_rtsp_client *client,
 
 int pw_rtsp_client_disconnect(struct pw_rtsp_client *client)
 {
+	struct message *msg;
+
 	if (client->source == NULL)
 		return 0;
 
@@ -462,21 +552,26 @@ int pw_rtsp_client_disconnect(struct pw_rtsp_client *client)
 	client->url = NULL;
 	free(client->session_id);
 	client->session_id = NULL;
+
+	spa_list_consume(msg, &client->messages, link) {
+		spa_list_remove(&msg->link);
+		free(msg);
+	}
 	pw_rtsp_client_emit_disconnected(client);
 	return 0;
 }
 
-int pw_rtsp_client_send(struct pw_rtsp_client *client,
+int pw_rtsp_client_url_send(struct pw_rtsp_client *client, const char *url,
 		const char *cmd, const struct spa_dict *headers,
-		const char *content_type, const char *content,
-		void (*reply) (void *user_data, int status, const struct spa_dict *headers),
+		const char *content_type, const void *content, size_t content_length,
+		int (*reply) (void *user_data, int status, const struct spa_dict *headers, const struct pw_array *content),
 		void *user_data)
 {
 	FILE *f;
 	size_t len;
 	const struct spa_dict_item *it;
 	struct message *msg;
-	int cseq;
+	uint32_t cseq;
 
 	if ((f = open_memstream((char**)&msg, &len)) == NULL)
 		return -errno;
@@ -485,21 +580,21 @@ int pw_rtsp_client_send(struct pw_rtsp_client *client,
 
 	cseq = ++client->cseq;
 
-	fprintf(f, "%s %s RTSP/1.0\r\n", cmd, client->url);
-	fprintf(f, "CSeq: %d\r\n", cseq);
+	fprintf(f, "%s %s RTSP/1.0\r\n", cmd, url);
+	fprintf(f, "CSeq: %" PRIu32 "\r\n", cseq);
 
 	if (headers != NULL) {
 		spa_dict_for_each(it, headers)
 			fprintf(f, "%s: %s\r\n", it->key, it->value);
 	}
 	if (content_type != NULL && content != NULL) {
-		fprintf(f, "Content-Type: %s\r\nContent-Length: %d\r\n",
-			content_type, (int)strlen(content));
+		fprintf(f, "Content-Type: %s\r\nContent-Length: %zu\r\n",
+			content_type, content_length);
 	}
 	fprintf(f, "\r\n");
 
 	if (content_type && content)
-		fprintf(f, "%s", content);
+		fwrite(content, 1, content_length, f);
 
 	fclose(f);
 
@@ -516,6 +611,19 @@ int pw_rtsp_client_send(struct pw_rtsp_client *client,
 	if (client->source && !(client->source->mask & SPA_IO_OUT)) {
 		pw_loop_update_io(client->loop, client->source,
 				client->source->mask | SPA_IO_OUT);
-        }
+	}
 	return 0;
+}
+
+int pw_rtsp_client_send(struct pw_rtsp_client *client,
+		const char *cmd, const struct spa_dict *headers,
+		const char *content_type, const char *content,
+		int (*reply) (void *user_data, int status, const struct spa_dict *headers, const struct pw_array *content),
+		void *user_data)
+{
+	const size_t content_length = content ? strlen(content) : 0;
+
+	return pw_rtsp_client_url_send(client, client->url, cmd, headers,
+				       content_type, content, content_length,
+				       reply, user_data);
 }

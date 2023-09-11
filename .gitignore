@@ -1,14 +1,10 @@
-.tarball-version
-.version
-.*.swp
+.*
+!.gitlab
 ABOUT-NLS
 *~
 *.tar.gz
 *.tar.xz
 *.o
-build/
-builddir/
-config.h.meson
 cscope.out
 cscope.in.out
 cscope.po.out
@@ -17,6 +13,11 @@ subprojects/lua*
 subprojects/wireplumber
 subprojects/media-session
 subprojects/packagecache
+subprojects/googletest*
+subprojects/gtest.wrap
+subprojects/libyaml.wrap
+subprojects/libyaml
+subprojects/libcamera
 
 # Created by https://www.gitignore.io/api/vim
 
