@@ -32,6 +32,7 @@ context.properties = {
     #default.clock.min-quantum   = 32
     #default.clock.max-quantum   = 2048
     #default.clock.quantum-limit = 8192
+    #default.clock.quantum-floor = 4
     #default.video.width         = 640
     #default.video.height        = 480
     #default.video.rate.num      = 25
@@ -76,7 +77,7 @@ context.modules = [
     { name = libpipewire-module-rt
         args = {
             nice.level   = -11
-            #rt.prio      = 88
+            rt.prio      = @rtprio_server@
             #rt.time.soft = -1
             #rt.time.hard = -1
         }
@@ -144,11 +145,11 @@ context.objects = [
     # Creates an object from a PipeWire factory with the given parameters.
     # If nofail is given, errors are ignored (and no object is created).
     #
-    #{ factory = spa-node-factory   args = { factory.name = videotestsrc node.name = videotestsrc Spa:Pod:Object:Param:Props:patternType = 1 } }
+    #{ factory = spa-node-factory   args = { factory.name = videotestsrc node.name = videotestsrc node.description = videotestsrc "Spa:Pod:Object:Param:Props:patternType" = 1 } }
     #{ factory = spa-device-factory args = { factory.name = api.jack.device foo=bar } flags = [ nofail ] }
     #{ factory = spa-device-factory args = { factory.name = api.alsa.enum.udev } }
     #{ factory = spa-node-factory   args = { factory.name = api.alsa.seq.bridge node.name = Internal-MIDI-Bridge } }
-    #{ factory = adapter            args = { factory.name = audiotestsrc node.name = my-test } }
+    #{ factory = adapter            args = { factory.name = audiotestsrc node.name = my-test node.description = audiotestsrc } }
     #{ factory = spa-node-factory   args = { factory.name = api.vulkan.compute.source node.name = my-compute-source } }
 
     # Make a default metadata store
@@ -162,7 +163,7 @@ context.objects = [
         }
     }
 
-    # A default dummy driver. This handles nodes marked with the "node.always-driver"
+    # A default dummy driver. This handles nodes marked with the "node.always-process"
     # property when no other driver is currently active. JACK clients need this.
     { factory = spa-node-factory
         args = {
@@ -319,6 +320,7 @@ context.objects = [
     #        node.description = "Microphone"
     #        media.class      = "Audio/Source/Virtual"
     #        audio.position   = "FL,FR"
+    #        monitor.passthrough = true
     #        adapter.auto-port-config = {
     #            mode = dsp
     #            monitor = true

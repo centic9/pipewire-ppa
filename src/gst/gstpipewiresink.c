@@ -209,8 +209,8 @@ gst_pipewire_sink_class_init (GstPipeWireSinkClass * klass)
   gstelement_class->change_state = gst_pipewire_sink_change_state;
 
   gst_element_class_set_static_metadata (gstelement_class,
-      "PipeWire sink", "Sink/Video",
-      "Send video to PipeWire", "Wim Taymans <wim.taymans@gmail.com>");
+      "PipeWire sink", "Sink/Audio/Video",
+      "Send audio/video to PipeWire", "Wim Taymans <wim.taymans@gmail.com>");
 
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&gst_pipewire_sink_template));
@@ -267,12 +267,12 @@ pool_activated (GstPipeWirePool *pool, GstPipeWireSink *sink)
 
   port_params[1] = spa_pod_builder_add_object (&b,
       SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
-      SPA_PARAM_META_type, SPA_POD_Int(SPA_META_Header),
+      SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
       SPA_PARAM_META_size, SPA_POD_Int(sizeof (struct spa_meta_header)));
 
   port_params[2] = spa_pod_builder_add_object (&b,
       SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
-      SPA_PARAM_META_type, SPA_POD_Int(SPA_META_VideoCrop),
+      SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoCrop),
       SPA_PARAM_META_size, SPA_POD_Int(sizeof (struct spa_meta_region)));
 
   pw_thread_loop_lock (sink->core->loop);
@@ -466,7 +466,10 @@ do_send_buffer (GstPipeWireSink *pwsink, GstBuffer *buffer)
   if (data->header) {
     data->header->seq = GST_BUFFER_OFFSET (buffer);
     data->header->pts = GST_BUFFER_PTS (buffer);
-    data->header->dts_offset = GST_BUFFER_DTS (buffer);
+    if (GST_BUFFER_DTS(buffer) != GST_CLOCK_TIME_NONE)
+      data->header->dts_offset = GST_BUFFER_DTS (buffer) - GST_BUFFER_PTS (buffer);
+    else
+      data->header->dts_offset = 0;
   }
   if (data->crop) {
     GstVideoCropMeta *meta = gst_buffer_get_video_crop_meta (buffer);
@@ -532,8 +535,13 @@ on_state_changed (void *data, enum pw_stream_state old, enum pw_stream_state sta
         pw_stream_trigger_process (pwsink->stream);
       break;
     case PW_STREAM_STATE_ERROR:
-      GST_ELEMENT_ERROR (pwsink, RESOURCE, FAILED,
-          ("stream error: %s", error), (NULL));
+      /* make the error permanent, if it is not already;
+         pw_stream_set_error() will recursively call us again */
+      if (pw_stream_get_state (pwsink->stream, NULL) != PW_STREAM_STATE_ERROR)
+        pw_stream_set_error (pwsink->stream, -EPIPE, "%s", error);
+      else
+        GST_ELEMENT_ERROR (pwsink, RESOURCE, FAILED,
+            ("stream error: %s", error), (NULL));
       break;
   }
   pw_thread_loop_signal (pwsink->core->loop, FALSE);
@@ -576,9 +584,10 @@ gst_pipewire_sink_setcaps (GstBaseSink * bsink, GstCaps * caps)
     goto start_error;
 
   if (state == PW_STREAM_STATE_UNCONNECTED) {
-    enum pw_stream_flags flags = 0;
+    enum pw_stream_flags flags;
     uint32_t target_id;
 
+    flags = PW_STREAM_FLAG_ASYNC;
     if (pwsink->mode != GST_PIPEWIRE_SINK_MODE_PROVIDE)
       flags |= PW_STREAM_FLAG_AUTOCONNECT;
     else
@@ -676,7 +685,11 @@ gst_pipewire_sink_render (GstBaseSink * bsink, GstBuffer * buffer)
     config = gst_buffer_pool_get_config (GST_BUFFER_POOL_CAST (pwsink->pool));
     gst_buffer_pool_config_get_params (config, &caps, &size, &min_buffers, &max_buffers);
 
-    size = (size == 0) ? gst_buffer_get_size (buffer) : size;
+    if (size == 0) {
+      gsize maxsize;
+      gst_buffer_get_sizes (buffer, NULL, &maxsize);
+      size = maxsize;
+    }
 
     gst_buffer_pool_config_set_params (config, caps, size, min_buffers, max_buffers);
     gst_buffer_pool_set_config (GST_BUFFER_POOL_CAST (pwsink->pool), config);
@@ -702,6 +715,7 @@ gst_pipewire_sink_render (GstBaseSink * bsink, GstBuffer * buffer)
     gst_buffer_extract (buffer, 0, info.data, info.maxsize);
     gst_buffer_unmap (b, &info);
     gst_buffer_resize (b, 0, gst_buffer_get_size (buffer));
+    gst_buffer_copy_into(b, buffer, GST_BUFFER_COPY_METADATA, 0, -1);
     buffer = b;
     unref_buffer = TRUE;
 

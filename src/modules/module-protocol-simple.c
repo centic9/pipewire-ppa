@@ -29,7 +29,7 @@
 
 #include <pipewire/impl.h>
 
-/** \page page_module_protocol_simple PipeWire Module: Protocol Simple
+/** \page page_module_protocol_simple Protocol Simple
  *
  * The simple protocol provides a bidirectional audio stream on a network
  * socket.
@@ -39,6 +39,10 @@
  *
  * Each client that connects will create a capture and/or playback stream,
  * depending on the configuration options.
+ *
+ * ## Module Name
+ *
+ * `libpipewire-module-protocol-simple`
  *
  * ## Module Options
  *
@@ -301,10 +305,11 @@ static void capture_process(void *data)
 		if (res < 0) {
 			if (errno == EINTR)
 				continue;
-			if (errno != EAGAIN && errno != EWOULDBLOCK)
+			if (errno != EAGAIN && errno != EWOULDBLOCK) {
 				pw_log_warn("%p: client:%p [%s] send error %d: %m", impl,
 						client, client->name, res);
-			client_cleanup(client);
+				client_cleanup(client);
+			}
 			break;
 		}
 		offset += res;

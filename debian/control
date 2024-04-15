@@ -4,13 +4,14 @@ Priority: optional
 Maintainer: Utopia Maintenance Team <pkg-utopia-maintainers@alioth-lists.debian.net>
 Uploaders: Jeremy Bicha <jbicha@debian.org>,
            Dylan Aïssi <daissi@debian.org>
-Build-Depends: debhelper-compat (= 13),
+Build-Depends: dpkg-dev (>= 1.22.5), debhelper-compat (= 13),
                doxygen <!nodoc>,
                graphviz <!nodoc>,
+               libapparmor-dev [linux-any],
                libasound2-dev,
                libavahi-client-dev,
-               libbluetooth-dev,
-               libcamera-dev [!m68k],
+               libbluetooth-dev [linux-any],
+               libcamera-dev (>= 0.2.0) [!m68k !hurd-any],
                libdbus-1-dev,
                libffado-dev,
                libfreeaptx-dev,
@@ -28,8 +29,10 @@ Build-Depends: debhelper-compat (= 13),
                libopus-dev,
                libpulse-dev,
                libreadline-dev,
+               libroc-dev (>= 0.3.0+dfsg-3),
                libsbc-dev,
                libsdl2-dev <!noinsttest>,
+               libsnapd-glib-dev [amd64 arm64 armhf i386 powerpc ppc64el riscv64 s390x],
                libsndfile1-dev,
                libssl-dev,
                libsystemd-dev [linux-any],
@@ -38,11 +41,11 @@ Build-Depends: debhelper-compat (= 13),
                libv4l-dev,
                libwebrtc-audio-processing-dev,
                libxfixes-dev (>= 1:6.0.0),
-               meson (>= 0.59.0),
+               meson (>= 0.61.1),
                modemmanager-dev,
-               pkg-config,
+               pkgconf,
                python3-docutils,
-               systemd [linux-any]
+               systemd-dev
 Build-Conflicts: libfdk-aac-dev
 Standards-Version: 4.6.2
 Vcs-Browser: https://salsa.debian.org/utopia-team/pipewire
@@ -50,8 +53,11 @@ Vcs-Git: https://salsa.debian.org/utopia-team/pipewire.git
 Homepage: https://pipewire.org/
 Rules-Requires-Root: no
 
-Package: libpipewire-0.3-0
-Architecture: linux-any
+Package: libpipewire-0.3-0t64
+Provides: ${t64:Provides}
+Replaces: libpipewire-0.3-0
+Breaks: libpipewire-0.3-0 (<< ${source:Version})
+Architecture: any
 Multi-Arch: same
 Depends: libspa-0.2-modules (= ${binary:Version}),
          ${misc:Depends},
@@ -85,9 +91,9 @@ Description: libraries for the PipeWire multimedia server - common files
 
 Package: libpipewire-0.3-dev
 Section: libdevel
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
-Depends: libpipewire-0.3-0 (= ${binary:Version}),
+Depends: libpipewire-0.3-0t64 (= ${binary:Version}),
          libspa-0.2-dev (= ${binary:Version}),
          ${misc:Depends}
 Suggests: pipewire-doc
@@ -103,7 +109,7 @@ Description: libraries for the PipeWire multimedia server - development
  This package contains the development files.
 
 Package: libpipewire-0.3-modules
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Breaks: pipewire (<< 0.3.5)
@@ -122,9 +128,11 @@ Description: libraries for the PipeWire multimedia server - modules
  depend on the pipewire package instead.
 
 Package: libpipewire-0.3-modules-x11
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
-Depends: ${misc:Depends}, ${shlibs:Depends}
+Depends: ${misc:Depends},
+         ${shlibs:Depends},
+         libcanberra-pulse
 Breaks: libpipewire-0.3-modules (<< 0.3.63-3~)
 Replaces: libpipewire-0.3-modules (<< 0.3.63-3~)
 Description: libraries for the PipeWire multimedia server - X11 modules
@@ -140,7 +148,7 @@ Description: libraries for the PipeWire multimedia server - X11 modules
 
 Package: libspa-0.2-dev
 Section: libdevel
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Depends: ${misc:Depends}
 Suggests: pipewire-doc
@@ -156,7 +164,7 @@ Description: libraries for the PipeWire multimedia server Simple Plugin API - de
  This package contains the development files for the Simple Plugin API.
 
 Package: libspa-0.2-modules
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Breaks: pipewire (<< 0.3.5)
@@ -196,7 +204,7 @@ Description: libraries for the PipeWire multimedia server - documentation
 
 Package: pipewire
 Section: video
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Depends: libpipewire-0.3-modules (= ${binary:Version}),
          pipewire-bin (= ${binary:Version}),
@@ -218,7 +226,7 @@ Description: audio and video processing engine multimedia server
 
 Package: pipewire-bin
 Section: video
-Architecture: linux-any
+Architecture: any
 Multi-Arch: foreign
 Depends: libpipewire-0.3-modules (= ${binary:Version}),
          ${misc:Depends},
@@ -243,7 +251,7 @@ Description: PipeWire multimedia server - programs
 
 Package: pipewire-pulse
 Section: sound
-Architecture: linux-any
+Architecture: any
 Multi-Arch: foreign
 Replaces: pipewire-bin (<< 0.3.27-2)
 Breaks: pipewire-bin (<< 0.3.27-2)
@@ -266,7 +274,7 @@ Description: PipeWire PulseAudio daemon
 
 Package: pipewire-alsa
 Section: sound
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Replaces: pipewire-audio-client-libraries (<< 0.3.54-1~)
 Breaks: pipewire-audio-client-libraries (<< 0.3.54-1~)
@@ -274,7 +282,7 @@ Conflicts: pulseaudio
 Depends: pipewire (= ${binary:Version}),
          ${misc:Depends},
          ${shlibs:Depends}
-Description: PipeWire ALSA plugin
+Description: PipeWire ALSA plugin, for ALSA applications to output via PipeWire
  PipeWire is a server and user space API to deal with multimedia
  pipelines. This includes:
  .
@@ -283,18 +291,18 @@ Description: PipeWire ALSA plugin
   - Accessing sources of audio and video for consumption.
   - Generating graphs for audio and video processing.
  .
- This package contains the ALSA plugin.
+ This package contains a plugin for ALSA applications to output via PipeWire.
 
 Package: pipewire-jack
 Section: sound
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Replaces: pipewire-audio-client-libraries (<< 0.3.54-1~)
 Breaks: pipewire-audio-client-libraries (<< 0.3.54-1~)
 Depends: pipewire (= ${binary:Version}),
          ${misc:Depends},
          ${shlibs:Depends}
-Description: PipeWire JACK plugin
+Description: PipeWire JACK plugin, for JACK applications to output via PipeWire
  PipeWire is a server and user space API to deal with multimedia
  pipelines. This includes:
  .
@@ -303,11 +311,11 @@ Description: PipeWire JACK plugin
   - Accessing sources of audio and video for consumption.
   - Generating graphs for audio and video processing.
  .
- This package contains the JACK plugin.
+ This package contains a plugin for JACK applications to output via PipeWire.
 
 Package: pipewire-v4l2
 Section: video
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Replaces: pipewire-bin (<< 0.3.54-1),
           libpipewire-0.3-modules (<< 0.3.54-1)
@@ -329,7 +337,7 @@ Description: PipeWire V4L2 plugin
 
 Package: pipewire-tests
 Build-Profiles: <!noinsttest>
-Architecture: linux-any
+Architecture: any
 Depends: pipewire (= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends}
 Section: misc
 Description: PipeWire multimedia server - tests and examples
@@ -344,7 +352,7 @@ Description: PipeWire multimedia server - tests and examples
  This package contains automated and manual tests and example programs.
 
 Package: gstreamer1.0-pipewire
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Depends: pipewire (= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends}
 Description: GStreamer 1.0 plugin for the PipeWire multimedia server
@@ -360,7 +368,7 @@ Description: GStreamer 1.0 plugin for the PipeWire multimedia server
  server available as GStreamer sources and sinks.
 
 Package: libspa-0.2-bluetooth
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Depends: libspa-0.2-modules (= ${binary:Version}),
          ${misc:Depends},
@@ -378,7 +386,7 @@ Description: libraries for the PipeWire multimedia server - bluetooth plugins
  speakers and headsets available to the PipeWire server.
 
 Package: libspa-0.2-jack
-Architecture: linux-any
+Architecture: any
 Multi-Arch: same
 Depends: libspa-0.2-modules (= ${binary:Version}),
          ${misc:Depends},

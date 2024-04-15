@@ -557,7 +557,7 @@ impl_node_port_set_param(void *object,
 {
 	struct state *this = object;
 	struct port *port;
-	int res;
+	int res = 0;
 
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 
@@ -572,7 +572,9 @@ impl_node_port_set_param(void *object,
 	case SPA_PARAM_Latency:
 	{
 		struct spa_latency_info info;
-		if ((res = spa_latency_parse(param, &info)) < 0)
+		if (param == NULL)
+			info = SPA_LATENCY_INFO(SPA_DIRECTION_REVERSE(direction));
+		else if ((res = spa_latency_parse(param, &info)) < 0)
 			return res;
 		if (direction == info.direction)
 			return -EINVAL;

@@ -296,7 +296,7 @@ static const char *find_best_verb(pa_card *impl)
 static int add_pro_profile(pa_card *impl, uint32_t index)
 {
 	snd_ctl_t *ctl_hndl;
-	int err, dev, count = 0;
+	int err, dev, count = 0, n_capture = 0, n_playback = 0;
 	pa_alsa_profile *ap;
 	pa_alsa_profile_set *ps = impl->profile_set;
 	pa_alsa_mapping *m;
@@ -304,6 +304,7 @@ static int add_pro_profile(pa_card *impl, uint32_t index)
 	snd_pcm_info_t *pcminfo;
 	pa_sample_spec ss;
 	snd_pcm_uframes_t try_period_size, try_buffer_size;
+	uint32_t idx;
 
 	if (impl->use_ucm) {
 		const char *verb = find_best_verb(impl);
@@ -391,6 +392,7 @@ static int add_pro_profile(pa_card *impl, uint32_t index)
 				pa_alsa_close(&m->output_pcm);
 				m->supported = true;
 				pa_channel_map_init_auto(&m->channel_map, m->sample_spec.channels, PA_CHANNEL_MAP_AUX);
+				n_playback++;
 			}
 			pa_idxset_put(ap->output_mappings, m, NULL);
 			free(name);
@@ -422,6 +424,7 @@ static int add_pro_profile(pa_card *impl, uint32_t index)
 				pa_alsa_close(&m->input_pcm);
 				m->supported = true;
 				pa_channel_map_init_auto(&m->channel_map, m->sample_spec.channels, PA_CHANNEL_MAP_AUX);
+				n_capture++;
 			}
 			pa_idxset_put(ap->input_mappings, m, NULL);
 			free(name);
@@ -429,6 +432,20 @@ static int add_pro_profile(pa_card *impl, uint32_t index)
 	}
 	snd_ctl_close(ctl_hndl);
 
+	if (n_capture == 1 && n_playback == 1) {
+		PA_IDXSET_FOREACH(m, ap->output_mappings, idx) {
+			pa_proplist_setf(m->output_proplist, "node.group", "pro-audio-%u", index);
+			pa_proplist_setf(m->output_proplist, "node.link-group", "pro-audio-%u", index);
+			pa_proplist_setf(m->output_proplist, "api.alsa.auto-link", "true");
+			pa_proplist_setf(m->output_proplist, "api.alsa.disable-tsched", "true");
+		}
+		PA_IDXSET_FOREACH(m, ap->input_mappings, idx) {
+			pa_proplist_setf(m->input_proplist, "node.group", "pro-audio-%u", index);
+			pa_proplist_setf(m->input_proplist, "node.link-group", "pro-audio-%u", index);
+			pa_proplist_setf(m->input_proplist, "api.alsa.auto-link", "true");
+			pa_proplist_setf(m->input_proplist, "api.alsa.disable-tsched", "true");
+		}
+	}
 	return 0;
 }
 
@@ -1123,7 +1140,8 @@ static void set_volume(pa_alsa_device *dev, const pa_cvolume *v)
 {
 	pa_cvolume r;
 
-	dev->real_volume = *v;
+	if (v != &dev->real_volume)
+		dev->real_volume = *v;
 
 	if (!dev->mixer_handle)
 		return;

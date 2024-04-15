@@ -1,3 +1,206 @@
+pipewire (1.0.5-1) unstable; urgency=medium
+
+  [ Dylan Aïssi ]
+  * New upstream release (Closes: #1069033, LP: #2061381)
+  * Refresh patches
+  * Drop patch included in upstream release:
+      - 64-bit-time-t-compat.patch
+
+  [ Jeremy Bícha ]
+  * Revert "Temporarily disable Snap integration on 32-bit non-x86"
+  * Revert "Temporarily disable libffado integration on 32-bit non-x86"
+
+ -- Dylan Aïssi <daissi@debian.org>  Mon, 15 Apr 2024 21:08:58 +0200
+
+pipewire (1.0.4-3) unstable; urgency=medium
+
+  * Team upload
+
+  [ Michael Hudson-Doyle ]
+  * s/libpipewire-0.3-0/libpipewire-0.3-0t64/ in the shlibs.local files
+
+  [ Simon McVittie ]
+  * Only build Snap integration on supported architectures.
+    According to Snap documentation, only these architectures are
+    supported, so enabling the others is unlikely to be particularly
+    useful. Reducing the architecture list reduces the impact of any
+    non-portability in snapd-glib.
+  * Temporarily disable Snap integration on 32-bit non-x86.
+    snapd-glib has not yet been rebuilt for the 64-bit time_t transition.
+    This change should be reverted after snapd-glib is rebuilt.
+  * Temporarily disable libffado integration on 32-bit non-x86.
+    Same reasoning as for snapd-glib, above.
+    (Closes: #1067558)
+
+ -- Simon McVittie <smcv@debian.org>  Sun, 24 Mar 2024 17:06:55 +0000
+
+pipewire (1.0.4-2) unstable; urgency=medium
+
+  [ Jeremy Bícha ]
+  * Use dh_installman to install manpages
+
+  [ Steve Langasek ]
+  * Add patch for 64-bit time_t compatibility (Closes: #1066839)
+
+ -- Dylan Aïssi <daissi@debian.org>  Thu, 14 Mar 2024 10:12:07 +0100
+
+pipewire (1.0.4-1) unstable; urgency=medium
+
+  * New upstream release
+  * Improve description of pw's ALSA and JACK packages (Closes: #1062262)
+  * Install a README next to 9999-custom.conf explaining how to divert
+      it (Closes: #1063898)
+  * Cherry-pick more upstream patches improving snap support:
+      - fed14321: snap-policy: ensure audio works with .deb snapd
+      - 4d3658b2: snap-policy: fix memory leak
+  * Install new manpages in their respective packages
+  * Update symbols file
+  * Update metadata of snap support patches
+
+ -- Dylan Aïssi <daissi@debian.org>  Wed, 13 Mar 2024 14:31:58 +0100
+
+pipewire (1.0.3-1.1) unstable; urgency=medium
+
+  * Non-maintainer upload.
+  * Rename libraries for 64-bit time_t transition.  Closes: #1063184
+
+ -- Benjamin Drung <bdrung@debian.org>  Fri, 01 Mar 2024 12:42:26 +0000
+
+pipewire (1.0.3-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Dylan Aïssi <daissi@debian.org>  Fri, 02 Feb 2024 16:06:47 +0100
+
+pipewire (1.0.2-1) unstable; urgency=medium
+
+  [ Dylan Aïssi ]
+  * New upstream release
+  * Drop patches included in upstream release:
+      - libcamera0.2 compatibility
+
+  [ Jeremy Bícha ]
+  * Cherry-pick patches from Sergio Costas for snap permissions support.
+    CVE-2022-4964 (LP: #1995707)
+  * Add apparmor and snapd-glib to Build-Depends for snap feature
+  * Cherry-pick a patch to fix LP: #2051504
+
+ -- Dylan Aïssi <daissi@debian.org>  Thu, 01 Feb 2024 13:01:35 +0100
+
+pipewire (1.0.1-2) unstable; urgency=medium
+
+  * Switch Build-Deps from systemd to systemd-dev (Closes: #1060598)
+  * Use pkgconf instead of the transitional pkg-config
+  * Bump minimum meson to 0.61.1
+  * Drop 'dh_missing --fail-missing', default since debhelper compat 13
+  * Bump minimum libcamera to 0.2.0
+  * Cherry-pick upstream patches for libcamera0.2 compatibility
+
+ -- Dylan Aïssi <daissi@debian.org>  Mon, 22 Jan 2024 17:24:44 +0100
+
+pipewire (1.0.1-1) unstable; urgency=medium
+
+  * New upstream release
+  * Add lintian overrides for groff-message in manpages
+  * Update upstream branch in debian/gbp.conf
+
+ -- Dylan Aïssi <daissi@debian.org>  Thu, 11 Jan 2024 14:59:54 +0100
+
+pipewire (1.0.0-3) unstable; urgency=medium
+
+  * libpipewire-0.3-modules-x11: depend on libcanberra-pulse (Closes: #1059544)
+      module-x11-bell requires the libcanberra PulseAudio backend.
+
+ -- Dylan Aïssi <daissi@debian.org>  Fri, 05 Jan 2024 11:59:35 +0100
+
+pipewire (1.0.0-2) experimental; urgency=medium
+
+  * Install udev rules in /usr/lib/udev/rules.d (Closes: #1057233)
+    Thanks to Chris Hofstaedtler.
+  * Extend hurd-i386 restrictions to hurd-any
+  * Build-Depend on the fixed version of libroc-dev: remove the now
+    useless build-deps on libuv1-dev and libspeexdsp-dev.
+
+ -- Dylan Aïssi <daissi@debian.org>  Thu, 21 Dec 2023 16:55:55 +0100
+
+pipewire (1.0.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * Install new manpages in their respective packages
+  * Update symbols file, 1 symbol is dropped in 1.0.0:
+      - pw_in_valgrind@Base 0.3.6
+      See commit 2738bb4c.
+  * Build ROC modules (Closes: #1002630)
+    - Add libroc-dev in Build-Deps
+    - Add libuv1-dev and libspeexdsp-dev in Build-Deps, those are missing
+      dependencies of libroc-dev. Will dropped once libroc-dev is fixed.
+
+ -- Dylan Aïssi <daissi@debian.org>  Mon, 27 Nov 2023 11:37:05 +0100
+
+pipewire (0.3.85-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Dylan Aïssi <daissi@debian.org>  Thu, 16 Nov 2023 12:12:15 +0100
+
+pipewire (0.3.84-1) unstable; urgency=medium
+
+  * New upstream release
+  * Update symbols file
+
+ -- Dylan Aïssi <daissi@debian.org>  Thu, 02 Nov 2023 17:57:57 +0100
+
+pipewire (0.3.83-1) unstable; urgency=medium
+
+  * New upstream release
+  * Disable libcamera-dev from build-deps for hurd-i386
+  * Refresh Don-t-automatically-start-pipewire-for-root-logins.patch
+
+ -- Dylan Aïssi <daissi@debian.org>  Fri, 20 Oct 2023 16:20:29 +0200
+
+pipewire (0.3.82-1) unstable; urgency=medium
+
+  * New upstream release
+  * Update symbols file, 1 symbol is dropped in 0.3.82:
+      - _pw_log_topic_new@Base 0.3.38
+      See commit 57404e44.
+  * Mark libbluetooth-dev as a linux-any only Build-deps because not available
+      on GNU/Hurd.
+
+ -- Dylan Aïssi <daissi@debian.org>  Fri, 13 Oct 2023 11:26:00 +0200
+
+pipewire (0.3.81-1) experimental; urgency=medium
+
+  * New upstream release
+      - Use malloc_trim() when available to release memory (Closes: #1015915)
+  * Drop patch included in upstream release:
+      - 1f1c308c: aec: support both webrtc versions
+  * Switch packages architecture from linux-any to any
+      - GNU/Hurd support was added
+
+ -- Dylan Aïssi <daissi@debian.org>  Sun, 08 Oct 2023 14:28:05 +0200
+
+pipewire (0.3.80-2) unstable; urgency=medium
+
+  * Cherry-pick upstream recommended patch:
+      - 1f1c308c: aec: support both webrtc versions
+  * Re-enable webrtc-audio-processing in Build-Deps
+
+ -- Dylan Aïssi <daissi@debian.org>  Fri, 15 Sep 2023 14:37:24 +0200
+
+pipewire (0.3.80-1) experimental; urgency=medium
+
+  * New upstream release
+  * Drop patches included in upstream release
+  * Disable webrtc-audio-processing in Build-Deps:
+      pipewire now requires webrtc-audio-processing >= 1.2 which is not yet
+      available in Debian. Therefore the echo-canceller module is not built
+      anymore, and because this module is used and upstream advised against
+      disabling it, new versions of pipewire will only target experimental until
+      we can re-enable it.
+
+ -- Dylan Aïssi <daissi@debian.org>  Thu, 14 Sep 2023 15:59:17 +0200
+
 pipewire (0.3.79-2) unstable; urgency=medium
 
   [ Boud Roukema ]

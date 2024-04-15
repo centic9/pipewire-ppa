@@ -26,7 +26,6 @@
 PW_LOG_TOPIC_EXTERN(log_filter);
 #define PW_LOG_TOPIC_DEFAULT log_filter
 
-#define MAX_SAMPLES	8192
 #define MAX_BUFFERS	64
 
 #define MASK_BUFFERS	(MAX_BUFFERS-1)
@@ -83,7 +82,8 @@ struct port {
 #define PORT_Format	3
 #define PORT_Buffers	4
 #define PORT_Latency	5
-#define N_PORT_PARAMS	6
+#define PORT_Tag	6
+#define N_PORT_PARAMS	7
 	struct spa_param_info params[N_PORT_PARAMS];
 
 	struct spa_io_buffers *io;
@@ -108,6 +108,8 @@ struct filter {
 	struct pw_context *context;
 	struct pw_loop *main_loop;
 	struct pw_loop *data_loop;
+
+	uint32_t quantum_limit;
 
 	enum pw_filter_flags flags;
 
@@ -189,15 +191,17 @@ static int get_port_param_index(uint32_t id)
 		return PORT_Buffers;
 	case SPA_PARAM_Latency:
 		return PORT_Latency;
+	case SPA_PARAM_Tag:
+		return PORT_Tag;
 	default:
 		return -1;
 	}
 }
 
-static void fix_datatype(const struct spa_pod *param)
+static void fix_datatype(struct spa_pod *param)
 {
 	const struct spa_pod_prop *pod_param;
-	const struct spa_pod *vals;
+	struct spa_pod *vals;
 	uint32_t dataType, n_vals, choice;
 
 	pod_param = spa_pod_find_prop(param, NULL, SPA_PARAM_BUFFERS_dataType);
@@ -237,11 +241,6 @@ static struct param *add_param(struct filter *impl, struct port *port,
 	if (p == NULL)
 		return NULL;
 
-	if (id == SPA_PARAM_Buffers && port != NULL &&
-	    SPA_FLAG_IS_SET(port->flags, PW_FILTER_PORT_FLAG_MAP_BUFFERS) &&
-	    port->direction == SPA_DIRECTION_INPUT)
-		fix_datatype(param);
-
 	if (id == SPA_PARAM_ProcessLatency && port == NULL)
 		spa_process_latency_parse(param, &impl->process_latency);
 
@@ -250,6 +249,11 @@ static struct param *add_param(struct filter *impl, struct port *port,
 	p->param = SPA_PTROFF(p, sizeof(struct param), struct spa_pod);
 	memcpy(p->param, param, SPA_POD_SIZE(param));
 	SPA_POD_OBJECT_ID(p->param) = id;
+
+	if (id == SPA_PARAM_Buffers && port != NULL &&
+	    SPA_FLAG_IS_SET(port->flags, PW_FILTER_PORT_FLAG_MAP_BUFFERS) &&
+	    port->direction == SPA_DIRECTION_INPUT)
+		fix_datatype(p->param);
 
 	pw_log_debug("%p: port %p param id %d (%s)", impl, p, id,
 			spa_debug_type_find_name(spa_type_param, id));
@@ -775,9 +779,12 @@ static void clear_buffers(struct port *port)
 		if (SPA_FLAG_IS_SET(b->flags, BUFFER_FLAG_MAPPED)) {
 			for (j = 0; j < b->this.buffer->n_datas; j++) {
 				struct spa_data *d = &b->this.buffer->datas[j];
-				pw_log_debug("%p: clear buffer %d mem",
-						impl, b->id);
-				unmap_data(impl, d);
+				if (SPA_FLAG_IS_SET(d->flags, SPA_DATA_FLAG_MAPPABLE) ||
+				    (mappable_dataTypes & (1<<d->type)) > 0) {
+					pw_log_debug("%p: clear buffer %d mem",
+							impl, b->id);
+					unmap_data(impl, d);
+				}
 			}
 		}
 	}
@@ -940,7 +947,8 @@ static int impl_port_use_buffers(void *object,
 		if (SPA_FLAG_IS_SET(impl_flags, PW_FILTER_PORT_FLAG_MAP_BUFFERS)) {
 			for (j = 0; j < buffers[i]->n_datas; j++) {
 				struct spa_data *d = &buffers[i]->datas[j];
-				if ((mappable_dataTypes & (1<<d->type)) > 0) {
+				if (SPA_FLAG_IS_SET(d->flags, SPA_DATA_FLAG_MAPPABLE) ||
+				    (mappable_dataTypes & (1<<d->type)) > 0) {
 					if ((res = map_data(impl, d, prot)) < 0)
 						return res;
 					SPA_FLAG_SET(b->flags, BUFFER_FLAG_MAPPED);
@@ -1233,6 +1241,7 @@ filter_new(struct pw_context *context, const char *name,
 	}
 
 	impl->main_loop = pw_context_get_main_loop(context);
+	impl->quantum_limit = context->settings.clock_quantum_limit;
 
 	this = &impl->this;
 	pw_log_debug("%p: new", impl);
@@ -1249,10 +1258,12 @@ filter_new(struct pw_context *context, const char *name,
 	spa_hook_list_init(&impl->hooks);
 	this->properties = props;
 
-	if (pw_properties_get(props, PW_KEY_NODE_NAME) == NULL && extra) {
-		str = pw_properties_get(extra, PW_KEY_APP_NAME);
-		if (str == NULL)
-			str = pw_properties_get(extra, PW_KEY_APP_PROCESS_BINARY);
+	if ((str = pw_properties_get(props, PW_KEY_NODE_NAME)) == NULL) {
+		if (extra) {
+			str = pw_properties_get(extra, PW_KEY_APP_NAME);
+			if (str == NULL)
+				str = pw_properties_get(extra, PW_KEY_APP_PROCESS_BINARY);
+		}
 		if (str == NULL)
 			str = name;
 		pw_properties_set(props, PW_KEY_NODE_NAME, str);
@@ -1329,7 +1340,7 @@ pw_filter_new_simple(struct pw_loop *loop,
 	if (props == NULL)
 		return NULL;
 
-	context = pw_context_new(loop, NULL, 0);
+	context = pw_context_new(loop, pw_properties_copy(props), 0);
 	if (context == NULL) {
 		res = -errno;
 		goto error_cleanup;
@@ -1656,10 +1667,10 @@ pw_filter_connect(struct pw_filter *filter,
 	if ((str = getenv("PIPEWIRE_QUANTUM")) != NULL) {
 		struct spa_fraction q;
 		if (sscanf(str, "%u/%u", &q.num, &q.denom) == 2 && q.denom != 0) {
-			pw_properties_setf(filter->properties, PW_KEY_NODE_RATE,
-					"1/%u", q.denom);
-			pw_properties_setf(filter->properties, PW_KEY_NODE_LATENCY,
-					"%u/%u", q.num, q.denom);
+			pw_properties_setf(filter->properties, PW_KEY_NODE_FORCE_RATE,
+					"%u", q.denom);
+			pw_properties_setf(filter->properties, PW_KEY_NODE_FORCE_QUANTUM,
+					"%u", q.num);
 		}
 	}
 	if ((str = getenv("PIPEWIRE_LATENCY")) != NULL)
@@ -1776,9 +1787,9 @@ static void add_audio_dsp_port_params(struct filter *impl, struct port *port)
 			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(1, 1, MAX_BUFFERS),
 			SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
 			SPA_PARAM_BUFFERS_size,    SPA_POD_CHOICE_STEP_Int(
-								MAX_SAMPLES * sizeof(float),
+								impl->quantum_limit * sizeof(float),
 								sizeof(float),
-								MAX_SAMPLES * sizeof(float),
+								impl->quantum_limit * sizeof(float),
 								sizeof(float)),
 			SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(4)));
 }
@@ -1849,6 +1860,7 @@ void *pw_filter_add_port(struct pw_filter *filter,
 	p->params[PORT_Format] = SPA_PARAM_INFO(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
 	p->params[PORT_Buffers] = SPA_PARAM_INFO(SPA_PARAM_Buffers, 0);
 	p->params[PORT_Latency] = SPA_PARAM_INFO(SPA_PARAM_Latency, SPA_PARAM_INFO_WRITE);
+	p->params[PORT_Tag] = SPA_PARAM_INFO(SPA_PARAM_Tag, SPA_PARAM_INFO_WRITE);
 	p->info.params = p->params;
 	p->info.n_params = N_PORT_PARAMS;
 
@@ -1985,6 +1997,14 @@ int pw_filter_get_time(struct pw_filter *filter, struct pw_time *time)
 			time->now, time->delay, time->ticks,
 			time->rate.num, time->rate.denom);
 	return 0;
+}
+
+SPA_EXPORT
+uint64_t pw_filter_get_nsec(struct pw_filter *filter)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return SPA_TIMESPEC_TO_NSEC(&ts);
 }
 
 SPA_EXPORT
