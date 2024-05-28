@@ -1,3 +1,9 @@
+pipewire (1.0.5-1ubuntu1) noble; urgency=medium
+
+  * Patch to handle long SysEx messages in MIDI bridge (LP: #2067338)
+
+ -- Erich Eickmeyer <eeickmeyer@ubuntu.com>  Mon, 27 May 2024 21:18:02 -0700
+
 pipewire (1.0.5-1) unstable; urgency=medium
 
   [ Dylan Aïssi ]
