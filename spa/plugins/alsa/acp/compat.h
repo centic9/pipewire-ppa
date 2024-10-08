@@ -214,6 +214,7 @@ typedef enum pa_log_level {
 	PA_LOG_NOTICE = 2,    /* Notice messages */
 	PA_LOG_INFO   = 3,    /* Info messages */
 	PA_LOG_DEBUG  = 4,    /* Debug messages */
+	PA_LOG_TRACE = 5,
 	PA_LOG_LEVEL_MAX
 } pa_log_level_t;
 
@@ -245,6 +246,7 @@ static inline PA_PRINTF_FUNC(5, 6) void pa_log_level_meta(enum pa_log_level leve
 #define pa_log_notice(fmt,...)	pa_logl(PA_LOG_NOTICE, fmt, ##__VA_ARGS__)
 #define pa_log_info(fmt,...)	pa_logl(PA_LOG_INFO, fmt, ##__VA_ARGS__)
 #define pa_log_debug(fmt,...)	pa_logl(PA_LOG_DEBUG, fmt, ##__VA_ARGS__)
+#define pa_log_trace(fmt,...)	pa_logl(PA_LOG_TRACE, fmt, ##__VA_ARGS__)
 #define pa_log			pa_log_error
 
 #define pa_assert_se(expr)                                              \
@@ -348,6 +350,48 @@ static inline void pa_xstrfreev(char **a) {
     pa_xfreev((void**)a);
 }
 
+typedef struct {
+	size_t size;
+	char *ptr;
+	FILE *f;
+} pa_strbuf;
+
+static inline pa_strbuf *pa_strbuf_new(void)
+{
+	pa_strbuf *s = pa_xnew0(pa_strbuf,1);
+	s->f = open_memstream(&s->ptr, &s->size);
+	return s;
+}
+
+static PA_PRINTF_FUNC(2,3) inline size_t pa_strbuf_printf(pa_strbuf *sb, const char *format, ...)
+{
+	int ret;
+	va_list args;
+	va_start(args, format);
+	ret = vfprintf(sb->f, format, args);
+	va_end(args);
+	return ret > 0 ? ret : 0;
+}
+
+static inline void pa_strbuf_puts(pa_strbuf *sb, const char *t)
+{
+	fputs(t, sb->f);
+}
+
+static inline bool pa_strbuf_isempty(pa_strbuf *sb)
+{
+	fflush(sb->f);
+	return sb->size == 0;
+}
+
+static inline char *pa_strbuf_to_string_free(pa_strbuf *sb)
+{
+	char *ptr;
+	fclose(sb->f);
+	ptr = sb->ptr;
+	free(sb);
+	return ptr;
+}
 
 #define pa_cstrerror	strerror
 
@@ -634,6 +678,8 @@ static inline char *pa_readlink(const char *p) {
     return NULL;
 #endif
 }
+
+char *get_data_path(const char *data_dir, const char *data_type, const char *fname);
 
 #include <spa/support/i18n.h>
 

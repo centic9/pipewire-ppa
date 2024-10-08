@@ -1,0 +1,28 @@
+From cdc150a2c32ae04e43736fd856ad1d2b8308d8ba Mon Sep 17 00:00:00 2001
+From: Wim Taymans <wtaymans@redhat.com>
+Date: Fri, 10 May 2024 12:15:36 +0200
+Subject: [PATCH] jack: copy events to right offset
+
+The larger events need to be copied into the target buffer at the same
+offset as the source buffer or else we overwrite the header and make
+a corrupt buffer.
+---
+ pipewire-jack/src/pipewire-jack.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/pipewire-jack/src/pipewire-jack.c b/pipewire-jack/src/pipewire-jack.c
+index 0e2ecd185..d66c466af 100644
+--- a/pipewire-jack/src/pipewire-jack.c
++++ b/pipewire-jack/src/pipewire-jack.c
+@@ -5356,7 +5356,7 @@ static void *get_buffer_input_midi(struct port *p, jack_nframes_t frames)
+                               * sizeof(struct midi_event)));
+ 	if (mb->write_pos) {
+ 		size_t offs = mb->buffer_size - 1 - mb->write_pos;
+-		memcpy(ptr, SPA_PTROFF(mb, offs, void), mb->write_pos);
++		memcpy(SPA_PTROFF(ptr, offs, void), SPA_PTROFF(mb, offs, void), mb->write_pos);
+ 	}
+ 	return ptr;
+ }
+-- 
+GitLab
+

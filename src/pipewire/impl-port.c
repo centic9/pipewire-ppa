@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <string.h>
 #include <stdlib.h>
@@ -29,12 +9,15 @@
 
 #include <spa/pod/parser.h>
 #include <spa/param/audio/format-utils.h>
+#include <spa/param/tag-utils.h>
 #include <spa/node/utils.h>
 #include <spa/utils/names.h>
 #include <spa/utils/string.h>
+#include <spa/utils/json.h>
 #include <spa/debug/types.h>
 #include <spa/pod/filter.h>
 #include <spa/pod/dynamic.h>
+#include <spa/debug/pod.h>
 
 #include "pipewire/impl.h"
 #include "pipewire/private.h"
@@ -46,6 +29,7 @@ PW_LOG_TOPIC_EXTERN(log_port);
 struct impl {
 	struct pw_impl_port this;
 	struct spa_node mix_node;	/**< mix node implementation */
+	struct spa_list mix_list;
 
 	struct spa_list param_list;
 	struct spa_list pending_list;
@@ -88,7 +72,7 @@ static void emit_info_changed(struct pw_impl_port *port)
 	port->info.change_mask = 0;
 }
 
-static const char *port_state_as_string(enum pw_impl_port_state state)
+const char *pw_impl_port_state_as_string(enum pw_impl_port_state state)
 {
 	switch (state) {
 	case PW_IMPL_PORT_STATE_ERROR:
@@ -119,7 +103,8 @@ void pw_impl_port_update_state(struct pw_impl_port *port, enum pw_impl_port_stat
 	pw_log(state == PW_IMPL_PORT_STATE_ERROR ?
 			SPA_LOG_LEVEL_ERROR : SPA_LOG_LEVEL_DEBUG,
 		"%p: state %s -> %s (%s)", port,
-		port_state_as_string(old), port_state_as_string(state), error);
+		pw_impl_port_state_as_string(old),
+		pw_impl_port_state_as_string(state), error);
 
 	pw_impl_port_emit_state_changed(port, old, state, error);
 
@@ -130,6 +115,72 @@ void pw_impl_port_update_state(struct pw_impl_port *port, enum pw_impl_port_stat
 	}
 }
 
+static struct pw_impl_port_mix *find_mix(struct pw_impl_port *port,
+		enum spa_direction direction, uint32_t port_id)
+{
+	struct pw_impl_port_mix *mix;
+	spa_list_for_each(mix, &port->mix_list, link) {
+		if (mix->port.direction == direction && mix->port.port_id == port_id)
+			return mix;
+	}
+	return NULL;
+}
+
+static int
+do_add_mix(struct spa_loop *loop,
+		 bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct pw_impl_port_mix *mix = user_data;
+	struct pw_impl_port *this = mix->p;
+	struct impl *impl = SPA_CONTAINER_OF(this, struct impl, this);
+	pw_log_trace("%p: add mix %p", this, mix);
+	if (!mix->active) {
+		spa_list_append(&impl->mix_list, &mix->rt_link);
+		mix->active = true;
+	}
+	return 0;
+}
+
+static int
+do_remove_mix(struct spa_loop *loop,
+		 bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct pw_impl_port_mix *mix = user_data;
+	struct pw_impl_port *this = mix->p;
+	pw_log_trace("%p: remove mix %p", this, mix);
+	if (mix->active) {
+		spa_list_remove(&mix->rt_link);
+		mix->active = false;
+	}
+	return 0;
+}
+
+static int port_set_io(void *object,
+		enum spa_direction direction, uint32_t port_id, uint32_t id,
+		void *data, size_t size)
+{
+	struct impl *impl = object;
+	struct pw_impl_port *this = &impl->this;
+	struct pw_impl_port_mix *mix;
+
+	mix = find_mix(this, direction, port_id);
+	if (mix == NULL)
+		return -ENOENT;
+
+	if (id == SPA_IO_Buffers) {
+		if (data == NULL || size == 0) {
+			pw_loop_invoke(this->node->data_loop,
+			       do_remove_mix, SPA_ID_INVALID, NULL, 0, true, mix);
+			mix->io = NULL;
+		} else if (data != NULL && size >= sizeof(struct spa_io_buffers)) {
+			mix->io = data;
+			pw_loop_invoke(this->node->data_loop,
+			       do_add_mix, SPA_ID_INVALID, NULL, 0, false, mix);
+		}
+	}
+	return 0;
+}
+
 static int tee_process(void *object)
 {
 	struct impl *impl = object;
@@ -138,7 +189,7 @@ static int tee_process(void *object)
 	struct spa_io_buffers *io = &this->rt.io;
 
 	pw_log_trace_fp("%p: tee input %d %d", this, io->status, io->buffer_id);
-	spa_list_for_each(mix, &this->rt.mix_list, rt_link) {
+	spa_list_for_each(mix, &impl->mix_list, rt_link) {
 		pw_log_trace_fp("%p: port %d %p->%p %d", this,
 				mix->port.port_id, io, mix->io, mix->io->buffer_id);
 		*mix->io = *io;
@@ -155,13 +206,13 @@ static int tee_reuse_buffer(void *object, uint32_t port_id, uint32_t buffer_id)
 
 	pw_log_trace_fp("%p: tee reuse buffer %d %d", this, port_id, buffer_id);
 	spa_node_port_reuse_buffer(this->node->node, this->port_id, buffer_id);
-
 	return 0;
 }
 
 static const struct spa_node_methods schedule_tee_node = {
 	SPA_VERSION_NODE_METHODS,
 	.process = tee_process,
+	.port_set_io = port_set_io,
 	.port_reuse_buffer = tee_reuse_buffer,
 };
 
@@ -175,7 +226,7 @@ static int schedule_mix_input(void *object)
 	if (SPA_UNLIKELY(PW_IMPL_PORT_IS_CONTROL(this)))
 		return SPA_STATUS_HAVE_DATA | SPA_STATUS_NEED_DATA;
 
-	spa_list_for_each(mix, &this->rt.mix_list, rt_link) {
+	spa_list_for_each(mix, &impl->mix_list, rt_link) {
 		pw_log_trace_fp("%p: mix input %d %p->%p %d %d", this,
 				mix->port.port_id, mix->io, io, mix->io->status, mix->io->buffer_id);
 		*io = *mix->io;
@@ -188,11 +239,10 @@ static int schedule_mix_input(void *object)
 static int schedule_mix_reuse_buffer(void *object, uint32_t port_id, uint32_t buffer_id)
 {
 	struct impl *impl = object;
-	struct pw_impl_port *this = &impl->this;
 	struct pw_impl_port_mix *mix;
 
-	spa_list_for_each(mix, &this->rt.mix_list, rt_link) {
-		pw_log_trace_fp("%p: reuse buffer %d %d", this, port_id, buffer_id);
+	spa_list_for_each(mix, &impl->mix_list, rt_link) {
+		pw_log_trace_fp("%p: reuse buffer %d %d", impl, port_id, buffer_id);
 		/* FIXME send reuse buffer to peer */
 		break;
 	}
@@ -202,6 +252,7 @@ static int schedule_mix_reuse_buffer(void *object, uint32_t port_id, uint32_t bu
 static const struct spa_node_methods schedule_mix_node = {
 	SPA_VERSION_NODE_METHODS,
 	.process = schedule_mix_input,
+	.port_set_io = port_set_io,
 	.port_reuse_buffer = schedule_mix_reuse_buffer,
 };
 
@@ -209,6 +260,7 @@ SPA_EXPORT
 int pw_impl_port_init_mix(struct pw_impl_port *port, struct pw_impl_port_mix *mix)
 {
 	uint32_t port_id;
+	struct pw_impl_node *node = port->node;
 	int res = 0;
 
 	port_id = pw_map_insert_new(&port->mix_port_map, mix);
@@ -248,10 +300,17 @@ int pw_impl_port_init_mix(struct pw_impl_port *port, struct pw_impl_port_mix *mi
 	spa_list_append(&port->mix_list, &mix->link);
 	port->n_mix++;
 
-	pw_log_debug("%p: init mix n_mix:%d %d.%d io:%p: (%s)", port,
+	pw_log_debug("%p: init mix n_mix:%d %d.%d id:%d peer:%d io:%p: (%s)", port,
 			port->n_mix, port->port_id, mix->port.port_id,
-			mix->io, spa_strerror(res));
+			mix->id, mix->peer_id, mix->io, spa_strerror(res));
 
+	if (port->n_mix == 1) {
+		pw_log_debug("%p: setting port io", port);
+		spa_node_port_set_io(node->node,
+				     port->direction, port->port_id,
+				     SPA_IO_Buffers,
+				     &port->rt.io, sizeof(port->rt.io));
+	}
 	return res;
 
 error_remove_port:
@@ -266,20 +325,33 @@ int pw_impl_port_release_mix(struct pw_impl_port *port, struct pw_impl_port_mix 
 {
 	int res = 0;
 	uint32_t port_id = mix->port.port_id;
+	struct pw_impl_node *node = port->node;
 
 	pw_map_remove(&port->mix_port_map, port_id);
 	spa_list_remove(&mix->link);
 	port->n_mix--;
 
+	pw_log_debug("%p: release mix %d %d.%d", port,
+			port->n_mix, port->port_id, mix->port.port_id);
+
 	res = pw_impl_port_call_release_mix(port, mix);
+
+	if (port->destroying)
+		return res;
 
 	if ((res = spa_node_remove_port(port->mix, port->direction, port_id)) < 0 &&
 	    res != -ENOTSUP)
 		pw_log_warn("can't remove mix port %d: %s", port_id, spa_strerror(res));
 
-	pw_log_debug("%p: release mix %d %d.%d", port,
-			port->n_mix, port->port_id, mix->port.port_id);
+	if (port->n_mix == 0) {
+		pw_log_debug("%p: clearing port io", port);
+		spa_node_port_set_io(node->node,
+				     port->direction, port->port_id,
+				     SPA_IO_Buffers,
+				     NULL, sizeof(port->rt.io));
 
+		pw_impl_port_set_param(port, SPA_PARAM_Format, 0, NULL);
+	}
 	return res;
 }
 
@@ -374,7 +446,7 @@ static int process_latency_param(void *data, int seq,
 	struct pw_impl_port *this = data;
 	struct spa_latency_info latency;
 
-	if (id != SPA_PARAM_Latency)
+	if (id != SPA_PARAM_Latency || param == NULL)
 		return -EINVAL;
 
 	if (spa_latency_parse(param, &latency) < 0)
@@ -391,6 +463,37 @@ static int process_latency_param(void *data, int seq,
 	this->latency[latency.direction] = latency;
 	if (latency.direction == this->direction)
 		pw_impl_port_emit_latency_changed(this);
+
+	return 0;
+}
+static int process_tag_param(void *data, int seq,
+		uint32_t id, uint32_t index, uint32_t next, struct spa_pod *param)
+{
+	struct pw_impl_port *this = data;
+	struct spa_tag_info info;
+	struct spa_pod *old;
+	void *state = NULL;
+
+	if (id != SPA_PARAM_Tag || param == NULL)
+		return -EINVAL;
+	if (spa_tag_parse(param, &info, &state) < 0)
+		return 0;
+
+	old = this->tag[info.direction];
+
+	if (spa_tag_compare(old, param) == 0)
+		return 0;
+
+	pw_log_debug("port %p: got %s tag %p", this,
+			pw_direction_as_string(info.direction), param);
+	if (param)
+		pw_log_pod(SPA_LOG_LEVEL_DEBUG, param);
+
+	free(old);
+	this->tag[info.direction] = spa_pod_copy(param);
+
+	if (info.direction == this->direction)
+		pw_impl_port_emit_tag_changed(this);
 
 	return 0;
 }
@@ -444,6 +547,13 @@ static void update_info(struct pw_impl_port *port, const struct spa_port_info *i
 					pw_impl_port_for_each_param(port, 0, id, 0, UINT32_MAX,
 							NULL, process_latency_param, port);
 				break;
+			case SPA_PARAM_Tag:
+				port->have_tag_param =
+					SPA_FLAG_IS_SET(info->params[i].flags, SPA_PARAM_INFO_WRITE);
+				if (port->node != NULL)
+					pw_impl_port_for_each_param(port, 0, id, 0, UINT32_MAX,
+							NULL, process_tag_param, port);
+				break;
 			default:
 				break;
 			}
@@ -475,8 +585,10 @@ struct pw_impl_port *pw_context_create_port(
 	spa_list_init(&impl->param_list);
 	spa_list_init(&impl->pending_list);
 	impl->cache_params = true;
+	spa_list_init(&impl->mix_list);
 
 	this = &impl->this;
+
 	pw_log_debug("%p: new %s %d", this,
 			pw_direction_as_string(direction), port_id);
 
@@ -515,7 +627,6 @@ struct pw_impl_port *pw_context_create_port(
 
 	spa_list_init(&this->links);
 	spa_list_init(&this->mix_list);
-	spa_list_init(&this->rt.mix_list);
 	spa_list_init(&this->control_list[0]);
 	spa_list_init(&this->control_list[1]);
 
@@ -847,10 +958,10 @@ static const struct pw_resource_events resource_events = {
 };
 
 static int
-global_bind(void *_data, struct pw_impl_client *client, uint32_t permissions,
+global_bind(void *object, struct pw_impl_client *client, uint32_t permissions,
 	       uint32_t version, uint32_t id)
 {
-	struct pw_impl_port *this = _data;
+	struct pw_impl_port *this = object;
 	struct pw_global *global = this->global;
 	struct pw_resource *resource;
 	struct resource_data *data;
@@ -886,9 +997,9 @@ error_resource:
 	return res;
 }
 
-static void global_destroy(void *object)
+static void global_destroy(void *data)
 {
-	struct pw_impl_port *port = object;
+	struct pw_impl_port *port = data;
 	spa_hook_remove(&port->global_listener);
 	port->global = NULL;
 	pw_impl_port_destroy(port);
@@ -917,6 +1028,7 @@ int pw_impl_port_register(struct pw_impl_port *port,
 		PW_KEY_PORT_CONTROL,
 		PW_KEY_PORT_ALIAS,
 		PW_KEY_PORT_EXTRA,
+		PW_KEY_PORT_IGNORE_LATENCY,
 		NULL
 	};
 
@@ -928,6 +1040,7 @@ int pw_impl_port_register(struct pw_impl_port *port,
 	port->global = pw_global_new(node->context,
 				PW_TYPE_INTERFACE_Port,
 				PW_VERSION_PORT,
+				PW_PORT_PERM_MASK,
 				properties,
 				global_bind,
 				port);
@@ -957,8 +1070,11 @@ int pw_impl_port_add(struct pw_impl_port *port, struct pw_impl_node *node)
 	struct spa_list *ports;
 	struct pw_map *portmap;
 	struct pw_impl_port *find;
-	bool control;
-	const char *str, *dir;
+	bool is_control, is_network, is_monitor, is_device, is_duplex, is_virtual;
+	const char *media_class, *override_device_prefix, *channel_names;
+	const char *str, *dir, *prefix, *path, *desc, *nick, *name;
+	const struct pw_properties *nprops;
+	char position[256];
 	int res;
 
 	if (port->node != NULL)
@@ -985,37 +1101,130 @@ int pw_impl_port_add(struct pw_impl_port *port, struct pw_impl_node *node)
 
 	pw_impl_port_for_each_param(port, 0, SPA_PARAM_IO, 0, 0, NULL, check_param_io, port);
 	pw_impl_port_for_each_param(port, 0, SPA_PARAM_Latency, 0, 0, NULL, process_latency_param, port);
+	pw_impl_port_for_each_param(port, 0, SPA_PARAM_Tag, 0, 0, NULL, process_tag_param, port);
 
-	control = PW_IMPL_PORT_IS_CONTROL(port);
-	if (control) {
+	nprops = pw_impl_node_get_properties(node);
+	media_class = pw_properties_get(nprops, PW_KEY_MEDIA_CLASS);
+	is_network = pw_properties_get_bool(nprops, PW_KEY_NODE_NETWORK, false);
+
+	is_monitor = pw_properties_get_bool(port->properties, PW_KEY_PORT_MONITOR, false);
+
+	port->ignore_latency = pw_properties_get_bool(port->properties, PW_KEY_PORT_IGNORE_LATENCY, false);
+
+	is_control = PW_IMPL_PORT_IS_CONTROL(port);
+	if (is_control) {
 		dir = port->direction == PW_DIRECTION_INPUT ?  "control" : "notify";
 		pw_properties_set(port->properties, PW_KEY_PORT_CONTROL, "true");
 	}
 	else {
-		dir = port->direction == PW_DIRECTION_INPUT ?  "in" : "out";
+		dir = port->direction == PW_DIRECTION_INPUT ? "in" : "out";
 	}
 	pw_properties_set(port->properties, PW_KEY_PORT_DIRECTION, dir);
 
-	if (pw_properties_get(port->properties, PW_KEY_PORT_NAME) == NULL) {
-		if ((str = pw_properties_get(port->properties, PW_KEY_AUDIO_CHANNEL)) != NULL &&
-		    !spa_streq(str, "UNK")) {
-			pw_properties_setf(port->properties, PW_KEY_PORT_NAME, "%s_%s", dir, str);
-		}
-		else {
-			pw_properties_setf(port->properties, PW_KEY_PORT_NAME, "%s_%d", dir, port->port_id);
-		}
+	/* inherit passive state from parent node */
+	if (port->direction == PW_DIRECTION_INPUT)
+		port->passive = node->in_passive;
+	else
+		port->passive = node->out_passive;
+	/* override with specific port property if available */
+	port->passive = pw_properties_get_bool(port->properties, PW_KEY_PORT_PASSIVE,
+			port->passive);
+
+	if (media_class != NULL &&
+	    (strstr(media_class, "Sink") != NULL ||
+	     strstr(media_class, "Source") != NULL))
+		is_device = true;
+	else
+		is_device = false;
+
+	is_duplex = media_class != NULL && strstr(media_class, "Duplex") != NULL;
+	is_virtual = media_class != NULL && strstr(media_class, "Virtual") != NULL;
+
+	override_device_prefix = pw_properties_get(nprops, PW_KEY_NODE_DEVICE_PORT_NAME_PREFIX);
+
+	if (is_network) {
+		prefix = port->direction == PW_DIRECTION_INPUT ?
+			"send" : is_monitor ? "monitor" : "receive";
+	} else if (is_duplex) {
+		prefix = port->direction == PW_DIRECTION_INPUT ?
+			"playback" : "capture";
+	} else if (is_virtual) {
+		prefix = port->direction == PW_DIRECTION_INPUT ?
+			"input" : "capture";
+	} else if (is_device) {
+		if (override_device_prefix != NULL)
+			prefix = is_monitor ? "monitor" : override_device_prefix;
+		else
+			prefix = port->direction == PW_DIRECTION_INPUT ?
+				"playback" : is_monitor ? "monitor" : "capture";
+	} else {
+		prefix = port->direction == PW_DIRECTION_INPUT ?
+			"input" : is_monitor ? "monitor" : "output";
 	}
+
+	path = pw_properties_get(nprops, PW_KEY_OBJECT_PATH);
+	desc = pw_properties_get(nprops, PW_KEY_NODE_DESCRIPTION);
+	nick = pw_properties_get(nprops, PW_KEY_NODE_NICK);
+	name = pw_properties_get(nprops, PW_KEY_NODE_NAME);
+
+	if (pw_properties_get(port->properties, PW_KEY_OBJECT_PATH) == NULL) {
+		if ((str = name) == NULL && (str = nick) == NULL && (str = desc) == NULL)
+			str = "node";
+
+		pw_properties_setf(port->properties, PW_KEY_OBJECT_PATH, "%s:%s_%d",
+			path ? path : str, prefix, pw_impl_port_get_id(port));
+	}
+
+	str = pw_properties_get(port->properties, PW_KEY_AUDIO_CHANNEL);
+	if (str ==  NULL || spa_streq(str, "UNK"))
+		snprintf(position, sizeof(position), "%d", port->port_id + 1);
+	else if (str != NULL)
+		snprintf(position, sizeof(position), "%s", str);
+
+	channel_names = pw_properties_get(nprops, PW_KEY_NODE_CHANNELNAMES);
+	if (channel_names != NULL) {
+		struct spa_json it[2];
+		char v[256];
+                uint32_t i;
+
+		spa_json_init(&it[0], channel_names, strlen(channel_names));
+		if (spa_json_enter_array(&it[0], &it[1]) <= 0)
+			spa_json_init(&it[1], channel_names, strlen(channel_names));
+
+		for (i = 0; i < port->port_id + 1; i++)
+			if (spa_json_get_string(&it[1], v, sizeof(v)) <= 0)
+				break;
+
+		if (i == port->port_id + 1 && strlen(v) > 0)
+			snprintf(position, sizeof(position), "%s", v);
+	}
+
+	if (pw_properties_get(port->properties, PW_KEY_PORT_NAME) == NULL) {
+		if (is_control)
+			pw_properties_setf(port->properties, PW_KEY_PORT_NAME, "%s", prefix);
+		else if (prefix == NULL || strlen(prefix) == 0)
+			pw_properties_setf(port->properties, PW_KEY_PORT_NAME, "%s", position);
+		else
+			pw_properties_setf(port->properties, PW_KEY_PORT_NAME, "%s_%s", prefix, position);
+	}
+	if (pw_properties_get(port->properties, PW_KEY_PORT_ALIAS) == NULL) {
+		if ((str = nick) == NULL && (str = desc) == NULL && (str = name) == NULL)
+			str = "node";
+
+		if (is_control)
+			pw_properties_setf(port->properties, PW_KEY_PORT_ALIAS, "%s:%s",
+				str, prefix);
+		else
+			pw_properties_setf(port->properties, PW_KEY_PORT_ALIAS, "%s:%s",
+				str, pw_properties_get(port->properties, PW_KEY_PORT_NAME));
+	}
+
 	port->info.props = &port->properties->dict;
 
-	if (control) {
+	if (is_control) {
 		pw_log_debug("%p: setting node control", port);
 	} else {
-		pw_log_debug("%p: setting node io", port);
-		spa_node_port_set_io(node->node,
-				     port->direction, port->port_id,
-				     SPA_IO_Buffers,
-				     &port->rt.io, sizeof(port->rt.io));
-
+		pw_log_debug("%p: setting mixer io", port);
 		spa_node_port_set_io(port->mix,
 			     pw_direction_reverse(port->direction), 0,
 			     SPA_IO_Buffers,
@@ -1142,6 +1351,8 @@ void pw_impl_port_destroy(struct pw_impl_port *port)
 
 	pw_param_clear(&impl->param_list, SPA_ID_INVALID);
 	pw_param_clear(&impl->pending_list, SPA_ID_INVALID);
+	free(port->tag[SPA_DIRECTION_INPUT]);
+	free(port->tag[SPA_DIRECTION_OUTPUT]);
 
 	pw_map_clear(&port->mix_port_map);
 
@@ -1157,7 +1368,6 @@ struct result_port_params_data {
 			uint32_t id, uint32_t index, uint32_t next,
 			struct spa_pod *param);
 	int seq;
-	uint32_t count;
 	unsigned int cache:1;
 };
 
@@ -1171,11 +1381,8 @@ static void result_port_params(void *data, int seq, int res, uint32_t type, cons
 		const struct spa_result_node_params *r = result;
 		if (d->seq == seq) {
 			d->callback(d->data, seq, r->id, r->index, r->next, r->param);
-			if (d->cache) {
-				if (d->count++ == 0)
-					pw_param_add(&impl->pending_list, r->id, NULL);
-				pw_param_add(&impl->pending_list, r->id, r->param);
-			}
+			if (d->cache)
+				pw_param_add(&impl->pending_list, seq, r->id, r->param);
 		}
 		break;
 	}
@@ -1197,7 +1404,7 @@ int pw_impl_port_for_each_param(struct pw_impl_port *port,
 	int res;
 	struct impl *impl = SPA_CONTAINER_OF(port, struct impl, this);
 	struct pw_impl_node *node = port->node;
-	struct result_port_params_data user_data = { impl, data, callback, seq, 0, false };
+	struct result_port_params_data user_data = { impl, data, callback, seq, false };
 	struct spa_hook listener;
 	struct spa_param_info *pi;
 	static const struct spa_node_events node_events = {
@@ -1227,10 +1434,10 @@ int pw_impl_port_for_each_param(struct pw_impl_port *port,
 		result.next = 0;
 
 		spa_list_for_each(p, &impl->param_list, link) {
-			result.index = result.next++;
 			if (p->id != param_id)
 				continue;
 
+			result.index = result.next++;
 			if (result.index < index)
 				continue;
 
@@ -1251,6 +1458,9 @@ int pw_impl_port_for_each_param(struct pw_impl_port *port,
 		user_data.cache = impl->cache_params &&
 			(filter == NULL && index == 0 && max == UINT32_MAX);
 
+		if (user_data.cache)
+			pw_param_add(&impl->pending_list, seq, param_id, NULL);
+
 		spa_zero(listener);
 		spa_node_add_listener(node->node, &listener, &node_events, &user_data);
 		res = spa_node_port_enum_params(node->node, seq,
@@ -1260,7 +1470,7 @@ int pw_impl_port_for_each_param(struct pw_impl_port *port,
 		spa_hook_remove(&listener);
 
 		if (user_data.cache) {
-			pw_param_update(&impl->param_list, &impl->pending_list);
+			pw_param_update(&impl->param_list, &impl->pending_list, 0, NULL);
 			pi->user = 1;
 		}
 	}
@@ -1306,7 +1516,7 @@ int pw_impl_port_for_each_filtered_param(struct pw_impl_port *in_port,
 		return res;
 
 	if (fd.n_params == 0)
-		res = do_filter(&filter, seq, 0, 0, 0, NULL);
+		res = do_filter(&fd, seq, 0, 0, 0, NULL);
 
 	return res;
 }
@@ -1339,6 +1549,7 @@ int pw_impl_port_recalc_latency(struct pw_impl_port *port)
 	struct spa_pod_builder b = { 0 };
 	uint8_t buffer[1024];
 	bool changed;
+	int count = 0;
 
 	if (port->destroying)
 		return 0;
@@ -1350,29 +1561,43 @@ int pw_impl_port_recalc_latency(struct pw_impl_port *port)
 	if (port->direction == PW_DIRECTION_OUTPUT) {
 		spa_list_for_each(l, &port->links, output_link) {
 			other = l->input;
+			if (other->ignore_latency) {
+				pw_log_debug("port %d: peer %d: peer latency ignored",
+						port->info.id, other->info.id);
+				continue;
+			}
 			spa_latency_info_combine(&latency, &other->latency[other->direction]);
 			pw_log_debug("port %d: peer %d: latency %f-%f %d-%d %"PRIu64"-%"PRIu64,
 					port->info.id, other->info.id,
 					latency.min_quantum, latency.max_quantum,
 					latency.min_rate, latency.max_rate,
 					latency.min_ns, latency.max_ns);
+			count++;
 		}
 	} else {
 		spa_list_for_each(l, &port->links, input_link) {
 			other = l->output;
+			if (other->ignore_latency) {
+				pw_log_debug("port %d: peer %d: peer latency ignored",
+						port->info.id, other->info.id);
+				continue;
+			}
 			spa_latency_info_combine(&latency, &other->latency[other->direction]);
 			pw_log_debug("port %d: peer %d: latency %f-%f %d-%d %"PRIu64"-%"PRIu64,
 					port->info.id, other->info.id,
 					latency.min_quantum, latency.max_quantum,
 					latency.min_rate, latency.max_rate,
 					latency.min_ns, latency.max_ns);
+			count++;
 		}
 	}
 	spa_latency_info_combine_finish(&latency);
 
-	current = &port->latency[latency.direction];
-
-	changed = spa_latency_info_compare(current, &latency) != 0;
+	current = port->have_latency ? &port->latency[latency.direction] : NULL;
+	if (current == NULL)
+		changed = count > 0;
+	else
+		changed = spa_latency_info_compare(current, &latency) != 0;
 
 	pw_log_info("port %d: %s %s latency %f-%f %d-%d %"PRIu64"-%"PRIu64,
 			port->info.id, changed ? "set" : "keep",
@@ -1384,14 +1609,88 @@ int pw_impl_port_recalc_latency(struct pw_impl_port *port)
 	if (!changed)
 		return 0;
 
-	*current = latency;
+	port->latency[latency.direction] = latency;
+	port->have_latency = count > 0;
 
 	if (!port->have_latency_param)
 		return 0;
 
 	spa_pod_builder_init(&b, buffer, sizeof(buffer));
-	param = spa_latency_build(&b, SPA_PARAM_Latency, &latency);
+	param = port->have_latency ? spa_latency_build(&b, SPA_PARAM_Latency, &latency) : NULL;
 	return pw_impl_port_set_param(port, SPA_PARAM_Latency, 0, param);
+}
+
+int pw_impl_port_recalc_tag(struct pw_impl_port *port)
+{
+	struct pw_impl_link *l;
+	struct pw_impl_port *other;
+	struct spa_pod *param, *tag, *old;
+	struct spa_pod_dynamic_builder b = { 0 };
+	struct spa_pod_frame f;
+	struct spa_tag_info info;
+	enum spa_direction direction;
+	uint8_t buffer[1024];
+	int count = 0;
+	bool changed;
+
+	if (port->destroying)
+		return 0;
+
+	direction = SPA_DIRECTION_REVERSE(port->direction);
+
+	spa_pod_dynamic_builder_init(&b, buffer, sizeof(buffer), 4096);
+	spa_tag_build_start(&b.b, &f, SPA_PARAM_Tag, direction);
+
+	if (port->direction == PW_DIRECTION_OUTPUT) {
+		spa_list_for_each(l, &port->links, output_link) {
+			other = l->input;
+			tag = other->tag[other->direction];
+			if (tag) {
+				void *state = NULL;
+				while (spa_tag_parse(tag, &info, &state) == 1) {
+					spa_tag_build_add_info(&b.b, info.info);
+					count++;
+				}
+			}
+		}
+	} else {
+		spa_list_for_each(l, &port->links, input_link) {
+			other = l->output;
+			tag = other->tag[other->direction];
+			if (tag) {
+				void *state = NULL;
+				while (spa_tag_parse(tag, &info, &state) == 1) {
+					spa_tag_build_add_info(&b.b, info.info);
+					count++;
+				}
+			}
+		}
+	}
+	param = count == 0 ? NULL : spa_tag_build_end(&b.b, &f);
+
+	old = port->tag[direction];
+
+	changed = spa_tag_compare(old, param);
+
+	pw_log_info("port %d: %p %s %s tag %p",
+			port->info.id, port, changed ? "set" : "keep",
+			pw_direction_as_string(direction), param);
+
+	if (changed) {
+		free(old);
+		port->tag[direction] = param ? spa_pod_copy(param) : NULL;
+		if (param)
+			pw_log_pod(SPA_LOG_LEVEL_INFO, param);
+	}
+	spa_pod_dynamic_builder_clean(&b);
+
+	if (!changed)
+		return 0;
+
+	if (!port->have_tag_param)
+		return 0;
+
+	return pw_impl_port_set_param(port, SPA_PARAM_Tag, 0, port->tag[direction]);
 }
 
 SPA_EXPORT
@@ -1417,7 +1716,7 @@ int pw_impl_port_set_param(struct pw_impl_port *port, uint32_t id, uint32_t flag
 	pw_log_debug("%p: %d set param on node %d:%d id:%d (%s): %d (%s)", port, port->state,
 			port->direction, port->port_id, id,
 			spa_debug_type_find_name(spa_type_param, id),
-			res, spa_strerror(res));
+			res, res <= 0 ? spa_strerror(res) : "modified");
 
 	/* set the parameters on all ports of the mixer node if possible */
 	if (res >= 0) {
@@ -1447,6 +1746,12 @@ int pw_impl_port_set_param(struct pw_impl_port *port, uint32_t id, uint32_t flag
 			port->added = false;
 		}
 		/* setting the format always destroys the negotiated buffers */
+		if (port->direction == PW_DIRECTION_OUTPUT) {
+			struct pw_impl_link *l;
+			/* remove all buffers shared with an output port peer */
+			spa_list_for_each(l, &port->links, output_link)
+				pw_impl_port_use_buffers(l->input, &l->rt.in_mix, 0, NULL, 0);
+		}
 		pw_buffers_clear(&port->buffers);
 		pw_buffers_clear(&port->mix_buffers);
 
@@ -1478,9 +1783,12 @@ static int negotiate_mixer_buffers(struct pw_impl_port *port, uint32_t flags,
 
 		/* try dynamic data */
 		alloc_flags = PW_BUFFERS_FLAG_DYNAMIC;
+		if (SPA_FLAG_IS_SET(node->spa_flags, SPA_NODE_FLAG_ASYNC))
+			alloc_flags |= PW_BUFFERS_FLAG_ASYNC;
 
-		pw_log_debug("%p: %d.%d negotiate %d buffers on node: %p",
-				port, port->direction, port->port_id, n_buffers, node->node);
+		pw_log_debug("%p: %d.%d negotiate %d buffers on node: %p flags:%08x",
+				port, port->direction, port->port_id, n_buffers, node->node,
+				alloc_flags);
 
 		if (port->added) {
 			pw_loop_invoke(node->data_loop, do_remove_port, SPA_ID_INVALID, NULL, 0, true, port);
@@ -1531,7 +1839,7 @@ int pw_impl_port_use_buffers(struct pw_impl_port *port, struct pw_impl_port_mix 
 	int res = 0, res2;
 
 	pw_log_debug("%p: %d:%d.%d: %d buffers flags:%d state:%d n_mix:%d", port,
-			port->direction, port->port_id, mix->id,
+			port->direction, port->port_id, mix->port.port_id,
 			n_buffers, flags, port->state, port->n_mix);
 
 	if (n_buffers == 0 && port->state <= PW_IMPL_PORT_STATE_READY)
@@ -1541,6 +1849,7 @@ int pw_impl_port_use_buffers(struct pw_impl_port *port, struct pw_impl_port_mix 
 		return -EIO;
 
 	if (n_buffers == 0) {
+		mix->have_buffers = false;
 		if (port->n_mix == 1)
 			pw_impl_port_update_state(port, PW_IMPL_PORT_STATE_READY, 0, NULL);
 	}

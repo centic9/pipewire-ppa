@@ -1,26 +1,6 @@
-/* Spa
- *
- * Copyright © 2021 Red Hat, Inc.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Spa */
+/* SPDX-FileCopyrightText: Copyright © 2021 Red Hat, Inc. */
+/* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
 #include <fnmatch.h>
@@ -42,6 +22,7 @@ support_log_topic_init(struct spa_list *patterns, enum spa_log_level default_lev
 		       struct spa_log_topic *t)
 {
 	enum spa_log_level level = default_level;
+	bool has_custom_level = false;
 	const char *topic = t->topic;
 	struct support_log_pattern *pattern;
 
@@ -49,10 +30,11 @@ support_log_topic_init(struct spa_list *patterns, enum spa_log_level default_lev
 		if (fnmatch(pattern->pattern, topic, 0) != 0)
 			continue;
 		level = pattern->level;
-		t->has_custom_level = true;
+		has_custom_level = true;
 	}
 
 	t->level = level;
+	t->has_custom_level = has_custom_level;
 }
 
 int

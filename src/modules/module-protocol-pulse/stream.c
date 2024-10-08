@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,10 +8,12 @@
 
 #include <spa/utils/hook.h>
 #include <spa/utils/ringbuffer.h>
+#include <spa/pod/dynamic.h>
+#include <spa/param/tag-utils.h>
+
 #include <pipewire/log.h>
 #include <pipewire/loop.h>
 #include <pipewire/map.h>
-#include <pipewire/private.h>
 #include <pipewire/properties.h>
 #include <pipewire/stream.h>
 #include <pipewire/work-queue.h>
@@ -64,6 +46,7 @@ struct stream *stream_new(struct client *client, enum stream_type type, uint32_t
 {
 	int res;
 	struct defs *defs = &client->impl->defs;
+	const char *str;
 
 	struct stream *stream = calloc(1, sizeof(*stream));
 	if (stream == NULL)
@@ -82,12 +65,17 @@ struct stream *stream_new(struct client *client, enum stream_type type, uint32_t
 	stream->attr = *attr;
 	spa_ringbuffer_init(&stream->ring);
 
+	stream->peer_index = SPA_ID_INVALID;
+
 	parse_frac(client->props, "pulse.min.req", &defs->min_req, &stream->min_req);
 	parse_frac(client->props, "pulse.min.frag", &defs->min_frag, &stream->min_frag);
 	parse_frac(client->props, "pulse.min.quantum", &defs->min_quantum, &stream->min_quantum);
 	parse_frac(client->props, "pulse.default.req", &defs->default_req, &stream->default_req);
 	parse_frac(client->props, "pulse.default.frag", &defs->default_frag, &stream->default_frag);
 	parse_frac(client->props, "pulse.default.tlength", &defs->default_tlength, &stream->default_tlength);
+	stream->idle_timeout_sec = defs->idle_timeout;
+	if ((str = pw_properties_get(client->props, "pulse.idle.timeout")) != NULL)
+		spa_atou32(str, &stream->idle_timeout_sec, 0);
 
 	switch (type) {
 	case STREAM_TYPE_RECORD:
@@ -117,9 +105,6 @@ void stream_free(struct stream *stream)
 	struct impl *impl = client->impl;
 
 	pw_log_debug("client %p: stream %p channel:%d", client, stream, stream->channel);
-
-	if (stream->pending)
-		spa_list_remove(&stream->link);
 
 	if (stream->drain_tag)
 		reply_error(client, -1, stream->drain_tag, -ENOENT);
@@ -194,15 +179,36 @@ uint32_t stream_pop_missing(struct stream *stream)
 	missing -= stream->requested;
 	missing -= avail;
 
-	if (missing <= 0)
+	if (missing <= 0) {
+		pw_log_debug("stream %p: (tlen:%u - req:%"PRIi64" - avail:%"PRIi64") <= 0",
+				stream, stream->attr.tlength, stream->requested, avail);
 		return 0;
+	}
 
-	if (missing < stream->attr.minreq && !stream_prebuf_active(stream, avail))
+	if (missing < stream->attr.minreq && !stream_prebuf_active(stream, avail)) {
+		pw_log_debug("stream %p: (tlen:%u - req:%"PRIi64" - avail:%"PRIi64") <= minreq:%u",
+				stream, stream->attr.tlength, stream->requested, avail,
+				stream->attr.minreq);
 		return 0;
+	}
 
 	stream->requested += missing;
 
 	return missing;
+}
+
+void stream_set_paused(struct stream *stream, bool paused, const char *reason)
+{
+	if (stream->is_paused == paused)
+		return;
+
+	if (reason && stream->client)
+		pw_log_info("%p: [%s] %s because of %s",
+				stream, stream->client->name,
+				paused ? "paused" : "resumed", reason);
+
+	stream->is_paused = paused;
+	pw_stream_set_active(stream->stream, !paused);
 }
 
 int stream_send_underflow(struct stream *stream, int64_t offset)
@@ -210,10 +216,11 @@ int stream_send_underflow(struct stream *stream, int64_t offset)
 	struct client *client = stream->client;
 	struct impl *impl = client->impl;
 	struct message *reply;
+	int suppressed;
 
-	if (ratelimit_test(&impl->rate_limit, stream->timestamp, SPA_LOG_LEVEL_INFO)) {
-		pw_log_info("[%s]: UNDERFLOW channel:%u offset:%" PRIi64,
-			    client->name, stream->channel, offset);
+	if ((suppressed = spa_ratelimit_test(&impl->rate_limit, stream->timestamp)) >= 0) {
+		pw_log_info("[%s]: UNDERFLOW channel:%u offset:%" PRIi64" (%d suppressed)",
+			    client->name, stream->channel, offset, suppressed);
 	}
 
 	reply = message_alloc(impl, -1, 0);
@@ -305,10 +312,11 @@ int stream_send_request(struct stream *stream)
 	uint32_t size;
 
 	size = stream_pop_missing(stream);
-	pw_log_debug("stream %p: REQUEST channel:%d %u", stream, stream->channel, size);
 
 	if (size == 0)
 		return 0;
+
+	pw_log_debug("stream %p: REQUEST channel:%d %u", stream, stream->channel, size);
 
 	msg = message_alloc(impl, -1, 0);
 	message_put(msg,
@@ -357,5 +365,86 @@ int stream_update_minreq(struct stream *stream, uint32_t minreq)
 			TAG_INVALID);
 		return client_queue_message(client, msg);
 	}
+	return 0;
+}
+
+int stream_send_moved(struct stream *stream, uint32_t peer_index, const char *peer_name)
+{
+	struct client *client = stream->client;
+	struct impl *impl = client->impl;
+	struct message *reply;
+	uint32_t command;
+
+	command = stream->direction == PW_DIRECTION_OUTPUT ?
+		COMMAND_PLAYBACK_STREAM_MOVED :
+		COMMAND_RECORD_STREAM_MOVED;
+
+	pw_log_info("client %p [%s]: stream %p %s channel:%u",
+			client, client->name, stream, commands[command].name,
+			stream->channel);
+
+	if (client->version < 12)
+		return 0;
+
+	reply = message_alloc(impl, -1, 0);
+	message_put(reply,
+		TAG_U32, command,
+		TAG_U32, -1,
+		TAG_U32, stream->channel,
+		TAG_U32, peer_index,
+		TAG_STRING, peer_name,
+		TAG_BOOLEAN, false,		/* suspended */
+		TAG_INVALID);
+
+	if (client->version >= 13) {
+		if (command == COMMAND_PLAYBACK_STREAM_MOVED) {
+			message_put(reply,
+				TAG_U32, stream->attr.maxlength,
+				TAG_U32, stream->attr.tlength,
+				TAG_U32, stream->attr.prebuf,
+				TAG_U32, stream->attr.minreq,
+				TAG_USEC, stream->lat_usec,
+				TAG_INVALID);
+		} else {
+			message_put(reply,
+				TAG_U32, stream->attr.maxlength,
+				TAG_U32, stream->attr.fragsize,
+				TAG_USEC, stream->lat_usec,
+				TAG_INVALID);
+		}
+	}
+	return client_queue_message(client, reply);
+}
+
+int stream_update_tag_param(struct stream *stream)
+{
+	struct spa_pod_dynamic_builder b;
+	const struct pw_properties *props = pw_stream_get_properties(stream->stream);
+	const struct spa_pod *param[1];
+	struct spa_dict_item items[64];
+	uint32_t i, n_items = 0;
+	uint8_t buffer[4096];
+
+	if (props == NULL)
+		return -EIO;
+
+	spa_pod_dynamic_builder_init(&b, buffer, sizeof(buffer), 4096);
+
+	for (i = 0; i < props->dict.n_items; i++) {
+		if (n_items < SPA_N_ELEMENTS(items) &&
+			spa_strstartswith(props->dict.items[i].key, "media."))
+				items[n_items++] = props->dict.items[i];
+	}
+	if (n_items > 0) {
+		struct spa_pod_frame f;
+		spa_tag_build_start(&b.b, &f, SPA_PARAM_Tag, SPA_DIRECTION_OUTPUT);
+		spa_tag_build_add_dict(&b.b, &SPA_DICT_INIT(items, n_items));
+		param[0] = spa_tag_build_end(&b.b, &f);
+	} else {
+		param[0] = NULL;
+	}
+	if (param[0] != NULL)
+		pw_stream_update_params(stream->stream, param, 1);
+	spa_pod_dynamic_builder_clean(&b);
 	return 0;
 }

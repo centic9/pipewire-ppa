@@ -2795,20 +2795,6 @@ static int path_verify(pa_alsa_path *p) {
     return 0;
 }
 
-static const char *get_default_paths_dir(void) {
-    const char *str;
-#ifdef HAVE_RUNNING_FROM_BUILD_TREE
-    if (pa_run_from_build_tree())
-        return PA_SRCDIR "mixer/paths";
-    else
-#endif
-    if (getenv("ACP_BUILDDIR") != NULL)
-        return "mixer/paths";
-    if ((str = getenv("ACP_PATHS_DIR")) != NULL)
-        return str;
-    return PA_ALSA_PATHS_DIR;
-}
-
 pa_alsa_path* pa_alsa_path_new(const char *paths_dir, const char *fname, pa_alsa_direction_t direction) {
     pa_alsa_path *p;
     char *fn;
@@ -2873,10 +2859,9 @@ pa_alsa_path* pa_alsa_path_new(const char *paths_dir, const char *fname, pa_alsa
     items[2].data = &p->description;
     items[3].data = &mute_during_activation;
 
-    if (!paths_dir)
-        paths_dir = get_default_paths_dir();
+    fn = get_data_path(paths_dir, "paths", fname);
 
-    fn = pa_maybe_prefix_path(fname, paths_dir);
+    pa_log_info("Loading path config: %s", fn);
 
     r = pa_config_parse(fn, NULL, items, p->proplist, false, p);
     pa_xfree(fn);
@@ -4734,35 +4719,29 @@ static int profile_verify(pa_alsa_profile *p) {
                                                        PA_ELEMENTSOF(well_known_descriptions)));
 
     if (!p->description) {
+        pa_strbuf *sb;
         uint32_t idx;
         pa_alsa_mapping *m;
-	char *ptr;
-	size_t size;
-	FILE *f;
-	int count = 0;
 
-	f = open_memstream(&ptr, &size);
-	if (f == NULL) {
-            pa_log("failed to open memstream: %m");
-            return -1;
-	}
+        sb = pa_strbuf_new();
 
         if (p->output_mappings)
             PA_IDXSET_FOREACH(m, p->output_mappings, idx) {
-                if (count++ > 0)
-                    fprintf(f, " + ");
-                fprintf(f, _("%s Output"), m->description);
+                if (!pa_strbuf_isempty(sb))
+                    pa_strbuf_puts(sb, " + ");
+
+                pa_strbuf_printf(sb, _("%s Output"), m->description);
             }
 
         if (p->input_mappings)
             PA_IDXSET_FOREACH(m, p->input_mappings, idx) {
-                if (count++ > 0)
-                    fprintf(f, " + ");
-                fprintf(f, _("%s Input"), m->description);
+                if (!pa_strbuf_isempty(sb))
+                    pa_strbuf_puts(sb, " + ");
+
+                pa_strbuf_printf(sb, _("%s Input"), m->description);
             }
 
-	fclose(f);
-        p->description = ptr;
+        p->description = pa_strbuf_to_string_free(sb);
     }
 
     return 0;
@@ -4814,43 +4793,23 @@ void pa_alsa_decibel_fix_dump(pa_alsa_decibel_fix *db_fix) {
     pa_assert(db_fix);
 
     if (db_fix->db_values) {
+        pa_strbuf *buf;
         unsigned long i, nsteps;
-	FILE *f;
-	char *ptr;
-	size_t size;
-
-	f = open_memstream(&ptr, &size);
-	if (f == NULL)
-		return;
 
         pa_assert(db_fix->min_step <= db_fix->max_step);
         nsteps = db_fix->max_step - db_fix->min_step + 1;
 
+        buf = pa_strbuf_new();
         for (i = 0; i < nsteps; ++i)
-            fprintf(f, "[%li]:%0.2f ", i + db_fix->min_step, db_fix->db_values[i] / 100.0);
+            pa_strbuf_printf(buf, "[%li]:%0.2f ", i + db_fix->min_step, db_fix->db_values[i] / 100.0);
 
-	fclose(f);
-        db_values = ptr;
+        db_values = pa_strbuf_to_string_free(buf);
     }
 
     pa_log_debug("Decibel fix %s, min_step=%li, max_step=%li, db_values=%s",
                  db_fix->name, db_fix->min_step, db_fix->max_step, pa_strnull(db_values));
 
     pa_xfree(db_values);
-}
-
-static const char *get_default_profile_dir(void) {
-    const char *str;
-#ifdef HAVE_RUNNING_FROM_BUILD_TREE
-    if (pa_run_from_build_tree())
-        return PA_SRCDIR "mixer/profile-sets";
-    else
-#endif
-    if (getenv("ACP_BUILDDIR") != NULL)
-        return "mixer/profile-sets";
-    if ((str = getenv("ACP_PROFILES_DIR")) != NULL)
-        return str;
-    return PA_ALSA_PROFILE_SETS_DIR;
 }
 
 pa_alsa_profile_set* pa_alsa_profile_set_new(const char *fname, const pa_channel_map *bonus) {
@@ -4902,13 +4861,14 @@ pa_alsa_profile_set* pa_alsa_profile_set_new(const char *fname, const pa_channel
 
     items[0].data = &ps->auto_profiles;
 
-    fn = pa_maybe_prefix_path(fname ? fname : "default.conf",
-		    get_default_profile_dir());
+    fn = get_data_path(NULL, "profile-sets", fname ? fname : "default.conf");
+
+    pa_log_info("Loading profile set: %s", fn);
+
     if ((r = access(fn, R_OK)) != 0) {
         if (fname != NULL) {
             pa_log_warn("profile-set '%s' can't be accessed: %m", fn);
-            fn = pa_maybe_prefix_path("default.conf",
-			    get_default_profile_dir());
+            fn = get_data_path(NULL, "profile-sets", "default.conf");
             r = access(fn, R_OK);
 	}
 	if (r != 0) {
@@ -4966,8 +4926,7 @@ static void profile_finalize_probing(pa_alsa_profile *to_be_finalized, pa_alsa_p
                 continue;
 
             pa_alsa_init_proplist_pcm(NULL, m->output_proplist, m->output_pcm);
-            snd_pcm_close(m->output_pcm);
-            m->output_pcm = NULL;
+            pa_alsa_close(&m->output_pcm);
         }
 
     if (to_be_finalized->input_mappings)
@@ -4986,8 +4945,7 @@ static void profile_finalize_probing(pa_alsa_profile *to_be_finalized, pa_alsa_p
                 continue;
 
             pa_alsa_init_proplist_pcm(NULL, m->input_proplist, m->input_pcm);
-            snd_pcm_close(m->input_pcm);
-            m->input_pcm = NULL;
+            pa_alsa_close(&m->input_pcm);
         }
 }
 

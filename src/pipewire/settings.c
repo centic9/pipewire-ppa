@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2021 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include "config.h"
 
@@ -41,10 +21,12 @@
 #define NAME "settings"
 
 #define DEFAULT_CLOCK_RATE			48000u
+#define DEFAULT_CLOCK_RATES			"[ 48000 ]"
 #define DEFAULT_CLOCK_QUANTUM			1024u
 #define DEFAULT_CLOCK_MIN_QUANTUM		32u
 #define DEFAULT_CLOCK_MAX_QUANTUM		2048u
 #define DEFAULT_CLOCK_QUANTUM_LIMIT		8192u
+#define DEFAULT_CLOCK_QUANTUM_FLOOR		4u
 #define DEFAULT_CLOCK_POWER_OF_TWO_QUANTUM	true
 #define DEFAULT_VIDEO_WIDTH			640
 #define DEFAULT_VIDEO_HEIGHT			480
@@ -126,15 +108,17 @@ static uint32_t parse_uint32_array(const char *str, uint32_t *vals, uint32_t max
 }
 
 static uint32_t parse_clock_rate(struct pw_properties *properties, const char *name,
-		uint32_t *rates, uint32_t def)
+		uint32_t *rates, const char *def_rates, uint32_t def)
 {
 	const char *str;
 	uint32_t count = 0;
 
 	if ((str = pw_properties_get(properties, name)) == NULL)
-		return 0;
+		str = def_rates;
 
 	count = parse_uint32_array(str, rates, MAX_RATES, def);
+	if (count == 0)
+		count = parse_uint32_array(def_rates, rates, MAX_RATES, def);
 	if (count == 0)
 		goto fallback;
 
@@ -223,11 +207,13 @@ void pw_settings_init(struct pw_context *this)
 	struct settings *d = &this->defaults;
 
 	d->clock_rate = get_default_int(p, "default.clock.rate", DEFAULT_CLOCK_RATE);
-	d->n_clock_rates = parse_clock_rate(p, "default.clock.allowed-rates", d->clock_rates, d->clock_rate);
+	d->n_clock_rates = parse_clock_rate(p, "default.clock.allowed-rates", d->clock_rates,
+			DEFAULT_CLOCK_RATES, d->clock_rate);
 	d->clock_quantum = get_default_int(p, "default.clock.quantum", DEFAULT_CLOCK_QUANTUM);
 	d->clock_min_quantum = get_default_int(p, "default.clock.min-quantum", DEFAULT_CLOCK_MIN_QUANTUM);
 	d->clock_max_quantum = get_default_int(p, "default.clock.max-quantum", DEFAULT_CLOCK_MAX_QUANTUM);
 	d->clock_quantum_limit = get_default_int(p, "default.clock.quantum-limit", DEFAULT_CLOCK_QUANTUM_LIMIT);
+	d->clock_quantum_floor = get_default_int(p, "default.clock.quantum-floor", DEFAULT_CLOCK_QUANTUM_FLOOR);
 	d->video_size.width = get_default_int(p, "default.video.width", DEFAULT_VIDEO_WIDTH);
 	d->video_size.height = get_default_int(p, "default.video.height", DEFAULT_VIDEO_HEIGHT);
 	d->video_rate.num = get_default_int(p, "default.video.rate.num", DEFAULT_VIDEO_RATE_NUM);
@@ -244,11 +230,13 @@ void pw_settings_init(struct pw_context *this)
 	d->check_rate = get_default_bool(p, "settings.check-rate", DEFAULT_CHECK_RATE);
 
 	d->clock_quantum_limit = SPA_CLAMP(d->clock_quantum_limit,
-			CLOCK_MIN_QUANTUM, CLOCK_MAX_QUANTUM);
+			CLOCK_QUANTUM_FLOOR, CLOCK_QUANTUM_LIMIT);
+	d->clock_quantum_floor = SPA_CLAMP(d->clock_quantum_floor,
+			CLOCK_QUANTUM_FLOOR, d->clock_quantum_limit);
 	d->clock_max_quantum = SPA_CLAMP(d->clock_max_quantum,
-			CLOCK_MIN_QUANTUM, d->clock_quantum_limit);
+			d->clock_quantum_floor, d->clock_quantum_limit);
 	d->clock_min_quantum = SPA_CLAMP(d->clock_min_quantum,
-			CLOCK_MIN_QUANTUM, d->clock_max_quantum);
+			d->clock_quantum_floor, d->clock_max_quantum);
 	d->clock_quantum = SPA_CLAMP(d->clock_quantum,
 			d->clock_min_quantum, d->clock_max_quantum);
 }

@@ -2,10 +2,6 @@ pipewire_daemon_sources = [
   'pipewire.c',
 ]
 
-pipewire_c_args = [
-  '-DG_LOG_DOMAIN=g_log_domain_pipewire',
-]
-
 conf_config = configuration_data()
 conf_config.set('VERSION', '"@0@"'.format(pipewire_version))
 conf_config.set('PIPEWIRE_CONFIG_DIR', pipewire_configdir)
@@ -15,6 +11,8 @@ conf_config.set('pipewire_path', pipewire_bindir / 'pipewire')
 conf_config.set('pipewire_pulse_path', pipewire_bindir / 'pipewire-pulse')
 conf_config.set('sm_comment', '#')
 conf_config.set('pulse_comment', '#')
+conf_config.set('rtprio_server', get_option('rtprio-server'))
+conf_config.set('rtprio_client', get_option('rtprio-client'))
 
 conf_config_uninstalled = conf_config
 conf_config_uninstalled.set('pipewire_path',
@@ -26,6 +24,8 @@ conf_config_uninstalled.set('pulse_comment', '')
 build_ms = 'media-session' in get_option('session-managers')
 build_wp = 'wireplumber' in get_option('session-managers')
 default_sm = get_option('session-managers').get(0, '')
+
+build_vk = get_option('vulkan').enabled()
 
 summary({'Build media-session': build_ms,
          'Build wireplumber': build_wp,
@@ -67,10 +67,17 @@ conf_files = [
  'pipewire.conf',
  'client.conf',
  'client-rt.conf',
+ 'filter-chain.conf',
  'jack.conf',
  'minimal.conf',
  'pipewire-pulse.conf',
+ 'pipewire-avb.conf',
+ 'pipewire-aes67.conf',
 ]
+
+if build_vk
+  conf_files += 'pipewire-vulkan.conf'
+endif
 
 foreach c : conf_files
   configure_file(input : '@0@.in'.format(c),
@@ -83,23 +90,51 @@ configure_file(input : 'pipewire.conf.in',
                output : 'pipewire-uninstalled.conf',
                configuration : conf_config_uninstalled)
 
+conf_avail_folders = [
+  'pipewire.conf.avail',
+  'client.conf.avail',
+  'client-rt.conf.avail',
+  'pipewire-pulse.conf.avail',
+]
+
+foreach c : conf_avail_folders
+  subdir(c)
+endforeach
+
 pipewire_exec = executable('pipewire',
   pipewire_daemon_sources,
   install: true,
-  c_args : pipewire_c_args,
-  include_directories : [ configinc ],
-  dependencies : [ spa_dep, pipewire_dep, ],
-)
-
-executable('pipewire-pulse',
-  pipewire_daemon_sources,
-  install: true,
-  c_args : pipewire_c_args,
   include_directories : [ configinc ],
   dependencies : [ spa_dep, pipewire_dep, ],
 )
 
 ln = find_program('ln')
+
+pipewire_aliases = [
+  'pipewire-pulse',
+  'pipewire-avb',
+  'pipewire-aes67',
+]
+
+if build_vk
+ pipewire_aliases += 'pipewire-vulkan'
+endif
+
+foreach alias : pipewire_aliases
+  custom_target(
+    alias,
+    build_by_default: true,
+    install: false,
+    command: [ln, '-sf', meson.project_build_root() + '/@INPUT@', '@OUTPUT@'],
+    input: pipewire_exec,
+    output: alias,
+  )
+  install_symlink(
+    alias,
+    pointing_to: pipewire_exec.name(),
+    install_dir: pipewire_bindir,
+  )
+endforeach
 
 custom_target('pipewire-uninstalled',
   build_by_default: true,

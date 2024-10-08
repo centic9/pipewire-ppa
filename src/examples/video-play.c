@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 /*
  [title]
@@ -34,8 +14,10 @@
 
 #include <spa/utils/result.h>
 #include <spa/param/video/format-utils.h>
+#include <spa/param/tag-utils.h>
 #include <spa/param/props.h>
 #include <spa/debug/format.h>
+#include <spa/debug/pod.h>
 
 #include <pipewire/pipewire.h>
 
@@ -204,6 +186,8 @@ on_process(void *_data)
 		}
 
 		sstride = buf->datas[0].chunk->stride;
+		if (sstride == 0)
+			sstride = buf->datas[0].chunk->size / data->size.height;
 		ostride = SPA_MIN(sstride, dstride);
 
 		src = sdata;
@@ -296,6 +280,10 @@ on_stream_param_changed(void *_data, uint32_t id, const struct spa_pod *param)
 	void *d;
 	int32_t mult, size;
 
+	if (param != NULL && id == SPA_PARAM_Tag) {
+		spa_debug_pod(0, NULL, param);
+		return;
+	}
 	/* NULL means to clear the format */
 	if (param == NULL || id != SPA_PARAM_Format)
 		return;
@@ -334,6 +322,10 @@ on_stream_param_changed(void *_data, uint32_t id, const struct spa_pod *param)
 
 	if (sdl_format == SDL_PIXELFORMAT_UNKNOWN) {
 		pw_stream_set_error(stream, -EINVAL, "unknown pixel format");
+		return;
+	}
+	if (data->size.width == 0 || data->size.height == 0) {
+		pw_stream_set_error(stream, -EINVAL, "invalid size");
 		return;
 	}
 
@@ -436,9 +428,10 @@ static void do_quit(void *userdata, int signal_number)
 int main(int argc, char *argv[])
 {
 	struct data data = { 0, };
-	const struct spa_pod *params[2];
+	const struct spa_pod *params[3];
 	uint8_t buffer[1024];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+	struct pw_properties *props;
 	int res, n_params;
 
 	pw_init(&argc, &argv);
@@ -460,18 +453,20 @@ int main(int argc, char *argv[])
 	 * you need to listen to is the process event where you need to consume
 	 * the data provided to you.
 	 */
+	props = pw_properties_new(PW_KEY_MEDIA_TYPE, "Video",
+			PW_KEY_MEDIA_CATEGORY, "Capture",
+			PW_KEY_MEDIA_ROLE, "Camera",
+			NULL),
+	data.path = argc > 1 ? argv[1] : NULL;
+	if (data.path)
+		pw_properties_set(props, PW_KEY_TARGET_OBJECT, data.path);
+
 	data.stream = pw_stream_new_simple(
 			pw_main_loop_get_loop(data.loop),
 			"video-play",
-			pw_properties_new(
-				PW_KEY_MEDIA_TYPE, "Video",
-				PW_KEY_MEDIA_CATEGORY, "Capture",
-				PW_KEY_MEDIA_ROLE, "Camera",
-				NULL),
+			props,
 			&stream_events,
 			&data);
-
-	data.path = argc > 1 ? argv[1] : NULL;
 
 	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
 		fprintf(stderr, "can't initialize SDL: %s\n", SDL_GetError());
@@ -489,12 +484,22 @@ int main(int argc, char *argv[])
 	 * object to the stack. */
 	n_params = build_format(&data, &b, params);
 
+	{
+		struct spa_pod_frame f;
+		struct spa_dict_item items[1];
+		/* send a tag, input tags travel upstream */
+		spa_tag_build_start(&b, &f, SPA_PARAM_Tag, SPA_DIRECTION_INPUT);
+		items[0] = SPA_DICT_ITEM_INIT("my-tag-other-key", "my-special-other-tag-value");
+		spa_tag_build_add_dict(&b, &SPA_DICT_INIT(items, 1));
+		params[n_params++] = spa_tag_build_end(&b, &f);
+	}
+
 	/* now connect the stream, we need a direction (input/output),
 	 * an optional target node to connect to, some flags and parameters
 	 */
 	if ((res = pw_stream_connect(data.stream,
 			  PW_DIRECTION_INPUT,
-			  data.path ? (uint32_t)atoi(data.path) : PW_ID_ANY,
+			  PW_ID_ANY,
 			  PW_STREAM_FLAG_AUTOCONNECT |	/* try to automatically connect this stream */
 			  PW_STREAM_FLAG_INACTIVE |	/* we will activate ourselves */
 			  PW_STREAM_FLAG_MAP_BUFFERS,	/* mmap the buffer data for us */

@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2021 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <dlfcn.h>
 #include <math.h>
@@ -35,11 +15,27 @@
 #include <pipewire/array.h>
 
 #include <lilv/lilv.h>
-#include <lv2/lv2plug.in/ns/ext/atom/atom.h>
-#include <lv2/lv2plug.in/ns/ext/buf-size/buf-size.h>
-#include "lv2/lv2plug.in/ns/ext/worker/worker.h"
-#include "lv2/lv2plug.in/ns/ext/options/options.h"
-#include "lv2/lv2plug.in/ns/ext/parameters/parameters.h"
+
+#if defined __has_include
+#	if __has_include (<lv2/atom/atom.h>)
+
+		#include <lv2/atom/atom.h>
+		#include <lv2/buf-size/buf-size.h>
+		#include <lv2/worker/worker.h>
+		#include <lv2/options/options.h>
+		#include <lv2/parameters/parameters.h>
+
+#	else
+
+		#include <lv2/lv2plug.in/ns/ext/atom/atom.h>
+		#include <lv2/lv2plug.in/ns/ext/buf-size/buf-size.h>
+		#include <lv2/lv2plug.in/ns/ext/worker/worker.h>
+		#include <lv2/lv2plug.in/ns/ext/options/options.h>
+		#include <lv2/lv2plug.in/ns/ext/parameters/parameters.h>
+
+#	endif
+
+#endif
 
 #include "plugin.h"
 
@@ -241,6 +237,7 @@ struct instance {
 	const LV2_Worker_Interface *work_iface;
 
 	int32_t block_length;
+	LV2_Atom empty_atom;
 };
 
 static int
@@ -282,17 +279,17 @@ work_schedule(LV2_Worker_Schedule_Handle handle, uint32_t size, const void *data
 }
 
 static void *lv2_instantiate(const struct fc_descriptor *desc,
-                        unsigned long *SampleRate, int index, const char *config)
+                        unsigned long SampleRate, int index, const char *config)
 {
 	struct descriptor *d = (struct descriptor*)desc;
 	struct plugin *p = d->p;
 	struct context *c = p->c;
 	struct instance *i;
-	uint32_t n_features = 0;
+	uint32_t n, n_features = 0;
 	static const int32_t min_block_length = 1;
 	static const int32_t max_block_length = 8192;
 	static const int32_t seq_size = 32768;
-	float fsample_rate = *SampleRate;
+	float fsample_rate = SampleRate;
 
 	i = calloc(1, sizeof(*i));
 	if (i == NULL)
@@ -334,7 +331,7 @@ static void *lv2_instantiate(const struct fc_descriptor *desc,
         i->options_feature.data = i->options;
         i->features[n_features++] = &i->options_feature;
 
-	i->instance = lilv_plugin_instantiate(p->p, *SampleRate, i->features);
+	i->instance = lilv_plugin_instantiate(p->p, SampleRate, i->features);
 	if (i->instance == NULL) {
 		free(i);
 		return NULL;
@@ -343,6 +340,12 @@ static void *lv2_instantiate(const struct fc_descriptor *desc,
                 i->work_iface = (const LV2_Worker_Interface*)
 			lilv_instance_get_extension_data(i->instance, LV2_WORKER__interface);
         }
+	for (n = 0; n < desc->n_ports; n++) {
+		const LilvPort *port = lilv_plugin_get_port_by_index(p->p, n);
+		if (lilv_port_is_a(p->p, port, c->atom_AtomPort)) {
+			lilv_instance_connect_port(i->instance, n, &i->empty_atom);
+		}
+	}
 
 	return i;
 }
@@ -380,7 +383,7 @@ static void lv2_run(void *instance, unsigned long SampleCount)
 		i->work_iface->end_run(i->instance);
 }
 
-static void lv2_free(struct fc_descriptor *desc)
+static void lv2_free(const struct fc_descriptor *desc)
 {
 	struct descriptor *d = (struct descriptor*)desc;
 	free((char*)d->desc.name);
@@ -455,8 +458,9 @@ static void lv2_unload(struct fc_plugin *plugin)
 	free(p);
 }
 
-struct fc_plugin *load_lv2_plugin(const struct spa_support *support, uint32_t n_support,
-		const char *plugin_uri, const char *config)
+SPA_EXPORT
+struct fc_plugin *pipewire__filter_chain_plugin_load(const struct spa_support *support, uint32_t n_support,
+		struct dsp_ops *ops, const char *plugin_uri, const char *config)
 {
 	struct context *c;
 	const LilvPlugins *plugins;

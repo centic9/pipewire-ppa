@@ -1,26 +1,6 @@
-/* Device/adapter/kernel quirk table
- *
- * Copyright © 2021 Pauli Virtanen
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Device/adapter/kernel quirk table */
+/* SPDX-FileCopyrightText: Copyright © 2021 Pauli Virtanen */
+/* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
 #include <stddef.h>
@@ -48,6 +28,7 @@
 #include <spa/support/plugin.h>
 #include <spa/monitor/device.h>
 #include <spa/monitor/utils.h>
+#include <spa/utils/cleanup.h>
 #include <spa/utils/hook.h>
 #include <spa/utils/type.h>
 #include <spa/utils/keys.h>
@@ -56,7 +37,6 @@
 #include <spa/utils/json.h>
 #include <spa/utils/string.h>
 
-#include "a2dp-codecs.h"
 #include "defs.h"
 
 static struct spa_log_topic log_topic = SPA_LOG_TOPIC(0, "spa.bluez5.quirks");
@@ -89,10 +69,9 @@ static enum spa_bt_feature parse_feature(const char *str)
 		{ "faststream", SPA_BT_FEATURE_FASTSTREAM },
 		{ "a2dp-duplex", SPA_BT_FEATURE_A2DP_DUPLEX },
 	};
-	size_t i;
-	for (i = 0; i < SPA_N_ELEMENTS(feature_keys); ++i) {
-		if (spa_streq(str, feature_keys[i].key))
-			return feature_keys[i].value;
+	SPA_FOR_EACH_ELEMENT_VAR(feature_keys, f) {
+		if (spa_streq(str, f->key))
+			return f->value;
 	}
 	return 0;
 }
@@ -209,27 +188,21 @@ static int load_conf(struct spa_bt_quirks *this, const char *path)
 {
 	char *data;
 	struct stat sbuf;
-	int fd = -1;
+	spa_autoclose int fd = -1;
 
 	spa_log_debug(this->log, "loading %s", path);
 
 	if ((fd = open(path, O_CLOEXEC | O_RDONLY)) < 0)
-		goto fail;
+		return -errno;
 	if (fstat(fd, &sbuf) < 0)
-		goto fail;
+		return -errno;
 	if ((data = mmap(NULL, sbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
-		goto fail;
-	close(fd);
+		return -errno;
 
 	load_quirks(this, data, sbuf.st_size);
 	munmap(data, sbuf.st_size);
 
 	return 0;
-
-fail:
-	if (fd >= 0)
-		close(fd);
-	return -errno;
 }
 
 struct spa_bt_quirks *spa_bt_quirks_create(const struct spa_dict *info, struct spa_log *log)
@@ -262,14 +235,16 @@ struct spa_bt_quirks *spa_bt_quirks_create(const struct spa_dict *info, struct s
 	} else {
 		char path[PATH_MAX];
 		const char *dir = getenv("SPA_DATA_DIR");
+		int res;
 
 		if (dir == NULL)
 			dir = SPADATADIR;
 
 		if (spa_scnprintf(path, sizeof(path), "%s/bluez5/bluez-hardware.conf", dir) >= 0)
-			load_conf(this, path);
+			if ((res = load_conf(this, path)) < 0)
+				spa_log_warn(this->log, "failed to load '%s': %s", path,
+						spa_strerror(res));
 	}
-
 	if (!(this->kernel_rules && this->adapter_rules && this->device_rules))
 		spa_log_warn(this->log, "failed to load bluez-hardware.conf");
 

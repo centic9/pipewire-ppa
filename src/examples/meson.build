@@ -3,6 +3,7 @@ examples = [
   'audio-src',
   'audio-dsp-src',
   'audio-dsp-filter',
+  'audio-capture',
   'video-play',
   'video-src',
   'video-dsp-play',
@@ -12,6 +13,7 @@ examples = [
   'video-src-reneg',
   'video-src-fixate',
   'video-play-fixate',
+  'internal',
   'export-sink',
   'export-source',
   'export-spa',
@@ -19,6 +21,10 @@ examples = [
   'bluez-session',
   'local-v4l2',
 ]
+
+if not get_option('examples').allowed()
+  subdir_done()
+endif
 
 examples_extra_deps = {
   'video-src-fixate': [drm_dep],

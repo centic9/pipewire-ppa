@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #ifndef PIPEWIRE_LOG_H
 #define PIPEWIRE_LOG_H
@@ -91,17 +71,6 @@ pw_log_logv(enum spa_log_level level,
 	    const char *file,
 	    int line, const char *func,
 	    const char *fmt, va_list args) SPA_PRINTF_FUNC(5, 0);
-
-/** Initialize the log topic. The returned topic is owned by the pipewire
- * context and the topic must not be modified or freed.
- * Do not use this function directly, use one of PW_LOG_TOPIC_* instead.
- *
- * \see PW_LOG_TOPIC_STATIC
- * \see PW_LOG_TOPIC_EXTERN
- * \see PW_LOG_TOPIC
- */
-void
-_pw_log_topic_new(struct spa_log_topic *topic);
 
 /**
  * Declare a static log topic named \a var. The usual usage is:

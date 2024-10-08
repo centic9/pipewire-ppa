@@ -14,5 +14,5 @@ spa_sections = [
 
 spa_headers = 'spa'  # used by doxygen
 install_subdir('spa',
-  install_dir : get_option('includedir') / spa_name
+  install_dir : get_option('includedir') / spa_name,
 )

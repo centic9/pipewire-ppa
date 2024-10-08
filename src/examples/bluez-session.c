@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2019 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 /*
  [title]
@@ -78,8 +58,6 @@ struct object {
 };
 
 struct impl {
-	struct timespec now;
-
 	struct pw_main_loop *loop;
 	struct pw_context *context;
 
@@ -91,6 +69,7 @@ struct impl {
 	struct spa_hook listener;
 
 	struct spa_list device_list;
+	struct pw_properties *props;
 };
 
 static struct node *find_node(struct object *obj, uint32_t id)
@@ -286,7 +265,7 @@ static void remove_object(struct impl *impl, struct object *obj)
 	spa_list_remove(&obj->link);
 	spa_hook_remove(&obj->listener);
 	pw_proxy_destroy(obj->proxy);
-	free(obj->handle);
+	pw_unload_spa_handle(obj->handle);
 	free(obj);
 }
 
@@ -322,7 +301,7 @@ static int start_monitor(struct impl *impl)
 	int res;
 	void *iface;
 
-	handle = pw_context_load_spa_handle(impl->context, SPA_NAME_API_BLUEZ5_ENUM_DBUS, NULL);
+	handle = pw_context_load_spa_handle(impl->context, SPA_NAME_API_BLUEZ5_ENUM_DBUS, &impl->props->dict);
 	if (handle == NULL) {
 		res = -errno;
 		goto out;
@@ -372,13 +351,15 @@ int main(int argc, char *argv[])
 	impl.loop = pw_main_loop_new(NULL);
 	impl.context = pw_context_new(pw_main_loop_get_loop(impl.loop), NULL, 0);
 
-	clock_gettime(CLOCK_MONOTONIC, &impl.now);
-
 	spa_list_init(&impl.device_list);
 
         impl.core = pw_context_connect(impl.context, NULL, 0);
 	if (impl.core == NULL) {
 		pw_log_error(NAME" %p: can't connect %m", &impl);
+		return -1;
+	}
+
+	if ((impl.props = pw_properties_new(NULL, NULL)) == NULL) {
 		return -1;
 	}
 

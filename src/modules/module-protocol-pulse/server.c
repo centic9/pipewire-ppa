@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include "config.h"
 
@@ -48,6 +28,7 @@
 #include <spa/utils/defs.h>
 #include <spa/utils/json.h>
 #include <spa/utils/result.h>
+#include <pipewire/cleanup.h>
 #include <pipewire/pipewire.h>
 
 #include "client.h"
@@ -60,13 +41,13 @@
 #include "server.h"
 #include "stream.h"
 #include "utils.h"
+#include "flatpak-utils.h"
 
 #define LISTEN_BACKLOG 32
 #define MAX_CLIENTS 64
 
 static int handle_packet(struct client *client, struct message *msg)
 {
-	struct impl * const impl = client->impl;
 	uint32_t command, tag;
 	int res = 0;
 
@@ -110,7 +91,7 @@ static int handle_packet(struct client *client, struct message *msg)
 	res = cmd->run(client, command, tag, msg);
 
 finish:
-	message_free(impl, msg, false, false);
+	message_free(msg, false, false);
 	if (res < 0)
 		reply_error(client, command, tag, res);
 
@@ -119,7 +100,6 @@ finish:
 
 static int handle_memblock(struct client *client, struct message *msg)
 {
-	struct impl * const impl = client->impl;
 	struct stream *stream;
 	uint32_t channel, flags, index;
 	int64_t offset, diff;
@@ -167,6 +147,8 @@ static int handle_memblock(struct client *client, struct message *msg)
 	index += diff;
 	filled += diff;
 	stream->write_index += diff;
+	if ((flags & FLAG_SEEKMASK) == SEEK_RELATIVE)
+		stream->requested -= diff;
 
 	if (filled < 0) {
 		/* underrun, reported on reader side */
@@ -183,14 +165,18 @@ static int handle_memblock(struct client *client, struct message *msg)
 			msg->data,
 			SPA_MIN(msg->length, MAXLENGTH));
 	index += msg->length;
-	stream->write_index += msg->length;
 	spa_ringbuffer_write_update(&stream->ring, index);
-	stream->requested -= SPA_MIN(msg->length, stream->requested);
+
+	stream->write_index += msg->length;
+	stream->requested -= msg->length;
 
 	stream_send_request(stream);
 
+	if (stream->is_paused && !stream->corked)
+		stream_set_paused(stream, false, "new data");
+
 finish:
-	message_free(impl, msg, false, false);
+	message_free(msg, false, false);
 	return res;
 }
 
@@ -264,7 +250,7 @@ static int do_read(struct client *client)
 		}
 
 		if (client->message)
-			message_free(impl, client->message, false, false);
+			message_free(client->message, false, false);
 
 		client->message = message_alloc(impl, channel, length);
 	} else if (client->message &&
@@ -402,6 +388,7 @@ on_connect(void *data, int fd, uint32_t mask)
 
 	client->props = pw_properties_new(
 			PW_KEY_CLIENT_API, "pipewire-pulse",
+			"config.ext", pw_properties_get(impl->props, "config.ext"),
 			NULL);
 	if (client->props == NULL)
 		goto error;
@@ -418,14 +405,45 @@ on_connect(void *data, int fd, uint32_t mask)
 		client_access = server->client_access;
 
 	if (server->addr.ss_family == AF_UNIX) {
+		spa_autofree char *app_id = NULL, *devices = NULL;
+
 #ifdef SO_PRIORITY
 		val = 6;
 		if (setsockopt(client_fd, SOL_SOCKET, SO_PRIORITY, &val, sizeof(val)) < 0)
 			pw_log_warn("setsockopt(SO_PRIORITY) failed: %m");
 #endif
 		pid = get_client_pid(client, client_fd);
-		if (pid != 0 && check_flatpak(client, pid) == 1)
+		if (pid != 0 && pw_check_flatpak(pid, &app_id, &devices) == 1) {
+			/*
+			 * XXX: we should really use Portal client access here
+			 *
+			 * However, session managers currently support only camera
+			 * permissions, and the XDG Portal doesn't have a "Sound Manager"
+			 * permission defined. So for now, use access=flatpak, and determine
+			 * extra permissions here.
+			 *
+			 * The application has access to the Pulseaudio socket,
+			 * and with real PA it would always then have full sound access.
+			 * We'll restrict the full access here behind devices=all;
+			 * if the application can access all devices it can then
+			 * also sound and camera devices directly, so granting also the
+			 * Manager permissions here is reasonable.
+			 *
+			 * The "Manager" permission in any case is also currently not safe
+			 * as the session manager does not check any permission store
+			 * for it.
+			 */
 			client_access = "flatpak";
+			pw_properties_set(client->props, "pipewire.access.portal.app_id",
+					app_id);
+
+			if (devices && (spa_streq(devices, "all") ||
+							spa_strstartswith(devices, "all;") ||
+							strstr(devices, ";all;")))
+				pw_properties_set(client->props, PW_KEY_MEDIA_CATEGORY, "Manager");
+			else
+				pw_properties_set(client->props, PW_KEY_MEDIA_CATEGORY, NULL);
+		}
 	}
 	else if (server->addr.ss_family == AF_INET || server->addr.ss_family == AF_INET6) {
 
@@ -459,7 +477,7 @@ static int parse_unix_address(const char *address, struct sockaddr_storage *addr
 	if (address[0] != '/') {
 		char runtime_dir[PATH_MAX];
 
-		if ((res = get_runtime_dir(runtime_dir, sizeof(runtime_dir), "pulse")) < 0)
+		if ((res = get_runtime_dir(runtime_dir, sizeof(runtime_dir))) < 0)
 			return res;
 
 		res = snprintf(addr.sun_path, sizeof(addr.sun_path),
@@ -580,13 +598,16 @@ static int start_unix_server(struct server *server, const struct sockaddr_storag
 			pw_log_warn("server %p: unlink('%s') failed: %m",
 				    server, addr_un->sun_path);
 	}
-
 	if (bind(fd, (const struct sockaddr *) addr_un, SUN_LEN(addr_un)) < 0) {
 		res = -errno;
 		pw_log_warn("server %p: bind() to '%s' failed: %m",
 			    server, addr_un->sun_path);
 		goto error_close;
 	}
+
+	if (chmod(addr_un->sun_path, 0777) < 0)
+		pw_log_warn("server %p: chmod('%s') failed: %m",
+				    server, addr_un->sun_path);
 
 	if (listen(fd, server->listen_backlog) < 0) {
 		res = -errno;
@@ -781,13 +802,14 @@ static int parse_ip_address(const char *address, struct sockaddr_storage *addrs,
 	if (len < 2)
 		return -ENOSPC;
 
-	snprintf(ip, sizeof(ip), "[::]:%d", res);
-	spa_assert_se(parse_ipv6_address(ip, (struct sockaddr_in6 *) &addr) == 0);
-	addrs[0] = addr;
-
 	snprintf(ip, sizeof(ip), "0.0.0.0:%d", res);
 	spa_assert_se(parse_ipv4_address(ip, (struct sockaddr_in *) &addr) == 0);
+	addrs[0] = addr;
+
+	snprintf(ip, sizeof(ip), "[::]:%d", res);
+	spa_assert_se(parse_ipv6_address(ip, (struct sockaddr_in6 *) &addr) == 0);
 	addrs[1] = addr;
+
 	return 2;
 }
 
@@ -860,7 +882,7 @@ static struct server *server_new(struct impl *impl)
 
 static int server_start(struct server *server, const struct sockaddr_storage *addr)
 {
-	const struct impl * const impl = server->impl;
+	struct impl * const impl = server->impl;
 	int res = 0, fd;
 
 	switch (addr->ss_family) {
@@ -885,6 +907,8 @@ static int server_start(struct server *server, const struct sockaddr_storage *ad
 		res = -errno;
 		pw_log_error("server %p: can't create server source: %m", impl);
 	}
+	if (res >= 0)
+		spa_hook_list_call(&impl->hooks, struct impl_events, server_started, 0, server);
 
 	return res;
 }
@@ -1029,6 +1053,8 @@ void server_free(struct server *server)
 		spa_assert_se(client_detach(c));
 		client_unref(c);
 	}
+
+	spa_hook_list_call(&impl->hooks, struct impl_events, server_stopped, 0, server);
 
 	if (server->source)
 		pw_loop_destroy_source(impl->loop, server->source);

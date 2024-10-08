@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2019 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #ifndef PIPEWIRE_EXT_METADATA_H
 #define PIPEWIRE_EXT_METADATA_H
@@ -41,6 +21,8 @@ extern "C" {
  */
 #define PW_TYPE_INTERFACE_Metadata		PW_TYPE_INFO_INTERFACE_BASE "Metadata"
 
+#define PW_METADATA_PERM_MASK			PW_PERM_RWX
+
 #define PW_VERSION_METADATA			3
 struct pw_metadata;
 
@@ -49,12 +31,13 @@ struct pw_metadata;
 #define PW_METADATA_EVENT_PROPERTY		0
 #define PW_METADATA_EVENT_NUM			1
 
+
 /** \ref pw_metadata events */
 struct pw_metadata_events {
 #define PW_VERSION_METADATA_EVENTS		0
 	uint32_t version;
 
-	int (*property) (void *object,
+	int (*property) (void *data,
 			uint32_t subject,
 			const char *key,
 			const char *type,
@@ -76,12 +59,33 @@ struct pw_metadata_methods {
 			const struct pw_metadata_events *events,
 			void *data);
 
+	/**
+	 * Set a metadata property
+	 *
+	 * Automatically emit property events for the subject and key
+	 * when they are changed.
+	 *
+	 * \param subject the id of the global to associate the metadata
+	 *                with.
+	 * \param key the key of the metadata, NULL clears all metadata for
+	 *                the subject.
+	 * \param type the type of the metadata, this can be blank
+	 * \param value the metadata value. NULL clears the metadata.
+	 *
+	 * This requires X and W permissions on the metadata. It also
+	 * requires M permissions on the subject global.
+	 */
 	int (*set_property) (void *object,
 			uint32_t subject,
 			const char *key,
 			const char *type,
 			const char *value);
 
+	/**
+	 * Clear all metadata
+	 *
+	 * This requires X and W permissions on the metadata.
+	 */
 	int (*clear) (void *object);
 };
 
@@ -100,6 +104,7 @@ struct pw_metadata_methods {
 #define pw_metadata_clear(c)			pw_metadata_method(c,clear,0)
 
 #define PW_KEY_METADATA_NAME		"metadata.name"
+#define PW_KEY_METADATA_VALUES		"metadata.values"
 
 /**
  * \}

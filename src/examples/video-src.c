@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 /*
  [title]
@@ -34,6 +14,8 @@
 #include <math.h>
 
 #include <spa/param/video/format-utils.h>
+#include <spa/param/tag-utils.h>
+#include <spa/debug/pod.h>
 
 #include <pipewire/pipewire.h>
 
@@ -108,9 +90,7 @@ static void on_process(void *userdata)
 
 	if ((h = spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(*h)))) {
 #if 0
-		struct timespec now;
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		h->pts = SPA_TIMESPEC_TO_NSEC(&now);
+		h->pts = pw_stream_get_nsec(data->stream);
 #else
 		h->pts = -1;
 #endif
@@ -232,6 +212,10 @@ on_stream_param_changed(void *_data, uint32_t id, const struct spa_pod *param)
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(params_buffer, sizeof(params_buffer));
 	const struct spa_pod *params[5];
 
+	if (param != NULL && id == SPA_PARAM_Tag) {
+		spa_debug_pod(0, NULL, param);
+		return;
+	}
 	if (param == NULL || id != SPA_PARAM_Format)
 		return;
 
@@ -296,7 +280,7 @@ static void do_quit(void *userdata, int signal_number)
 int main(int argc, char *argv[])
 {
 	struct data data = { 0, };
-	const struct spa_pod *params[1];
+	const struct spa_pod *params[2];
 	uint8_t buffer[1024];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
 
@@ -334,6 +318,16 @@ int main(int argc, char *argv[])
 						&SPA_RECTANGLE(4096, 4096)),
 		SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&SPA_FRACTION(25, 1)));
 
+	{
+		struct spa_pod_frame f;
+		struct spa_dict_item items[1];
+		/* send a tag, output tags travel downstream */
+		spa_tag_build_start(&b, &f, SPA_PARAM_Tag, SPA_DIRECTION_OUTPUT);
+		items[0] = SPA_DICT_ITEM_INIT("my-tag-key", "my-special-tag-value");
+		spa_tag_build_add_dict(&b, &SPA_DICT_INIT(items, 1));
+		params[1] = spa_tag_build_end(&b, &f);
+	}
+
 	pw_stream_add_listener(data.stream,
 			       &data.stream_listener,
 			       &stream_events,
@@ -344,7 +338,7 @@ int main(int argc, char *argv[])
 			  PW_ID_ANY,
 			  PW_STREAM_FLAG_DRIVER |
 			  PW_STREAM_FLAG_MAP_BUFFERS,
-			  params, 1);
+			  params, 2);
 
 	pw_main_loop_run(data.loop);
 

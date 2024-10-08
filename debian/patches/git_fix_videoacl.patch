@@ -1,0 +1,191 @@
+Description: Fix Pipewire missing V4L2 sources.
+ spa: v4l2: Use systemd-logind to listen for access changes
+ ,
+ There is a race between logind applying ACLs to allow the active session
+ of a locally present user access to devices with a udev uaccess tag
+ (like /dev/video# nodes) getting applied vs wireplumber/pipewire starting.
+ .
+ Wireplumber/pipewire are part of the (user) default.target, which gets
+ started as soon as a user logs in and systemd --user is started for that
+ user, where as logind only starts applying the ACLs after the gnome-shell
+ associated logind session has been created.
+ .
+ This race may cause pipewire to not see v4l2 video sources at login,
+ this can be reproduced with these steps:
+ .
+ 1. sudo setfacl --remove-all /dev/video*
+ 2. systemctl --user restart pipewire
+ 3. Now wp-ctl status will not show any video devices
+    (like if pipewire was started before the udev uaccess ACLs got applied)
+ 4. Do a switch to another (test) user without logging out, e.g. in GNOME
+    go to the top right system menu press the power on/off icon and select
+    "Switch User..."
+ 5. Switch back to your normal user. Run getfacl /dev/video0 this will show
+    your user has access now.
+ 6. wp-ctl status should show the camera now, but it does not.
+ .
+ Fix pipewire not seeing v4l2 sources in this case by making v4l2-udev
+ monitor systemd-logind session changes and redoing the access() checks
+ on /dev/video# nodes when the session changes.
+Author: Hans de Goede <hdegoede@redhat.com>
+Adjuster: Nathan Pratta Teodosio <nathan.teodosio@canonical.com>
+Bug-Ubuntu: https://launchpad.net/bugs/2061687
+Origin: https://gitlab.freedesktop.org/pipewire/pipewire/-/merge_requests/2118.diff
+
+--- pipewire-1.0.5.orig/spa/plugins/v4l2/meson.build
++++ pipewire-1.0.5/spa/plugins/v4l2/meson.build
+@@ -2,9 +2,14 @@ v4l2_sources = ['v4l2.c',
+                 'v4l2-device.c',
+                 'v4l2-udev.c',
+                 'v4l2-source.c']
++v4l2_dependencies = [ spa_dep, libinotify_dep, libudev_dep ]
++if systemd_dep.found()
++  v4l2_dependencies += [ systemd_dep ]
++endif
+ 
+ v4l2lib = shared_library('spa-v4l2',
+                           v4l2_sources,
++                          include_directories : [ configinc ],
+-                          dependencies : [ spa_dep, libudev_dep, libinotify_dep ],
++                          dependencies : v4l2_dependencies,
+                           install : true,
+                           install_dir : spa_plugindir / 'v4l2')
+--- pipewire-1.0.5.orig/spa/plugins/v4l2/v4l2-udev.c
++++ pipewire-1.0.5/spa/plugins/v4l2/v4l2-udev.c
+@@ -23,6 +23,9 @@
+ #include <spa/support/plugin.h>
+ #include <spa/monitor/device.h>
+ #include <spa/monitor/utils.h>
++#ifdef HAVE_SYSTEMD
++#include <systemd/sd-login.h>
++#endif
+ 
+ #define NAME "v4l2-udev"
+ 
+@@ -61,6 +64,10 @@ struct impl {
+ 
+ 	struct spa_source source;
+ 	struct spa_source notify;
++#ifdef HAVE_SYSTEMD
++	struct spa_source logind;
++	sd_login_monitor *logind_monitor;
++#endif
+ };
+ 
+ static int impl_udev_open(struct impl *this)
+@@ -468,6 +475,12 @@ static int start_inotify(struct impl *th
+ {
+ 	int notify_fd;
+ 
++#ifdef HAVE_SYSTEMD
++	/* Do not use inotify when using logind session monitoring */
++	if (this->logind_monitor)
++		return 0;
++#endif
++
+ 	if (this->notify.fd != -1)
+ 		return 0;
+ 
+@@ -488,6 +501,65 @@ static int start_inotify(struct impl *th
+ 	return 0;
+ }
+ 
++#ifdef HAVE_SYSTEMD
++static void impl_on_logind_events(struct spa_source *source)
++{
++	struct impl *this = source->data;
++
++	/* Recheck access on all v4l2 devices on logind session changes */
++	for (size_t i = 0; i < this->n_devices; i++)
++		process_device(this, ACTION_CHANGE, &this->devices[i]);
++
++	sd_login_monitor_flush(this->logind_monitor);
++}
++
++static int start_logind(struct impl *this)
++{
++	int res;
++
++	if (this->logind_monitor)
++		return 0;
++
++	/* If we are not actually running logind become a NOP */
++	if (access("/run/systemd/seats/", F_OK) < 0)
++		return 0;
++
++	res = sd_login_monitor_new("session", &this->logind_monitor);
++	if (res < 0)
++		return res;
++
++	spa_log_info(this->log, "start logind monitoring");
++
++	this->logind.func = impl_on_logind_events;
++	this->logind.data = this;
++	this->logind.fd = sd_login_monitor_get_fd(this->logind_monitor);
++	this->logind.mask = SPA_IO_IN | SPA_IO_ERR;
++
++	spa_loop_add_source(this->main_loop, &this->logind);
++
++	return 0;
++}
++
++static void stop_logind(struct impl *this)
++{
++	if (this->logind_monitor) {
++		spa_loop_remove_source(this->main_loop, &this->logind);
++		sd_login_monitor_unref(this->logind_monitor);
++		this->logind_monitor = NULL;
++	}
++}
++#else
++/* Stubs to avoid more ifdefs below */
++static int start_logind(struct impl *this)
++{
++	return 0;
++}
++
++static void stop_logind(struct impl *this)
++{
++}
++#endif
++
+ static void impl_on_fd_events(struct spa_source *source)
+ {
+ 	struct impl *this = source->data;
+@@ -503,8 +575,6 @@ static void impl_on_fd_events(struct spa
+ 
+ 	spa_log_debug(this->log, "action %s", action);
+ 
+-	start_inotify(this);
+-
+ 	if (spa_streq(action, "add") ||
+ 	    spa_streq(action, "change")) {
+ 		process_device(this, ACTION_ADD, dev);
+@@ -537,6 +607,9 @@ static int start_monitor(struct impl *th
+ 	spa_log_debug(this->log, "monitor %p", this->umonitor);
+ 	spa_loop_add_source(this->main_loop, &this->source);
+ 
++	if ((res = start_logind(this)) < 0)
++		return res;
++
+ 	if ((res = start_inotify(this)) < 0)
+ 		return res;
+ 
+@@ -555,6 +628,7 @@ static int stop_monitor(struct impl *thi
+ 	this->umonitor = NULL;
+ 
+ 	stop_inotify(this);
++	stop_logind(this);
+ 
+ 	return 0;
+ }
+@@ -701,6 +775,9 @@ impl_init(const struct spa_handle_factor
+ 
+ 	this = (struct impl *) handle;
+ 	this->notify.fd = -1;
++#ifdef HAVE_SYSTEMD
++	this->logind_monitor = NULL;
++#endif
+ 
+ 	this->log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log);
+ 	this->main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop);

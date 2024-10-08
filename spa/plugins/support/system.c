@@ -1,26 +1,6 @@
-/* Spa
- *
- * Copyright © 2019 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Spa */
+/* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <unistd.h>
 #include <errno.h>
@@ -210,7 +190,7 @@ static int impl_timerfd_read(void *object, int fd, uint64_t *expirations)
 static int impl_eventfd_create(void *object, int flags)
 {
 	struct impl *impl = object;
-	int fl = 0, res;
+	int fl = 0, res, err;
 	if (flags & SPA_FD_CLOEXEC)
 		fl |= EFD_CLOEXEC;
 	if (flags & SPA_FD_NONBLOCK)
@@ -218,8 +198,9 @@ static int impl_eventfd_create(void *object, int flags)
 	if (flags & SPA_FD_EVENT_SEMAPHORE)
 		fl |= EFD_SEMAPHORE;
 	res = eventfd(0, fl);
+	err = -errno; /* save errno in case it is overwritten before return */
 	spa_log_debug(impl->log, "%p: new fd:%d", impl, res);
-	return res < 0 ? -errno : res;
+	return res < 0 ? err : res;
 }
 
 static int impl_eventfd_write(void *object, int fd, uint64_t count)

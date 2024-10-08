@@ -1,6 +1,7 @@
 From: Simon McVittie <smcv@debian.org>
 Date: Sun, 17 Jan 2021 11:40:01 +0000
 Subject: Don't automatically start pipewire for root logins
+Forwarded: not-needed
 
 Closes: #979791
 ---
@@ -22,7 +23,7 @@ Closes: #979791
 +++ b/src/daemon/systemd/user/pipewire.socket
 @@ -1,5 +1,6 @@
  [Unit]
- Description=PipeWire Multimedia System Socket
+ Description=PipeWire Multimedia System Sockets
 +ConditionUser=!root
  
  [Socket]

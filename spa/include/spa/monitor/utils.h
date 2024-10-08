@@ -1,26 +1,6 @@
-/* Simple Plugin API
- *
- * Copyright © 2019 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Simple Plugin API */
+/* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #ifndef SPA_DEVICE_UTILS_H
 #define SPA_DEVICE_UTILS_H
@@ -42,8 +22,8 @@ struct spa_result_device_params_data {
 	struct spa_result_device_params data;
 };
 
-static inline void spa_result_func_device_params(void *data, int seq, int res,
-		uint32_t type, const void *result)
+static inline void spa_result_func_device_params(void *data, int seq SPA_UNUSED, int res SPA_UNUSED,
+		uint32_t type SPA_UNUSED, const void *result)
 {
 	struct spa_result_device_params_data *d =
 		(struct spa_result_device_params_data *)data;
@@ -62,8 +42,8 @@ static inline int spa_device_enum_params_sync(struct spa_device *device,
 			struct spa_pod **param,
 			struct spa_pod_builder *builder)
 {
-	struct spa_result_device_params_data data = { builder, };
-	struct spa_hook listener = {{0}};
+	struct spa_result_device_params_data data = { builder, {0}};
+	struct spa_hook listener = {{0}, {0}, 0, 0};
 	static const struct spa_device_events device_events = {
 		.version = SPA_VERSION_DEVICE_EVENTS,
 		.info = NULL,

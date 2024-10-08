@@ -1,22 +1,40 @@
-audioconvert_sources = ['audioadapter.c',
+audioconvert_sources = [
+  'audioadapter.c',
   'audioconvert.c',
-  'fmtconvert.c',
-  'channelmix.c',
-  'merger.c',
-  'plugin.c',
-  'resample.c',
-  'splitter.c']
+  'plugin.c'
+]
 
 simd_cargs = []
 simd_dependencies = []
 
+opt_flags = []
+if host_machine.cpu_family() != 'alpha'
+  opt_flags += '-Ofast'
+else
+  opt_flags += '-O3'
+endif
+
+audioconvert_c = static_library('audioconvert_c',
+  [ 'channelmix-ops-c.c',
+    'biquad.c',
+    'crossover.c',
+    'volume-ops-c.c',
+    'peaks-ops-c.c',
+    'resample-native-c.c',
+    'fmt-ops-c.c' ],
+  c_args : [ opt_flags ],
+  dependencies : [ spa_dep ],
+  install : false
+  )
+simd_dependencies += audioconvert_c
+
 if have_sse
   audioconvert_sse = static_library('audioconvert_sse',
     ['resample-native-sse.c',
-      'resample-peaks-sse.c',
       'volume-ops-sse.c',
+      'peaks-ops-sse.c',
       'channelmix-ops-sse.c' ],
-    c_args : [sse_args, '-O3', '-DHAVE_SSE'],
+    c_args : [sse_args, opt_flags, '-DHAVE_SSE'],
     dependencies : [ spa_dep ],
     install : false
     )
@@ -89,15 +107,12 @@ endif
 
 audioconvert_lib = static_library('audioconvert',
   ['fmt-ops.c',
-    'biquad.c',
-    'crossover.c',
     'channelmix-ops.c',
-    'channelmix-ops-c.c',
+    'peaks-ops.c',
     'resample-native.c',
     'resample-peaks.c',
-    'fmt-ops-c.c',
-    'volume-ops.c',
-    'volume-ops-c.c' ],
+    'wavfile.c',
+    'volume-ops.c' ],
   c_args : [ simd_cargs, '-O3'],
   link_with : simd_dependencies,
   include_directories : [configinc],
@@ -120,12 +135,14 @@ test_lib = static_library('test_lib',
   dependencies : [ spa_dep ],
   install : false
   )
+test_inc = include_directories('../test')
 
 test_apps = [
   'test-audioadapter',
   'test-audioconvert',
   'test-channelmix',
   'test-fmt-ops',
+  'test-peaks',
   'test-resample',
   ]
 
@@ -133,7 +150,7 @@ foreach a : test_apps
   test(a,
     executable(a, a + '.c',
       dependencies : [ spa_dep, dl_lib, pthread_lib, mathlib, audioconvert_dep, spa_audioconvert_dep ],
-      include_directories : [ configinc ],
+      include_directories : [ configinc, test_inc ],
       link_with : [ test_lib ],
       install_rpath : spa_plugindir / 'audioconvert',
       c_args : [ simd_cargs ],
@@ -164,7 +181,7 @@ foreach a : benchmark_apps
   benchmark(a,
     executable(a, a + '.c',
       dependencies : [ spa_dep, dl_lib, pthread_lib, mathlib, audioconvert_dep, spa_audioconvert_dep ],
-      include_directories : [ configinc ],
+      include_directories : [ configinc, test_inc ],
       c_args : [ simd_cargs ],
       install_rpath : spa_plugindir / 'audioconvert',
       install : installed_tests_enabled,

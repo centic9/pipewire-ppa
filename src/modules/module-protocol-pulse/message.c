@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -33,7 +13,6 @@
 #include "defs.h"
 #include "format.h"
 #include "internal.h"
-#include "log.h"
 #include "message.h"
 #include "remap.h"
 #include "volume.h"
@@ -46,6 +25,9 @@
 #define VOLUME_MAX ((uint32_t) UINT32_MAX/2)
 
 #define PA_CHANNELS_MAX	(32u)
+
+PW_LOG_TOPIC_EXTERN(pulse_conn);
+#define PW_LOG_TOPIC_DEFAULT pulse_conn
 
 static inline uint32_t volume_from_linear(float vol)
 {
@@ -390,15 +372,23 @@ static int ensure_size(struct message *m, uint32_t size)
 	uint32_t alloc, diff;
 	void *data;
 
+	if (m->length > m->allocated)
+		return -ENOMEM;
+
 	if (m->length + size <= m->allocated)
 		return size;
 
 	alloc = SPA_ROUND_UP_N(SPA_MAX(m->allocated + size, 4096u), 4096u);
 	diff = alloc - m->allocated;
-	if ((data = realloc(m->data, alloc)) == NULL)
+	if ((data = realloc(m->data, alloc)) == NULL) {
+		free(m->data);
+		m->data = NULL;
+		m->impl->stat.allocated -= m->allocated;
+		m->allocated = 0;
 		return -errno;
-	m->stat->allocated += diff;
-	m->stat->accumulated += diff;
+	}
+	m->impl->stat.allocated += diff;
+	m->impl->stat.accumulated += diff;
 	m->data = data;
 	m->allocated = alloc;
 	return size;
@@ -821,19 +811,21 @@ struct message *message_alloc(struct impl *impl, uint32_t channel, uint32_t size
 	if (!spa_list_is_empty(&impl->free_messages)) {
 		msg = spa_list_first(&impl->free_messages, struct message, link);
 		spa_list_remove(&msg->link);
-		pw_log_trace("using recycled message %p", msg);
+		pw_log_trace("using recycled message %p size:%d", msg, size);
+
+		spa_assert(msg->impl == impl);
 	} else {
 		if ((msg = calloc(1, sizeof(*msg))) == NULL)
 			return NULL;
 
-		pw_log_trace("new message %p", msg);
-		msg->stat = &impl->stat;
-		msg->stat->n_allocated++;
-		msg->stat->n_accumulated++;
+		pw_log_trace("new message %p size:%d", msg, size);
+		msg->impl = impl;
+		msg->impl->stat.n_allocated++;
+		msg->impl->stat.n_accumulated++;
 	}
 
 	if (ensure_size(msg, size) < 0) {
-		message_free(impl, msg, false, true);
+		message_free(msg, false, true);
 		return NULL;
 	}
 
@@ -845,22 +837,23 @@ struct message *message_alloc(struct impl *impl, uint32_t channel, uint32_t size
 	return msg;
 }
 
-void message_free(struct impl *impl, struct message *msg, bool dequeue, bool destroy)
+void message_free(struct message *msg, bool dequeue, bool destroy)
 {
 	if (dequeue)
 		spa_list_remove(&msg->link);
 
-	if (msg->stat->allocated > MAX_ALLOCATED || msg->allocated > MAX_SIZE)
+	if (msg->impl->stat.allocated > MAX_ALLOCATED || msg->allocated > MAX_SIZE)
 		destroy = true;
 
 	if (destroy) {
 		pw_log_trace("destroy message %p size:%d", msg, msg->allocated);
-		msg->stat->n_allocated--;
-		msg->stat->allocated -= msg->allocated;
+		msg->impl->stat.n_allocated--;
+		msg->impl->stat.allocated -= msg->allocated;
 		free(msg->data);
 		free(msg);
 	} else {
-		pw_log_trace("recycle message %p size:%d", msg, msg->allocated);
-		spa_list_append(&impl->free_messages, &msg->link);
+		pw_log_trace("recycle message %p size:%d/%d", msg, msg->length, msg->allocated);
+		spa_list_append(&msg->impl->free_messages, &msg->link);
+		msg->length = 0;
 	}
 }

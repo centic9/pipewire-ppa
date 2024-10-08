@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2019 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include "pwtest.h"
 
@@ -47,6 +27,8 @@ PWTEST(context_abi)
 		void (*check_access) (void *data, struct pw_impl_client *client);
 		void (*global_added) (void *data, struct pw_global *global);
 		void (*global_removed) (void *data, struct pw_global *global);
+		void (*driver_added) (void *data, struct pw_impl_node *node);
+		void (*driver_removed) (void *data, struct pw_impl_node *node);
 	} test = { PW_VERSION_CONTEXT_EVENTS, NULL };
 
 	pw_init(0, NULL);
@@ -56,8 +38,10 @@ PWTEST(context_abi)
 	TEST_FUNC(ev, test, check_access);
 	TEST_FUNC(ev, test, global_added);
 	TEST_FUNC(ev, test, global_removed);
+	TEST_FUNC(ev, test, driver_added);
+	TEST_FUNC(ev, test, driver_removed);
 
-	pwtest_int_eq(PW_VERSION_CONTEXT_EVENTS, 0);
+	pwtest_int_eq(PW_VERSION_CONTEXT_EVENTS, 1);
 	pwtest_int_eq(sizeof(ev), sizeof(test));
 
 	pw_deinit();
@@ -85,7 +69,14 @@ static void context_global_removed_error(void *data, struct pw_global *global)
 {
 	pwtest_fail_if_reached();
 }
-
+static void context_driver_added_error(void *data, struct pw_impl_node *node)
+{
+	pwtest_fail_if_reached();
+}
+static void context_driver_removed_error(void *data, struct pw_impl_node *node)
+{
+	pwtest_fail_if_reached();
+}
 static const struct pw_context_events context_events_error =
 {
 	PW_VERSION_CONTEXT_EVENTS,
@@ -94,6 +85,8 @@ static const struct pw_context_events context_events_error =
 	.check_access = context_check_access_error,
 	.global_added = context_global_added_error,
 	.global_removed = context_global_removed_error,
+	.driver_added = context_driver_added_error,
+	.driver_removed = context_driver_removed_error,
 };
 
 static int destroy_count = 0;

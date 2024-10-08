@@ -1,26 +1,6 @@
-/* GStreamer
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* GStreamer */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include "config.h"
 
@@ -51,27 +31,26 @@ gst_pipewire_clock_get_internal_time (GstClock * clock)
 {
   GstPipeWireClock *pclock = (GstPipeWireClock *) clock;
   GstClockTime result;
-  struct timespec ts;
+  uint64_t now;
 
-  clock_gettime(CLOCK_MONOTONIC, &ts);
+  now = pw_stream_get_nsec(pclock->stream);
 #if 0
   struct pw_time t;
   if (pclock->stream == NULL ||
-      pw_stream_get_time (pclock->stream, &t) < 0 ||
+      pw_stream_get_time_n (pclock->stream, &t, sizeof(t)) < 0 ||
       t.rate.denom == 0)
     return pclock->last_time;
 
   result = gst_util_uint64_scale_int (t.ticks, GST_SECOND * t.rate.num, t.rate.denom);
-  result += SPA_TIMESPEC_TO_NSEC(&ts) - t.now;
+  result += now - t.now;
 
   result += pclock->time_offset;
   pclock->last_time = result;
 
-  GST_DEBUG ("%"PRId64", %d/%d %"PRId64" %"PRId64,
-                t.ticks, t.rate.num, t.rate.denom, t.now, result);
+  GST_DEBUG ("%"PRId64", %d/%d %"PRId64" %"PRId64" %"PRId64,
+                t.ticks, t.rate.num, t.rate.denom, t.now, result, now);
 #else
-  result = SPA_TIMESPEC_TO_NSEC(&ts);
-  result += pclock->time_offset;
+  result = now + pclock->time_offset;
   pclock->last_time = result;
 #endif
 
@@ -111,6 +90,7 @@ gst_pipewire_clock_init (GstPipeWireClock * clock)
 void
 gst_pipewire_clock_reset (GstPipeWireClock * clock, GstClockTime time)
 {
+#if 0
   GstClockTimeDiff time_offset;
 
   if (clock->last_time >= time)
@@ -124,4 +104,5 @@ gst_pipewire_clock_reset (GstPipeWireClock * clock, GstClockTime time)
       "reset clock to %" GST_TIME_FORMAT ", last %" GST_TIME_FORMAT
       ", offset %" GST_STIME_FORMAT, GST_TIME_ARGS (time),
       GST_TIME_ARGS (clock->last_time), GST_STIME_ARGS (time_offset));
+#endif
 }

@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <assert.h>
 
@@ -41,10 +21,11 @@ struct proxy {
 };
 /** \endcond */
 
-int pw_proxy_init(struct pw_proxy *proxy, const char *type, uint32_t version)
+int pw_proxy_init(struct pw_proxy *proxy, struct pw_core *core, const char *type, uint32_t version)
 {
 	int res;
 
+	proxy->core = core;
 	proxy->refcount = 1;
 	proxy->type = type;
 	proxy->version = version;
@@ -101,9 +82,8 @@ struct pw_proxy *pw_proxy_new(struct pw_proxy *factory,
 		return NULL;
 
 	this = &impl->this;
-	this->core = factory->core;
 
-	if ((res = pw_proxy_init(this, type, version)) < 0)
+	if ((res = pw_proxy_init(this, factory->core, type, version)) < 0)
 		goto error_init;
 
 	if (user_data_size > 0)
@@ -177,12 +157,6 @@ const char *pw_proxy_get_type(struct pw_proxy *proxy, uint32_t *version)
 	if (version)
 		*version = proxy->version;
 	return proxy->type;
-}
-
-SPA_EXPORT
-struct pw_core *pw_proxy_get_core(struct pw_proxy *proxy)
-{
-	return proxy->core;
 }
 
 SPA_EXPORT

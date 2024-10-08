@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #ifndef PIPEWIRE_MAP_H
 #define PIPEWIRE_MAP_H
@@ -85,7 +65,7 @@ struct pw_map {
 };
 
 /** \param extend the amount of bytes to grow the map with when needed */
-#define PW_MAP_INIT(extend) (struct pw_map) { PW_ARRAY_INIT(extend), SPA_ID_INVALID }
+#define PW_MAP_INIT(extend) ((struct pw_map) { PW_ARRAY_INIT(extend), SPA_ID_INVALID })
 
 /**
  * Get the number of currently allocated elements in the map.
@@ -209,7 +189,7 @@ static inline void pw_map_remove(struct pw_map *map, uint32_t id)
  * \param id the index to look at
  * \return the item at \a id or NULL when no such item exists
  */
-static inline void *pw_map_lookup(struct pw_map *map, uint32_t id)
+static inline void *pw_map_lookup(const struct pw_map *map, uint32_t id)
 {
 	if (SPA_LIKELY(pw_map_check_id(map, id))) {
 		union pw_map_item *item = pw_map_get_item(map, id);
@@ -227,8 +207,8 @@ static inline void *pw_map_lookup(struct pw_map *map, uint32_t id)
  * \param data data to pass to \a func
  * \return the result of the last call to \a func or 0 when all callbacks returned 0.
  */
-static inline int pw_map_for_each(struct pw_map *map,
-				   int (*func) (void *item_data, void *data), void *data)
+static inline int pw_map_for_each(const struct pw_map *map,
+				  int (*func) (void *item_data, void *data), void *data)
 {
 	union pw_map_item *item;
 	int res = 0;

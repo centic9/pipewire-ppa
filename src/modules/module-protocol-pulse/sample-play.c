@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <stdint.h>
 #include <errno.h>
@@ -57,17 +37,6 @@ static void sample_play_stream_state_changed(void *data, enum pw_stream_state ol
 		sample_play_emit_ready(p, p->id);
 		break;
 	default:
-		break;
-	}
-}
-
-static void sample_play_stream_io_changed(void *data, uint32_t id, void *area, uint32_t size)
-{
-	struct sample_play *p = data;
-
-	switch (id) {
-	case SPA_IO_RateMatch:
-		p->rate_match = area;
 		break;
 	}
 }
@@ -111,8 +80,8 @@ static void sample_play_stream_process(void *data)
 		return;
 
 	size = SPA_MIN(size, buf->datas[0].maxsize);
-	if (p->rate_match)
-		size = SPA_MIN(size, p->rate_match->size * p->stride);
+	if (b->requested)
+		size = SPA_MIN(size, b->requested * p->stride);
 
 	memcpy(d, s->buffer + p->offset, size);
 
@@ -135,7 +104,6 @@ static void sample_play_stream_drained(void *data)
 static const struct pw_stream_events sample_play_stream_events = {
 	PW_VERSION_STREAM_EVENTS,
 	.state_changed = sample_play_stream_state_changed,
-	.io_changed = sample_play_stream_io_changed,
 	.destroy = sample_play_stream_destroy,
 	.process = sample_play_stream_process,
 	.drained = sample_play_stream_drained,
@@ -210,6 +178,8 @@ void sample_play_destroy(struct sample_play *p)
 {
 	if (p->stream)
 		pw_stream_destroy(p->stream);
+
+	spa_hook_list_clean(&p->hooks);
 
 	free(p);
 }
