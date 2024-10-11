@@ -772,6 +772,19 @@ pipewire (0.3.49-1) unstable; urgency=medium
 
  -- Dylan Aïssi <daissi@debian.org>  Wed, 30 Mar 2022 12:06:06 +0200
 
+pipewire (0.3.48-1ubuntu4~ppa1) jammy; urgency=medium
+
+  * Use version which is actually newer than ubuntu3.
+
+ -- Dominik Stadler (Ubuntu key) <dominik.stadler@gmx.at>  Mon, 23 Jan 2023 10:37:53 +0100
+
+pipewire (0.3.48-1ubuntu3~ppa1) jammy; urgency=medium
+
+  * Revert patch https://gitlab.freedesktop.org/pipewire/pipewire/-/commit/c4997fc46d4846e3d11eb7e1b9374614348c6666
+    to allow moving sources even if they declare DONT_MOVE
+
+ -- Dominik Stadler (Ubuntu key) <dominik.stadler@gmx.at>  Mon, 23 Jan 2023 09:27:11 +0100
+
 pipewire (0.3.48-1) unstable; urgency=medium
 
   * Team upload.

@@ -23,3 +23,5 @@ snap/snap-policy-fix-memory-leak.patch
 
 # Upstream patch for long SysEx messages
 0001_copy-events-to-right-offset.patch
+
+disable_dont_move
