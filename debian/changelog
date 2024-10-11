@@ -1,3 +1,9 @@
+pipewire (1.0.5-1ubuntu2~ppa2) noble; urgency=medium
+
+  * Fix build-failure and minimize patch to disable dontmove.
+
+ -- Dominik Stadler (Ubuntu key) <dominik.stadler@gmx.at>  Fri, 11 Oct 2024 13:39:34 +0200
+
 pipewire (1.0.5-1ubuntu2~ppa1) noble; urgency=medium
 
   * Apply patch to allow moving of all devices to latest pipewire
