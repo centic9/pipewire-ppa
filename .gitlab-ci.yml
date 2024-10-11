@@ -25,8 +25,8 @@ include:
 .fedora:
   variables:
     # Update this tag when you want to trigger a rebuild
-    FDO_DISTRIBUTION_TAG: '2023-05-31.0'
-    FDO_DISTRIBUTION_VERSION: '37'
+    FDO_DISTRIBUTION_TAG: '2023-11-22.0'
+    FDO_DISTRIBUTION_VERSION: '39'
     FDO_DISTRIBUTION_PACKAGES: >-
       alsa-lib-devel
       avahi-devel
@@ -75,6 +75,7 @@ include:
       pulseaudio-utils
       openal-soft
       readline-devel
+      pandoc
 # Uncommenting the following two lines and disabling the meson entry above
 # will re-enable use of Meson via pip but please consider using a newer distro
 # image first or making the build system compatible instead! This is because
@@ -262,6 +263,9 @@ build_on_fedora:
   variables:
     MESON_OPTIONS: >-
         -Ddocs=enabled
+        -Dman=enabled
+        -Ddoc-prefix-value=/usr
+        -Ddoc-sysconfdir-value=/etc
         -Dinstalled_tests=enabled
         -Dsystemd-system-service=enabled
         -Dbluez5-backend-hsphfpd=enabled
@@ -279,6 +283,47 @@ build_on_fedora:
     paths:
       - build-*/meson-logs
       - prefix-*
+
+build_on_fedora_html_docs:
+  extends:
+    - .build_on_fedora
+  variables:
+    MESON_OPTIONS: >-
+        -Ddocs=enabled
+        -Dman=enabled
+        -Ddoc-prefix-value=/usr
+        -Ddoc-sysconfdir-value=/etc
+        -Dinstalled_tests=enabled
+        -Dsystemd-system-service=enabled
+        -Dbluez5-backend-hsphfpd=enabled
+        -Daudiotestsrc=enabled
+        -Dtest=enabled
+        -Dvideotestsrc=enabled
+        -Dvolume=enabled
+        -Dvulkan=enabled
+        -Dsdl2=enabled
+        -Dsndfile=enabled
+        -Dsession-managers=[]
+  before_script:
+    - git fetch origin 1.0 master
+    - git branch -f 1.0 origin/1.0
+    - git branch -f master origin/master
+    - git clone -b 1.0 . branch-1.0
+    - git clone -b master . branch-master
+    - !reference [.build, before_script]
+  script:
+    - cd branch-1.0
+    - meson setup builddir $MESON_OPTIONS
+    - meson compile -C builddir doc/pipewire-docs
+    - cd ../branch-master
+    - meson setup builddir $MESON_OPTIONS
+    - meson compile -C builddir doc/pipewire-docs
+  artifacts:
+    name: pipewire-$CI_COMMIT_SHA
+    when: always
+    paths:
+      - branch-*/builddir/meson-logs
+      - branch-*/builddir/doc/html
 
 build_on_alpine:
   extends:
@@ -343,7 +388,7 @@ build_with_asan_ubsan:
     - echo "Building with ASan and UBSan"
     - meson setup "$BUILD_DIR" --prefix="$PREFIX" -D debug=true -D optimization=g -D b_sanitize=address,undefined -D session-managers=[]
     - meson compile -C "$BUILD_DIR" $COMPILE_ARGS
-    - meson test -C "$BUILD_DIR" --no-rebuild
+    - env UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 meson test -C "$BUILD_DIR" --no-rebuild
 
 # A release build with NDEBUG, all options on auto() but tests explicitly
 # enabled. This should show issues with tests failing due to different
@@ -458,8 +503,15 @@ shellcheck:
   extends:
     - .build_on_fedora
   stage: analysis
+  variables:
+    MESON_OPTIONS: >-
+        -Dpipewire-v4l2=enabled
+        -Dpipewire-jack=enabled
   script:
-    - shellcheck $(git grep -l "#\!/.*bin/.*sh")
+    - echo "Configuring with meson options $MESON_OPTIONS"
+    - meson setup "$BUILD_DIR" --prefix="$PREFIX" $MESON_OPTIONS
+    - shellcheck $(git ls-files '*.sh')
+    - shellcheck $(grep -rl "#\!/.*bin/.*sh" "$BUILD_DIR")
 
 spellcheck:
   extends:
@@ -499,12 +551,14 @@ pages:
     - .not_coverity
   stage: pages
   dependencies:
-    - build_on_fedora
+    - build_on_fedora_html_docs
   script:
-    - mkdir public
-    - cp -R prefix-*/share/doc/pipewire/html/* public/
+    - mkdir public public/devel
+    - cp -R branch-1.0/builddir/doc/html/* public/
+    - cp -R branch-master/builddir/doc/html/* public/devel/
   artifacts:
     paths:
       - public
   only:
-    - master
+    - 'master'
+    - '1.0'

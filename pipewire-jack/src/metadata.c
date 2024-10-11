@@ -230,7 +230,7 @@ int jack_set_property(jack_client_t*client,
 	pw_log_info("set id:%u (%"PRIu64") '%s' to '%s@%s'", o->id, subject, key, value, type);
 	if (update_property(c, subject, key, type, value))
 		pw_metadata_set_property(c->metadata->proxy, o->id, key, type, value);
-	res = 0;
+	res = do_sync(c);
 done:
 	pw_thread_loop_unlock(c->context.loop);
 
@@ -324,7 +324,8 @@ SPA_EXPORT
 int jack_remove_property (jack_client_t* client, jack_uuid_t subject, const char* key)
 {
 	struct client *c = (struct client *) client;
-	uint32_t id;
+	struct object *o;
+	uint32_t serial;
 	int res = -1;
 
 	spa_return_val_if_fail(c != NULL, -EINVAL);
@@ -335,12 +336,17 @@ int jack_remove_property (jack_client_t* client, jack_uuid_t subject, const char
 	if (c->metadata == NULL)
 		goto done;
 
-	id = jack_uuid_to_index(subject);
+	if (subject & (1<<30))
+		goto done;
 
-	pw_log_info("remove id:%u (%"PRIu64") '%s'", id, subject, key);
+	serial = jack_uuid_to_index(subject);
+	if ((o = find_by_serial(c, serial)) == NULL)
+		goto done;
+
+	pw_log_info("remove id:%u (%"PRIu64") '%s'", o->id, subject, key);
 	pw_metadata_set_property(c->metadata->proxy,
-			id, key, NULL, NULL);
-	res = 0;
+			o->id, key, NULL, NULL);
+	res = do_sync(c);
 done:
 	pw_thread_loop_unlock(c->context.loop);
 
@@ -351,7 +357,8 @@ SPA_EXPORT
 int jack_remove_properties (jack_client_t* client, jack_uuid_t subject)
 {
 	struct client *c = (struct client *) client;
-	uint32_t id;
+	struct object *o;
+	uint32_t serial;
 	int res = -1;
 
 	spa_return_val_if_fail(c != NULL, -EINVAL);
@@ -360,12 +367,17 @@ int jack_remove_properties (jack_client_t* client, jack_uuid_t subject)
 	if (c->metadata == NULL)
 		goto done;
 
-	id = jack_uuid_to_index(subject);
+	if (subject & (1<<30))
+		goto done;
 
-	pw_log_info("remove id:%u (%"PRIu64")", id, subject);
+	serial = jack_uuid_to_index(subject);
+	if ((o = find_by_serial(c, serial)) == NULL)
+		goto done;
+
+	pw_log_info("remove id:%u (%"PRIu64")", o->id, subject);
 	pw_metadata_set_property(c->metadata->proxy,
-			id, NULL, NULL, NULL);
-	res = 0;
+			o->id, NULL, NULL, NULL);
+	res = do_sync(c);
 done:
 	pw_thread_loop_unlock(c->context.loop);
 
@@ -375,15 +387,17 @@ done:
 SPA_EXPORT
 int jack_remove_all_properties (jack_client_t* client)
 {
+	int res;
 	struct client *c = (struct client *) client;
 
 	spa_return_val_if_fail(c != NULL, -EINVAL);
 
 	pw_thread_loop_lock(c->context.loop);
 	pw_metadata_clear(c->metadata->proxy);
+	res = do_sync(c);
 	pw_thread_loop_unlock(c->context.loop);
 
-	return 0;
+	return res;
 }
 
 SPA_EXPORT
@@ -394,8 +408,9 @@ int jack_set_property_change_callback (jack_client_t*             client,
 	struct client *c = (struct client *) client;
 
 	spa_return_val_if_fail(c != NULL, -EINVAL);
-
+	pw_thread_loop_lock(c->context.loop);
 	c->property_callback = callback;
 	c->property_arg = arg;
+	pw_thread_loop_unlock(c->context.loop);
 	return 0;
 }

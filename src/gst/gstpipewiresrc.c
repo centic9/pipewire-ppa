@@ -402,8 +402,8 @@ gst_pipewire_src_class_init (GstPipeWireSrcClass * klass)
   gstelement_class->send_event = gst_pipewire_src_send_event;
 
   gst_element_class_set_static_metadata (gstelement_class,
-      "PipeWire source", "Source/Video",
-      "Uses PipeWire to create video", "Wim Taymans <wim.taymans@gmail.com>");
+      "PipeWire source", "Source/Audio/Video",
+      "Uses PipeWire to create audio/video", "Wim Taymans <wim.taymans@gmail.com>");
 
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&gst_pipewire_src_template));
@@ -586,6 +586,9 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
         GST_BUFFER_DTS (buf) = GST_BUFFER_PTS (buf) + h->dts_offset;
     }
     GST_BUFFER_OFFSET (buf) = h->seq;
+  } else {
+    GST_BUFFER_PTS (buf) = b->time;
+    GST_BUFFER_DTS (buf) = b->time;
   }
   crop = data->crop;
   if (crop) {
@@ -681,9 +684,13 @@ on_state_changed (void *data,
     case PW_STREAM_STATE_STREAMING:
       break;
     case PW_STREAM_STATE_ERROR:
-      pw_stream_set_error (pwsrc->stream, -EPIPE, "%s", error);
-      GST_ELEMENT_ERROR (pwsrc, RESOURCE, FAILED,
-          ("stream error: %s", error), (NULL));
+      /* make the error permanent, if it is not already;
+         pw_stream_set_error() will recursively call us again */
+      if (pw_stream_get_state (pwsrc->stream, NULL) != PW_STREAM_STATE_ERROR)
+        pw_stream_set_error (pwsrc->stream, -EPIPE, "%s", error);
+      else
+        GST_ELEMENT_ERROR (pwsrc, RESOURCE, FAILED,
+            ("stream error: %s", error), (NULL));
       break;
   }
   pw_thread_loop_signal (pwsrc->core->loop, FALSE);
@@ -764,7 +771,7 @@ start_error:
 static enum pw_stream_state
 wait_started (GstPipeWireSrc *this)
 {
-  enum pw_stream_state state;
+  enum pw_stream_state state, prev_state = PW_STREAM_STATE_UNCONNECTED;
   const char *error = NULL;
   struct timespec abstime;
 
@@ -779,10 +786,9 @@ wait_started (GstPipeWireSrc *this)
     GST_DEBUG_OBJECT (this, "waiting for started signal, state now %s",
         pw_stream_state_as_string (state));
 
-    if (state == PW_STREAM_STATE_ERROR)
-      break;
-
-    if (this->flushing) {
+    if (state == PW_STREAM_STATE_ERROR ||
+        (state == PW_STREAM_STATE_UNCONNECTED && prev_state > PW_STREAM_STATE_UNCONNECTED) ||
+        this->flushing) {
       state = PW_STREAM_STATE_ERROR;
       break;
     }
@@ -790,10 +796,16 @@ wait_started (GstPipeWireSrc *this)
     if (this->started)
       break;
 
-    if (pw_thread_loop_timed_wait_full (this->core->loop, &abstime) < 0) {
-      state = PW_STREAM_STATE_ERROR;
-      break;
+    if (this->autoconnect) {
+      if (pw_thread_loop_timed_wait_full (this->core->loop, &abstime) < 0) {
+        state = PW_STREAM_STATE_ERROR;
+        break;
+      }
+    } else {
+      pw_thread_loop_wait (this->core->loop);
     }
+
+    prev_state = state;
   }
   GST_DEBUG_OBJECT (this, "got started signal: %s",
                   pw_stream_state_as_string (state));
@@ -892,7 +904,9 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
   GST_DEBUG_OBJECT (basesrc, "connect capture with path %s, target-object %s",
                     pwsrc->path, pwsrc->target_object);
   pwsrc->negotiated = FALSE;
-  enum pw_stream_flags flags = PW_STREAM_FLAG_DONT_RECONNECT;
+  enum pw_stream_flags flags;
+  flags = PW_STREAM_FLAG_DONT_RECONNECT |
+	  PW_STREAM_FLAG_ASYNC;
   if (pwsrc->autoconnect)
     flags |= PW_STREAM_FLAG_AUTOCONNECT;
   pw_stream_connect (pwsrc->stream,
@@ -916,8 +930,12 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
     if (pwsrc->negotiated)
       break;
 
-    if (pw_thread_loop_timed_wait_full (pwsrc->core->loop, &abstime) < 0)
+    if (pwsrc->autoconnect) {
+      if (pw_thread_loop_timed_wait_full (pwsrc->core->loop, &abstime) < 0)
         goto connect_error;
+    } else {
+      pw_thread_loop_wait (pwsrc->core->loop);
+    }
   }
   caps = pwsrc->caps;
   pwsrc->caps = NULL;
@@ -1186,7 +1204,7 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
     if (state == PW_STREAM_STATE_ERROR)
       goto streaming_error;
 
-    if (state != PW_STREAM_STATE_STREAMING)
+    if (state == PW_STREAM_STATE_UNCONNECTED)
       goto streaming_stopped;
 
     if ((caps = pwsrc->caps) != NULL) {

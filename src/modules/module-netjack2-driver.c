@@ -40,10 +40,14 @@
 #define IPTOS_DSCP(x) ((x) & IPTOS_DSCP_MASK)
 #endif
 
-/** \page page_module_netjack2_driver PipeWire Module: Netjack2 driver
+/** \page page_module_netjack2_driver Netjack2 driver
  *
  * The netjack2-driver module provides a source or sink that is following a
- * netjack2 driver.
+ * netjack2 manager.
+ *
+ * ## Module Name
+ *
+ * `libpipewire-module-netjack2-driver`
  *
  * ## Module Options
  *
@@ -199,6 +203,7 @@ struct impl {
 	int dscp;
 	int mtu;
 	uint32_t latency;
+	uint32_t quantum_limit;
 
 	struct pw_impl_module *module;
 	struct spa_hook module_listener;
@@ -371,7 +376,7 @@ static void param_latency_changed(struct stream *s, const struct spa_pod *param,
 	bool update = false;
 	enum spa_direction direction = port->direction;
 
-	if (spa_latency_parse(param, &latency) < 0)
+	if (param == NULL || spa_latency_parse(param, &latency) < 0)
 		return;
 
 	if (spa_latency_info_compare(&port->latency[direction], &latency)) {
@@ -411,7 +416,7 @@ static void make_stream_ports(struct stream *s)
 
 		if (i < s->info.channels) {
 			str = spa_debug_type_find_short_name(spa_type_audio_channel,
-					s->info.position[i]);
+					s->info.position[i % SPA_AUDIO_MAX_CHANNELS]);
 			if (str)
 				snprintf(name, sizeof(name), "%s_%s", prefix, str);
 			else
@@ -602,13 +607,6 @@ static int create_filters(struct impl *impl)
 }
 
 
-static inline uint64_t get_time_ns(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return SPA_TIMESPEC_TO_NSEC(&ts);
-}
-
 static void
 on_data_io(void *data, int fd, uint32_t mask)
 {
@@ -628,7 +626,7 @@ on_data_io(void *data, int fd, uint32_t mask)
 		if (nframes == 0)
 			return;
 
-		nsec = get_time_ns();
+		nsec = pw_filter_get_nsec(impl->source.filter);
 
 		if (!impl->done) {
 			impl->pw_xrun++;
@@ -814,6 +812,7 @@ static int handle_follower_setup(struct impl *impl, struct nj2_session_params *p
 {
 	int res;
 	struct netjack2_peer *peer = &impl->peer;
+	uint32_t i;
 
 	pw_log_info("got follower setup");
 	nj2_dump_session_params(params);
@@ -837,10 +836,18 @@ static int handle_follower_setup(struct impl *impl, struct nj2_session_params *p
 
 	impl->source.n_ports = peer->params.send_audio_channels + peer->params.send_midi_channels;
 	impl->source.info.rate =  peer->params.sample_rate;
-	impl->source.info.channels =  peer->params.send_audio_channels;
+	if ((uint32_t)peer->params.send_audio_channels != impl->source.info.channels) {
+		impl->source.info.channels = peer->params.send_audio_channels;
+		for (i = 0; i < SPA_MIN(impl->source.info.channels, SPA_AUDIO_MAX_CHANNELS); i++)
+			impl->source.info.position[i] = SPA_AUDIO_CHANNEL_AUX0 + i;
+	}
 	impl->sink.n_ports = peer->params.recv_audio_channels + peer->params.recv_midi_channels;
 	impl->sink.info.rate =  peer->params.sample_rate;
-	impl->sink.info.channels =  peer->params.recv_audio_channels;
+	if ((uint32_t)peer->params.recv_audio_channels != impl->sink.info.channels) {
+		impl->sink.info.channels =  peer->params.recv_audio_channels;
+		for (i = 0; i < SPA_MIN(impl->sink.info.channels, SPA_AUDIO_MAX_CHANNELS); i++)
+			impl->sink.info.position[i] = SPA_AUDIO_CHANNEL_AUX0 + i;
+	}
 	impl->samplerate = peer->params.sample_rate;
 	impl->period_size = peer->params.period_size;
 
@@ -868,6 +875,7 @@ static int handle_follower_setup(struct impl *impl, struct nj2_session_params *p
 	peer->other_stream = 's';
 	peer->send_volume = &impl->sink.volume;
 	peer->recv_volume = &impl->source.volume;
+	peer->quantum_limit = impl->quantum_limit;
 	netjack2_init(peer);
 
 	int bufsize = NETWORK_MAX_LATENCY * (peer->params.mtu +
@@ -914,7 +922,7 @@ on_socket_io(void *data, int fd, uint32_t mask)
 		if (len < (int)sizeof(struct nj2_session_params))
 			goto short_packet;
 
-		if (strcmp(params.type, "params") != 0)
+		if (strncmp(params.type, "params", sizeof(params.type)) != 0)
 			goto wrong_type;
 
 		switch(ntohl(params.packet_id)) {
@@ -1238,6 +1246,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->props = props;
 	data_loop = pw_context_get_data_loop(context);
 	impl->data_loop = pw_data_loop_get_loop(data_loop);
+	impl->quantum_limit = pw_properties_get_uint32(
+			pw_context_get_properties(context),
+			"default.clock.quantum-limit", 8192u);
 
 	impl->sink.props = pw_properties_new(NULL, NULL);
 	impl->source.props = pw_properties_new(NULL, NULL);

@@ -43,7 +43,7 @@ context.modules = [
     # Boost the data thread priority.
     { name = libpipewire-module-rt
         args = {
-            #rt.prio      = 88
+            #rt.prio      = @rtprio_client@
             #rt.time.soft = -1
             #rt.time.hard = -1
         }
@@ -89,6 +89,7 @@ jack.properties = {
      #jack.global-buffer-size = false
      #jack.max-client-ports   = 768
      #jack.fill-aliases       = false
+     #jack.writable-input     = true
 }
 
 # client specific properties

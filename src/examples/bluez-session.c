@@ -58,8 +58,6 @@ struct object {
 };
 
 struct impl {
-	struct timespec now;
-
 	struct pw_main_loop *loop;
 	struct pw_context *context;
 
@@ -71,6 +69,7 @@ struct impl {
 	struct spa_hook listener;
 
 	struct spa_list device_list;
+	struct pw_properties *props;
 };
 
 static struct node *find_node(struct object *obj, uint32_t id)
@@ -266,7 +265,7 @@ static void remove_object(struct impl *impl, struct object *obj)
 	spa_list_remove(&obj->link);
 	spa_hook_remove(&obj->listener);
 	pw_proxy_destroy(obj->proxy);
-	free(obj->handle);
+	pw_unload_spa_handle(obj->handle);
 	free(obj);
 }
 
@@ -302,7 +301,7 @@ static int start_monitor(struct impl *impl)
 	int res;
 	void *iface;
 
-	handle = pw_context_load_spa_handle(impl->context, SPA_NAME_API_BLUEZ5_ENUM_DBUS, NULL);
+	handle = pw_context_load_spa_handle(impl->context, SPA_NAME_API_BLUEZ5_ENUM_DBUS, &impl->props->dict);
 	if (handle == NULL) {
 		res = -errno;
 		goto out;
@@ -352,13 +351,15 @@ int main(int argc, char *argv[])
 	impl.loop = pw_main_loop_new(NULL);
 	impl.context = pw_context_new(pw_main_loop_get_loop(impl.loop), NULL, 0);
 
-	clock_gettime(CLOCK_MONOTONIC, &impl.now);
-
 	spa_list_init(&impl.device_list);
 
         impl.core = pw_context_connect(impl.context, NULL, 0);
 	if (impl.core == NULL) {
 		pw_log_error(NAME" %p: can't connect %m", &impl);
+		return -1;
+	}
+
+	if ((impl.props = pw_properties_new(NULL, NULL)) == NULL) {
 		return -1;
 	}
 

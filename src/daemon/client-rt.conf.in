@@ -43,7 +43,7 @@ context.modules = [
     # Uses realtime scheduling to boost the audio thread priorities
     { name = libpipewire-module-rt
         args = {
-            #rt.prio      = 88
+            #rt.prio      = @rtprio_client@
             #rt.time.soft = -1
             #rt.time.hard = -1
         }
@@ -111,6 +111,7 @@ stream.rules = [
 ]
 
 alsa.properties = {
+    #alsa.deny = false
     # ALSA params take a single value, an array [] of values
     # or a range { min=.. max=... }
     #alsa.access = [ MMAP_INTERLEAVED MMAP_NONINTERLEAVED RW_INTERLEAVED RW_NONINTERLEAVED ]

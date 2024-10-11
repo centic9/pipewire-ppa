@@ -53,6 +53,9 @@ int pthread_setname_np(pthread_t thread, const char *name)
 }
 #endif
 #endif
+#if defined(__GNU__)
+int pthread_setname_np(pthread_t thread, const char *name) { return 0; }
+#endif
 
 static struct spa_thread *impl_create(void *object,
 			const struct spa_dict *props,
@@ -99,13 +102,13 @@ static int impl_get_rt_range(void *object, const struct spa_dict *props,
 }
 static int impl_acquire_rt(void *object, struct spa_thread *thread, int priority)
 {
-	pw_log_warn("acquire_rt thread:%p prio:%d not implemented", thread, priority);
+	pw_log_info("acquire_rt thread:%p prio:%d not implemented", thread, priority);
 	return -ENOTSUP;
 }
 
 static int impl_drop_rt(void *object, struct spa_thread *thread)
 {
-	pw_log_warn("drop_rt thread:%p not implemented", thread);
+	pw_log_info("drop_rt thread:%p not implemented", thread);
 	return -ENOTSUP;
 }
 

@@ -32,6 +32,7 @@ context.properties = {
     #default.clock.min-quantum   = 32
     #default.clock.max-quantum   = 2048
     #default.clock.quantum-limit = 8192
+    #default.clock.quantum-floor = 4
     #default.video.width         = 640
     #default.video.height        = 480
     #default.video.rate.num      = 25
@@ -50,6 +51,8 @@ context.properties = {
     # enables autoloading of access module, when disabled an alternative
     # access module needs to be loaded.
     module.access = true
+    # enables autoloading of module-jackdbus-detect
+    module.jackdbus-detect = true
 }
 
 context.spa-libs = {
@@ -88,19 +91,27 @@ context.modules = [
 
     # Uses realtime scheduling to boost the audio thread priorities. This uses
     # RTKit if the user doesn't have permission to use regular realtime
-    # scheduling.
+    # scheduling. You can also clamp utilisation values to improve scheduling
+    # on embedded and heterogeneous systems, e.g. Arm big.LITTLE devices.
     { name = libpipewire-module-rt
         args = {
             nice.level    = -11
-            #rt.prio      = 88
+            rt.prio       = @rtprio_server@
             #rt.time.soft = -1
             #rt.time.hard = -1
+            #uclamp.min = 0
+            #uclamp.max = 1024
         }
         flags = [ ifexists nofail ]
     }
 
     # The native communication protocol.
-    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-protocol-native
+        args = {
+            # List of server Unix sockets, and optionally permissions
+            #sockets = [ { name = "pipewire-0" }, { name = "pipewire-0-manager" } ]
+        }
+    }
 
     # The profile module. Allows application to access profiler
     # and performance data. It provides an interface that is used
@@ -139,21 +150,12 @@ context.modules = [
     # new clients.
     { name = libpipewire-module-access
         args = {
-            # access.allowed to list an array of paths of allowed
-            # apps.
-            #access.allowed = [
-            #    @session_manager_path@
-            #]
+            # Socket-specific access permissions
+            #access.socket = { pipewire-0 = "default", pipewire-0-manager = "unrestricted" }
 
-            # An array of rejected paths.
-            #access.rejected = [ ]
-
-            # An array of paths with restricted access.
-            #access.restricted = [ ]
-
-            # Anything not in the above lists gets assigned the
-            # access.force permission.
-            #access.force = flatpak
+            # Deprecated legacy mode (not socket-based),
+            # for now enabled by default if access.socket is not specified
+            #access.legacy = true
         }
         condition = [ { module.access = true } ]
     }
@@ -171,13 +173,36 @@ context.modules = [
     # Use libcanberra to play X11 Bell
     { name = libpipewire-module-x11-bell
         args = {
-            #sink.name = "@DEFAULT_SINK@"
+            #sink.name = "\@DEFAULT_SINK\@"
             #sample.name = "bell-window-system"
             #x11.display = null
             #x11.xauthority = null
         }
         flags = [ ifexists nofail ]
         condition = [ { module.x11.bell = true } ]
+    }
+    { name = libpipewire-module-jackdbus-detect
+        args = {
+            #jack.library     = libjack.so.0
+            #jack.server      = null
+            #jack.client-name = PipeWire
+            #jack.connect     = true
+            #tunnel.mode      = duplex  # source|sink|duplex
+            source.props = {
+                #audio.channels = 2
+		#midi.ports = 1
+                #audio.position = [ FL FR ]
+                # extra sink properties
+            }
+            sink.props = {
+                #audio.channels = 2
+		#midi.ports = 1
+                #audio.position = [ FL FR ]
+                # extra sink properties
+            }
+        }
+        flags = [ ifexists nofail ]
+        condition = [ { module.jackdbus-detect = true } ]
     }
 ]
 
@@ -193,14 +218,14 @@ context.objects = [
     # If condition is given, the object is created only when the context properties
     # all match the match rules.
     #
-    #{ factory = spa-node-factory   args = { factory.name = videotestsrc node.name = videotestsrc Spa:Pod:Object:Param:Props:patternType = 1 } }
+    #{ factory = spa-node-factory   args = { factory.name = videotestsrc node.name = videotestsrc node.description = videotestsrc "Spa:Pod:Object:Param:Props:patternType" = 1 } }
     #{ factory = spa-device-factory args = { factory.name = api.jack.device foo=bar } flags = [ nofail ] }
     #{ factory = spa-device-factory args = { factory.name = api.alsa.enum.udev } }
     #{ factory = spa-node-factory   args = { factory.name = api.alsa.seq.bridge node.name = Internal-MIDI-Bridge } }
-    #{ factory = adapter            args = { factory.name = audiotestsrc node.name = my-test } }
+    #{ factory = adapter            args = { factory.name = audiotestsrc node.name = my-test node.description = audiotestsrc } }
     #{ factory = spa-node-factory   args = { factory.name = api.vulkan.compute.source node.name = my-compute-source } }
 
-    # A default dummy driver. This handles nodes marked with the "node.always-driver"
+    # A default dummy driver. This handles nodes marked with the "node.always-process"
     # property when no other driver is currently active. JACK clients need this.
     { factory = spa-node-factory
         args = {
@@ -231,6 +256,7 @@ context.objects = [
     #        node.description = "Microphone"
     #        media.class      = "Audio/Source/Virtual"
     #        audio.position   = "FL,FR"
+    #        monitor.passthrough = true
     #    }
     #}
 

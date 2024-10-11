@@ -27,10 +27,14 @@
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
 
-/** \page page_module_x11_bell PipeWire Module: X11 Bell
+/** \page page_module_x11_bell X11 Bell
  *
  * The `x11-bell` module intercept the X11 bell events and uses libcanberra to
  * play a sound.
+ *
+ * ## Module Name
+ *
+ * `libpipewire-module-x11-bell`
  *
  * ## Module Options
  *
@@ -99,6 +103,11 @@ static int play_sample(struct impl *impl)
 		pw_log_error("canberra context create error: %s", ca_strerror(res));
 		res = -EIO;
 		goto exit;
+	}
+	if ((res = ca_context_set_driver(ca, "pulse")) < 0) {
+		pw_log_error("canberra context set backend error: %s", ca_strerror(res));
+		res = -EIO;
+		goto exit_destroy;
 	}
 	if ((res = ca_context_open(ca)) < 0) {
 		pw_log_error("canberra context open error: %s", ca_strerror(res));
