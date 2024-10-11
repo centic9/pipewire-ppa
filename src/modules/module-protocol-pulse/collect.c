@@ -1,31 +1,14 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <spa/param/props.h>
 #include <spa/pod/builder.h>
 #include <spa/pod/parser.h>
 #include <spa/utils/string.h>
+
+#include <spa/param/audio/format-utils.h>
+
 #include <pipewire/pipewire.h>
 
 #include "collect.h"
@@ -82,16 +65,6 @@ uint32_t id_to_index(struct pw_manager *m, uint32_t id)
 	return SPA_ID_INVALID;
 }
 
-uint32_t index_to_id(struct pw_manager *m, uint32_t index)
-{
-	struct pw_manager_object *o;
-	spa_list_for_each(o, &m->object_list, link) {
-		if (o->index == index)
-			return o->id;
-	}
-	return SPA_ID_INVALID;
-}
-
 bool collect_is_linked(struct pw_manager *m, uint32_t id, enum pw_direction direction)
 {
 	struct pw_manager_object *o;
@@ -112,29 +85,41 @@ bool collect_is_linked(struct pw_manager *m, uint32_t id, enum pw_direction dire
 	return false;
 }
 
+struct pw_manager_object *find_peer_for_link(struct pw_manager *m,
+		struct pw_manager_object *o, uint32_t id, enum pw_direction direction)
+{
+	struct pw_manager_object *p;
+	uint32_t in_node, out_node;
+
+	if (o->props == NULL)
+		return NULL;
+
+	if (pw_properties_fetch_uint32(o->props, PW_KEY_LINK_OUTPUT_NODE, &out_node) != 0 ||
+	    pw_properties_fetch_uint32(o->props, PW_KEY_LINK_INPUT_NODE, &in_node) != 0)
+		return NULL;
+
+	if (direction == PW_DIRECTION_OUTPUT && id == out_node) {
+		struct selector sel = { .id = in_node, .type = pw_manager_object_is_sink, };
+		if ((p = select_object(m, &sel)) != NULL)
+			return p;
+	}
+	if (direction == PW_DIRECTION_INPUT && id == in_node) {
+		struct selector sel = { .id = out_node, .type = pw_manager_object_is_recordable, };
+		if ((p = select_object(m, &sel)) != NULL)
+			return p;
+	}
+	return NULL;
+}
+
 struct pw_manager_object *find_linked(struct pw_manager *m, uint32_t id, enum pw_direction direction)
 {
 	struct pw_manager_object *o, *p;
-	uint32_t in_node, out_node;
 
 	spa_list_for_each(o, &m->object_list, link) {
-		if (o->props == NULL || !pw_manager_object_is_link(o))
+		if (!pw_manager_object_is_link(o))
 			continue;
-
-		if (pw_properties_fetch_uint32(o->props, PW_KEY_LINK_OUTPUT_NODE, &out_node) != 0 ||
-                    pw_properties_fetch_uint32(o->props, PW_KEY_LINK_INPUT_NODE, &in_node) != 0)
-                        continue;
-
-		if (direction == PW_DIRECTION_OUTPUT && id == out_node) {
-			struct selector sel = { .id = in_node, .type = pw_manager_object_is_sink, };
-			if ((p = select_object(m, &sel)) != NULL)
-				return p;
-		}
-		if (direction == PW_DIRECTION_INPUT && id == in_node) {
-			struct selector sel = { .id = out_node, .type = pw_manager_object_is_recordable, };
-			if ((p = select_object(m, &sel)) != NULL)
-				return p;
-		}
+		if ((p = find_peer_for_link(m, o, id, direction)) != NULL)
+			return p;
 	}
 	return NULL;
 }
@@ -244,7 +229,7 @@ uint32_t find_profile_index(struct pw_manager_object *card, const char *name)
 	return SPA_ID_INVALID;
 }
 
-void collect_device_info(struct pw_manager_object *device, struct pw_manager_object *card,
+static void collect_device_info(struct pw_manager_object *device, struct pw_manager_object *card,
 			 struct device_info *dev_info, bool monitor, struct defs *defs)
 {
 	struct pw_manager_param *p;
@@ -303,6 +288,57 @@ void collect_device_info(struct pw_manager_object *device, struct pw_manager_obj
 		dev_info->ss.channels = dev_info->map.channels;
 	if (dev_info->volume_info.volume.channels != dev_info->map.channels)
 		dev_info->volume_info.volume.channels = dev_info->map.channels;
+}
+
+static void update_device_info(struct pw_manager *manager, struct pw_manager_object *o,
+		enum pw_direction direction, bool monitor, struct defs *defs)
+{
+	const char *str;
+	const char *key = monitor ? "device.info.monitor" : "device.info";
+	struct pw_manager_object *card = NULL;
+	struct pw_node_info *info = o->info;
+	struct device_info *dev_info, di;
+
+	if (info == NULL)
+		return;
+
+	di = DEVICE_INFO_INIT(direction);
+	if ((str = spa_dict_lookup(info->props, PW_KEY_DEVICE_ID)) != NULL)
+		di.card_id = (uint32_t)atoi(str);
+	if ((str = spa_dict_lookup(info->props, "card.profile.device")) != NULL)
+		di.device = (uint32_t)atoi(str);
+	if (di.card_id != SPA_ID_INVALID) {
+		struct selector sel = { .id = di.card_id, .type = pw_manager_object_is_card, };
+		card = select_object(manager, &sel);
+	}
+	collect_device_info(o, card, &di, monitor, defs);
+
+	dev_info = pw_manager_object_get_data(o, key);
+	if (dev_info) {
+		if (memcmp(dev_info, &di, sizeof(di)) != 0) {
+			if (monitor || direction == PW_DIRECTION_INPUT)
+				o->change_mask |= PW_MANAGER_OBJECT_FLAG_SOURCE;
+			else
+				o->change_mask |= PW_MANAGER_OBJECT_FLAG_SINK;
+		}
+	} else {
+		o->change_mask = ~0;
+		dev_info = pw_manager_object_add_data(o, key, sizeof(*dev_info));
+	}
+	if (dev_info != NULL)
+		*dev_info = di;
+}
+
+void get_device_info(struct pw_manager_object *o, struct device_info *info,
+		enum pw_direction direction, bool monitor)
+{
+	const char *key = monitor ? "device.info.monitor" : "device.info";
+	struct device_info *di;
+	di = pw_manager_object_get_data(o, key);
+	if (di != NULL)
+		*info = *di;
+	else
+		*info = DEVICE_INFO_INIT(direction);
 }
 
 static bool array_contains(uint32_t *vals, uint32_t n_vals, uint32_t val)
@@ -544,4 +580,22 @@ uint32_t collect_transport_codec_info(struct pw_manager_object *card,
 	}
 
 	return n_codecs;
+}
+
+void update_object_info(struct pw_manager *manager, struct pw_manager_object *o,
+		struct defs *defs)
+{
+	if (pw_manager_object_is_sink(o)) {
+		update_device_info(manager, o, PW_DIRECTION_OUTPUT, false, defs);
+		update_device_info(manager, o, PW_DIRECTION_OUTPUT, true, defs);
+	}
+	if (pw_manager_object_is_source(o)) {
+		update_device_info(manager, o, PW_DIRECTION_INPUT, false, defs);
+	}
+	if (pw_manager_object_is_source_output(o)) {
+		update_device_info(manager, o, PW_DIRECTION_INPUT, false, defs);
+	}
+	if (pw_manager_object_is_sink_input(o)) {
+		update_device_info(manager, o, PW_DIRECTION_OUTPUT, false, defs);
+	}
 }

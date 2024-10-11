@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
 #include <unistd.h>
@@ -45,10 +25,10 @@ struct impl {
 SPA_EXPORT
 uint32_t pw_global_get_permissions(struct pw_global *global, struct pw_impl_client *client)
 {
-	if (client->permission_func == NULL)
-		return PW_PERM_ALL;
-
-	return client->permission_func(global, client, client->permission_data);
+	uint32_t permissions = global->permission_mask;
+	if (client->permission_func != NULL)
+		permissions &= client->permission_func(global, client, client->permission_data);
+	return permissions;
 }
 
 /** Create a new global
@@ -67,6 +47,7 @@ struct pw_global *
 pw_global_new(struct pw_context *context,
 	      const char *type,
 	      uint32_t version,
+	      uint32_t permission_mask,
 	      struct pw_properties *properties,
 	      pw_global_bind_func_t func,
 	      void *object)
@@ -91,6 +72,7 @@ pw_global_new(struct pw_context *context,
 	this->context = context;
 	this->type = type;
 	this->version = version;
+	this->permission_mask = permission_mask;
 	this->func = func;
 	this->object = object;
 	this->properties = properties;
@@ -177,7 +159,7 @@ int pw_global_register(struct pw_global *global)
 			pw_log_debug("impl-client %p: (no registry) global %d %08x serial:%"PRIu64
 					" generation:%"PRIu64, client, global->id, permissions, global->serial,
 					global->generation);
-			pw_core_resource_done(client->core_resource, global->id, 0);
+			pw_core_resource_done(client->core_resource, SPA_ID_INVALID, 0);
 		}
 	}
 

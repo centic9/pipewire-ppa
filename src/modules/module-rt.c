@@ -1,126 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
-
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-#include <stdio.h>
-#include <errno.h>
-#include <sys/stat.h>
-#ifdef __FreeBSD__
-#include <sys/thr.h>
-#endif
-#include <fcntl.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <sys/resource.h>
-
-#include "config.h"
-
-#include <spa/support/dbus.h>
-#include <spa/utils/result.h>
-#include <spa/utils/string.h>
-
-#include <pipewire/impl.h>
-#include <pipewire/thread.h>
-
-/** \page page_module_rt PipeWire Module: RT
- *
- * The `rt` module uses the operating system's scheduler to enable realtime
- * scheduling for certain threads to assist with low latency audio processing.
- * This requires `RLIMIT_RTPRIO` to be set to a value that's equal to this
- * module's `rt.prio` parameter or higher. Most distros will come with some
- * package that configures this for certain groups or users. If this is not set
- * up and DBus is available, then this module will fall back to using RTKit.
- */
-
-#define NAME "rt"
-
-PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
-#define PW_LOG_TOPIC_DEFAULT mod_topic
-
-#define REALTIME_POLICY         SCHED_FIFO
-#ifdef SCHED_RESET_ON_FORK
-#define PW_SCHED_RESET_ON_FORK  SCHED_RESET_ON_FORK
-#else
-/* FreeBSD compat */
-#define PW_SCHED_RESET_ON_FORK  0
-#endif
-
-#define IS_VALID_NICE_LEVEL(l)	((l)>=-20 && (l)<=19)
-
-#define DEFAULT_NICE_LEVEL      20
-#define DEFAULT_RT_PRIO		88
-#define DEFAULT_RT_TIME_SOFT	-1
-#define DEFAULT_RT_TIME_HARD	-1
-
-#define MODULE_USAGE	"[nice.level=<priority: default "SPA_STRINGIFY(DEFAULT_NICE_LEVEL)"(don't change)>] "	\
-			"[rt.prio=<priority: default "SPA_STRINGIFY(DEFAULT_RT_PRIO)">] "		\
-			"[rt.time.soft=<in usec: default "SPA_STRINGIFY(DEFAULT_RT_TIME_SOFT)"] "	\
-			"[rt.time.hard=<in usec: default "SPA_STRINGIFY(DEFAULT_RT_TIME_HARD)"] "
-
-static const struct spa_dict_item module_props[] = {
-	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
-	{ PW_KEY_MODULE_DESCRIPTION, "Use realtime thread scheduling, falling back to RTKit" },
-	{ PW_KEY_MODULE_USAGE, MODULE_USAGE },
-	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
-};
-
-struct pw_rtkit_bus;
-
-struct thread {
-	struct impl *impl;
-	struct spa_list link;
-	pthread_t thread;
-	pid_t pid;
-	void *(*start)(void*);
-	void *arg;
-};
-
-struct impl {
-	struct pw_context *context;
-
-	struct spa_thread_utils thread_utils;
-
-	int nice_level;
-	int rt_prio;
-	rlim_t rt_time_soft;
-	rlim_t rt_time_hard;
-
-	struct spa_hook module_listener;
-
-	bool use_rtkit;
-	struct pw_rtkit_bus *system_bus;
-
-	/* These are only for the RTKit implementation to fill in the `thread`
-	 * struct. Since there's barely any overhead here we'll do this
-	 * regardless of which backend is used. */
-	pthread_mutex_t lock;
-	pthread_cond_t cond;
-	struct spa_list threads_list;
-};
-
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2022 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 /***
   Copyright 2009 Lennart Poettering
   Copyright 2010 David Henningsson <diwic@ubuntu.com>
@@ -146,18 +26,131 @@ struct impl {
   SOFTWARE.
 ***/
 
-#include <dbus/dbus.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/stat.h>
+#if defined(__FreeBSD__) || defined(__MidnightBSD__)
+#include <sys/thr.h>
+#endif
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 
 #include "config.h"
 
-#include <sys/syscall.h>
+#include <spa/utils/result.h>
+#include <spa/utils/string.h>
 
+#include <pipewire/impl.h>
+#include <pipewire/thread.h>
+
+#ifdef HAVE_DBUS
+#include <spa/support/dbus.h>
+#include <dbus/dbus.h>
+#endif
+
+/** \page page_module_rt PipeWire Module: RT
+ *
+ * The `rt` modules can give real-time priorities to processing threads.
+ *
+ * It uses the operating system's scheduler to enable realtime scheduling
+ * for certain threads to assist with low latency audio processing.
+ * This requires `RLIMIT_RTPRIO` to be set to a value that's equal to this
+ * module's `rt.prio` parameter or higher. Most distros will come with some
+ * package that configures this for certain groups or users. If this is not set
+ * up and DBus is available, then this module will fall back to using the Portal
+ * Realtime DBus API or RTKit.
+ *
+ * ## Module Options
+ *
+ * - `nice.level`: The nice value set for the application thread. It improves
+ *                 performance of the communication with the pipewire daemon.
+ * - `rt.prio`: The realtime priority of the data thread. Higher values are
+ *              higher priority.
+ * - `rt.time.soft`, `rt.time.hard`: The amount of CPU time an RT thread can
+ *              consume without doing any blocking calls before the kernel kills
+ *              the thread. This is a safety measure to avoid lockups of the complete
+ *              system when some thread consumes 100%.
+ * - `rlimits.enabled`: enable the use of rtlimits, default true.
+ * - `rtportal.enabled`: enable the use of realtime portal, default true
+ * - `rtkit.enabled`: enable the use of rtkit, default true
+
+ * The nice level is by default set to an invalid value so that clients don't
+ * automatically have the nice level raised.
+ *
+ * The PipeWire server processes are explicitly configured with a valid nice level.
+ *
+ * ## Example configuration
+ *
+ *\code{.unparsed}
+ * context.modules = [
+ * {   name = libpipewire-module-rt
+ *     args = {
+ *         #nice.level   = 20
+ *         #rt.prio      = 88
+ *         #rt.time.soft = -1
+ *         #rt.time.hard = -1
+ *         #rlimits.enabled = true
+ *         #rtportal.enabled = true
+ *         #rtkit.enabled = true
+ *     }
+ *     flags = [ ifexists nofail ]
+ * }
+ * ]
+ *\endcode
+ */
+
+#define NAME "rt"
+
+PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+#define PW_LOG_TOPIC_DEFAULT mod_topic
+
+#define REALTIME_POLICY         SCHED_FIFO
+#ifdef SCHED_RESET_ON_FORK
+#define PW_SCHED_RESET_ON_FORK  SCHED_RESET_ON_FORK
+#else
+/* FreeBSD compat */
+#define PW_SCHED_RESET_ON_FORK  0
+#endif
+
+#define MIN_NICE_LEVEL		-20
+#define MAX_NICE_LEVEL		19
+#define IS_VALID_NICE_LEVEL(l)	((l)>=MIN_NICE_LEVEL && (l)<=MAX_NICE_LEVEL)
+
+#define DEFAULT_NICE_LEVEL	20 	/* invalid value by default, see above */
+#define DEFAULT_RT_PRIO_MIN	11
+#define DEFAULT_RT_PRIO		88
+#define DEFAULT_RT_TIME_SOFT	-1
+#define DEFAULT_RT_TIME_HARD	-1
+
+#define MODULE_USAGE	"( nice.level=<priority: default "SPA_STRINGIFY(DEFAULT_NICE_LEVEL)"(don't change)> ) "	\
+			"( rt.prio=<priority: default "SPA_STRINGIFY(DEFAULT_RT_PRIO)"> ) "		\
+			"( rt.time.soft=<in usec: default "SPA_STRINGIFY(DEFAULT_RT_TIME_SOFT)"> ) "	\
+			"( rt.time.hard=<in usec: default "SPA_STRINGIFY(DEFAULT_RT_TIME_HARD)"> ) "	\
+			"( rlimits.enabled=<default true> ) " \
+			"( rtportal.enabled=<default true> ) " \
+			"( rtkit.enabled=<default true> ) "
+
+static const struct spa_dict_item module_props[] = {
+	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
+	{ PW_KEY_MODULE_DESCRIPTION, "Use realtime thread scheduling, falling back to RTKit" },
+	{ PW_KEY_MODULE_USAGE, MODULE_USAGE },
+	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
+};
+
+#ifdef HAVE_DBUS
 #define RTKIT_SERVICE_NAME "org.freedesktop.RealtimeKit1"
 #define RTKIT_OBJECT_PATH "/org/freedesktop/RealtimeKit1"
+#define RTKIT_INTERFACE "org.freedesktop.RealtimeKit1"
 
-#ifndef RLIMIT_RTTIME
-#define RLIMIT_RTTIME 15
-#endif
+#define XDG_PORTAL_SERVICE_NAME "org.freedesktop.portal.Desktop"
+#define XDG_PORTAL_OBJECT_PATH "/org/freedesktop/portal/desktop"
+#define XDG_PORTAL_INTERFACE "org.freedesktop.portal.Realtime"
 
 /** \cond */
 struct pw_rtkit_bus {
@@ -165,7 +158,76 @@ struct pw_rtkit_bus {
 };
 /** \endcond */
 
-struct pw_rtkit_bus *pw_rtkit_bus_get_system(void)
+struct thread {
+	struct impl *impl;
+	struct spa_list link;
+	pthread_t thread;
+	pid_t pid;
+	void *(*start)(void*);
+	void *arg;
+};
+#endif /* HAVE_DBUS */
+
+struct impl {
+	struct pw_context *context;
+
+	struct spa_thread_utils thread_utils;
+
+	pid_t main_pid;
+	struct rlimit rl;
+	int nice_level;
+	int rt_prio;
+	rlim_t rt_time_soft;
+	rlim_t rt_time_hard;
+
+	struct spa_hook module_listener;
+
+	unsigned rlimits_enabled:1;
+	unsigned rtportal_enabled:1;
+	unsigned rtkit_enabled:1;
+
+#ifdef HAVE_DBUS
+	bool use_rtkit;
+	/* For D-Bus. These are const static. */
+	const char* service_name;
+	const char* object_path;
+	const char* interface;
+	struct pw_rtkit_bus *rtkit_bus;
+	struct pw_thread_loop *thread_loop;
+	int max_rtprio;
+	int min_nice_level;
+	rlim_t rttime_max;
+
+	/* These are only for the RTKit implementation to fill in the `thread`
+	 * struct. Since there's barely any overhead here we'll do this
+	 * regardless of which backend is used. */
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	struct spa_list threads_list;
+#endif
+};
+
+#ifndef RLIMIT_RTTIME
+#define RLIMIT_RTTIME 15
+#endif
+
+static pid_t _gettid(void)
+{
+#if defined(HAVE_GETTID)
+	return (pid_t) gettid();
+#elif defined(__linux__)
+	return syscall(SYS_gettid);
+#elif defined(__FreeBSD__) || defined(__MidnightBSD__)
+	long pid;
+	thr_self(&pid);
+	return (pid_t)pid;
+#else
+#error "No gettid impl"
+#endif
+}
+
+#ifdef HAVE_DBUS
+static struct pw_rtkit_bus *pw_rtkit_bus_get(DBusBusType bus_type)
 {
 	struct pw_rtkit_bus *bus;
 	DBusError error;
@@ -181,7 +243,7 @@ struct pw_rtkit_bus *pw_rtkit_bus_get_system(void)
 	if (bus == NULL)
 		return NULL;
 
-	bus->bus = dbus_bus_get_private(DBUS_BUS_SYSTEM, &error);
+	bus->bus = dbus_bus_get_private(bus_type, &error);
 	if (bus->bus == NULL)
 		goto error;
 
@@ -191,32 +253,38 @@ struct pw_rtkit_bus *pw_rtkit_bus_get_system(void)
 
 error:
 	free(bus);
-	pw_log_error("Failed to connect to system bus: %s", error.message);
+	pw_log_error("Failed to connect to %s bus: %s",
+		     bus_type == DBUS_BUS_SYSTEM ? "system" : "session", error.message);
 	dbus_error_free(&error);
 	errno = ECONNREFUSED;
 	return NULL;
 }
 
-void pw_rtkit_bus_free(struct pw_rtkit_bus *system_bus)
+static struct pw_rtkit_bus *pw_rtkit_bus_get_system(void)
+{
+	return pw_rtkit_bus_get(DBUS_BUS_SYSTEM);
+}
+
+static struct pw_rtkit_bus *pw_rtkit_bus_get_session(void)
+{
+	return pw_rtkit_bus_get(DBUS_BUS_SESSION);
+}
+
+static bool pw_rtkit_check_xdg_portal(struct pw_rtkit_bus *system_bus)
+{
+	if (!dbus_bus_name_has_owner(system_bus->bus, XDG_PORTAL_SERVICE_NAME, NULL)) {
+		pw_log_info("Can't find %s. Is xdg-desktop-portal running?", XDG_PORTAL_SERVICE_NAME);
+		return false;
+	}
+
+	return true;
+}
+
+static void pw_rtkit_bus_free(struct pw_rtkit_bus *system_bus)
 {
 	dbus_connection_close(system_bus->bus);
 	dbus_connection_unref(system_bus->bus);
 	free(system_bus);
-}
-
-static pid_t _gettid(void)
-{
-#if defined(HAVE_GETTID)
-	return (pid_t) gettid();
-#elif defined(__linux__)
-	return syscall(SYS_gettid);
-#elif defined(__FreeBSD__)
-	long pid;
-	thr_self(&pid);
-	return (pid_t)pid;
-#else
-#error "No gettid impl"
-#endif
 }
 
 static int translate_error(const char *name)
@@ -231,11 +299,18 @@ static int translate_error(const char *name)
 	if (spa_streq(name, DBUS_ERROR_ACCESS_DENIED) ||
 	    spa_streq(name, DBUS_ERROR_AUTH_FAILED))
 		return -EACCES;
-
+	if (spa_streq(name, DBUS_ERROR_IO_ERROR))
+		return -EIO;
+	if (spa_streq(name, DBUS_ERROR_NOT_SUPPORTED))
+		return -ENOTSUP;
+	if (spa_streq(name, DBUS_ERROR_INVALID_ARGS))
+		return -EINVAL;
+	if (spa_streq(name, DBUS_ERROR_TIMED_OUT))
+		return -ETIMEDOUT;
 	return -EIO;
 }
 
-static long long rtkit_get_int_property(struct pw_rtkit_bus *connection, const char *propname,
+static long long rtkit_get_int_property(struct impl *impl, const char *propname,
 					long long *propval)
 {
 	DBusMessage *m = NULL, *r = NULL;
@@ -245,19 +320,19 @@ static long long rtkit_get_int_property(struct pw_rtkit_bus *connection, const c
 	DBusError error;
 	int current_type;
 	long long ret;
-	const char *interfacestr = "org.freedesktop.RealtimeKit1";
+	struct pw_rtkit_bus *connection = impl->rtkit_bus;
 
 	dbus_error_init(&error);
 
-	if (!(m = dbus_message_new_method_call(RTKIT_SERVICE_NAME,
-					       RTKIT_OBJECT_PATH,
+	if (!(m = dbus_message_new_method_call(impl->service_name,
+					       impl->object_path,
 					       "org.freedesktop.DBus.Properties", "Get"))) {
 		ret = -ENOMEM;
 		goto finish;
 	}
 
 	if (!dbus_message_append_args(m,
-				      DBUS_TYPE_STRING, &interfacestr,
+				      DBUS_TYPE_STRING, &impl->interface,
 				      DBUS_TYPE_STRING, &propname, DBUS_TYPE_INVALID)) {
 		ret = -ENOMEM;
 		goto finish;
@@ -314,77 +389,44 @@ finish:
 	return ret;
 }
 
-int pw_rtkit_get_max_realtime_priority(struct pw_rtkit_bus *connection)
+static int pw_rtkit_make_realtime(struct impl *impl, pid_t thread, int priority)
 {
-	long long retval;
-	int err;
-
-	err = rtkit_get_int_property(connection, "MaxRealtimePriority", &retval);
-	return err < 0 ? err : retval;
-}
-
-int pw_rtkit_get_min_nice_level(struct pw_rtkit_bus *connection, int *min_nice_level)
-{
-	long long retval;
-	int err;
-
-	err = rtkit_get_int_property(connection, "MinNiceLevel", &retval);
-	if (err >= 0)
-		*min_nice_level = retval;
-	return err;
-}
-
-long long pw_rtkit_get_rttime_usec_max(struct pw_rtkit_bus *connection)
-{
-	long long retval;
-	int err;
-
-	err = rtkit_get_int_property(connection, "RTTimeUSecMax", &retval);
-	return err < 0 ? err : retval;
-}
-
-int pw_rtkit_make_realtime(struct pw_rtkit_bus *connection, pid_t thread, int priority)
-{
-	DBusMessage *m = NULL, *r = NULL;
+	DBusMessage *m = NULL;
+	dbus_uint64_t pid;
 	dbus_uint64_t u64;
-	dbus_uint32_t u32;
+	dbus_uint32_t u32, serial;
 	DBusError error;
 	int ret;
+	struct pw_rtkit_bus *connection = impl->rtkit_bus;
 
 	dbus_error_init(&error);
 
 	if (thread == 0)
 		thread = _gettid();
 
-	if (!(m = dbus_message_new_method_call(RTKIT_SERVICE_NAME,
-					       RTKIT_OBJECT_PATH,
-					       "org.freedesktop.RealtimeKit1",
-					       "MakeThreadRealtime"))) {
+	if (!(m = dbus_message_new_method_call(impl->service_name,
+					       impl->object_path, impl->interface,
+					       "MakeThreadRealtimeWithPID"))) {
 		ret = -ENOMEM;
 		goto finish;
 	}
 
+	pid = (dbus_uint64_t) getpid();
 	u64 = (dbus_uint64_t) thread;
 	u32 = (dbus_uint32_t) priority;
 
 	if (!dbus_message_append_args(m,
+				      DBUS_TYPE_UINT64, &pid,
 				      DBUS_TYPE_UINT64, &u64,
 				      DBUS_TYPE_UINT32, &u32, DBUS_TYPE_INVALID)) {
 		ret = -ENOMEM;
 		goto finish;
 	}
 
-	if (!(r = dbus_connection_send_with_reply_and_block(connection->bus, m, -1, &error))) {
+	if (!dbus_connection_send(connection->bus, m, &serial)) {
 		ret = translate_error(error.name);
 		goto finish;
 	}
-
-
-	if (dbus_set_error_from_message(&error, r)) {
-		ret = translate_error(error.name);
-		goto finish;
-	}
-
 	ret = 0;
 
 finish:
@@ -392,58 +434,45 @@ finish:
 	if (m)
 		dbus_message_unref(m);
 
-	if (r)
-		dbus_message_unref(r);
-
-	dbus_error_free(&error);
-
 	return ret;
 }
 
-int pw_rtkit_make_high_priority(struct pw_rtkit_bus *connection, pid_t thread, int nice_level)
+
+static int pw_rtkit_make_high_priority(struct impl *impl, pid_t thread, int nice_level)
 {
-	DBusMessage *m = NULL, *r = NULL;
+	DBusMessage *m = NULL;
+	dbus_uint64_t pid;
 	dbus_uint64_t u64;
 	dbus_int32_t s32;
-	DBusError error;
+	dbus_uint32_t serial;
 	int ret;
-
-	dbus_error_init(&error);
+	struct pw_rtkit_bus *connection = impl->rtkit_bus;
 
 	if (thread == 0)
 		thread = _gettid();
 
-	if (!(m = dbus_message_new_method_call(RTKIT_SERVICE_NAME,
-					       RTKIT_OBJECT_PATH,
-					       "org.freedesktop.RealtimeKit1",
-					       "MakeThreadHighPriority"))) {
+	if (!(m = dbus_message_new_method_call(impl->service_name,
+					       impl->object_path, impl->interface,
+					       "MakeThreadHighPriorityWithPID"))) {
 		ret = -ENOMEM;
 		goto finish;
 	}
 
+	pid = (dbus_uint64_t) getpid();
 	u64 = (dbus_uint64_t) thread;
 	s32 = (dbus_int32_t) nice_level;
 
 	if (!dbus_message_append_args(m,
+				      DBUS_TYPE_UINT64, &pid,
 				      DBUS_TYPE_UINT64, &u64,
 				      DBUS_TYPE_INT32, &s32, DBUS_TYPE_INVALID)) {
 		ret = -ENOMEM;
 		goto finish;
 	}
-
-
-
-	if (!(r = dbus_connection_send_with_reply_and_block(connection->bus, m, -1, &error))) {
-		ret = translate_error(error.name);
+	if (!dbus_connection_send(connection->bus, m, &serial)) {
+		ret = -EIO;
 		goto finish;
 	}
-
-
-	if (dbus_set_error_from_message(&error, r)) {
-		ret = translate_error(error.name);
-		goto finish;
-	}
-
 	ret = 0;
 
 finish:
@@ -451,23 +480,23 @@ finish:
 	if (m)
 		dbus_message_unref(m);
 
-	if (r)
-		dbus_message_unref(r);
-
-	dbus_error_free(&error);
-
 	return ret;
 }
+#endif /* HAVE_DBUS */
 
 static void module_destroy(void *data)
 {
 	struct impl *impl = data;
-
-	pw_thread_utils_set(NULL);
+	pw_context_set_object(impl->context, SPA_TYPE_INTERFACE_ThreadUtils, NULL);
 	spa_hook_remove(&impl->module_listener);
 
-	if (impl->system_bus)
-		pw_rtkit_bus_free(impl->system_bus);
+#ifdef HAVE_DBUS
+	if (impl->thread_loop)
+		pw_thread_loop_destroy(impl->thread_loop);
+	if (impl->rtkit_bus)
+		pw_rtkit_bus_free(impl->rtkit_bus);
+#endif
+
 	free(impl);
 }
 
@@ -476,108 +505,190 @@ static const struct pw_impl_module_events module_events = {
 	.destroy = module_destroy,
 };
 
+static int get_rt_priority_range(int *out_min, int *out_max)
+{
+	int min, max;
+
+	if ((min = sched_get_priority_min(REALTIME_POLICY)) < 0)
+		return -errno;
+	if ((max = sched_get_priority_max(REALTIME_POLICY)) < 0)
+		return -errno;
+
+	if (out_min)
+		*out_min = min;
+	if (out_max)
+		*out_max = max;
+
+	return 0;
+}
 /**
  * Check if the current user has permissions to use realtime scheduling at the
  * specified priority.
  */
-static bool check_realtime_priviliges(rlim_t priority)
+static bool check_realtime_privileges(struct impl *impl)
 {
-	int old_policy;
+	rlim_t priority = impl->rt_prio;
+	int err, old_policy, new_policy, min, max;
 	struct sched_param old_sched_params;
-	int new_policy = REALTIME_POLICY;
 	struct sched_param new_sched_params;
+	int try = 0;
 
-	/* We could check `RLIMIT_RTPRIO`, but the BSDs generally don't have
-	 * that available, and there are also other ways to use realtime
-	 * scheduling without that rlimit being set such as `CAP_SYS_NICE` or
-	 * running as root. Instead of checking a bunch of preconditions, we
-	 * just try if setting realtime scheduling works or not. */
-	if ((old_policy = sched_getscheduler(0)) < 0 ||
-	    sched_getparam(0, &old_sched_params) != 0) {
+	if (!impl->rlimits_enabled)
 		return false;
-	}
 
-	/* If the current scheduling policy has `SCHED_RESET_ON_FORK` set, then
-	 * this also needs to be set here or `sched_setscheduler()` will return
-	 * an error code. Similarly, if it is not set, then we don't want to set
-	 * it here as it would irreversible change the current thread's
-	 * scheduling policy. */
-	spa_zero(new_sched_params);
-	new_sched_params.sched_priority = priority;
-	if ((old_policy & PW_SCHED_RESET_ON_FORK) != 0) {
-		new_policy |= PW_SCHED_RESET_ON_FORK;
-	}
+	while (try++ < 2) {
+		/* We could check `RLIMIT_RTPRIO`, but the BSDs generally don't have
+		 * that available, and there are also other ways to use realtime
+		 * scheduling without that rlimit being set such as `CAP_SYS_NICE` or
+		 * running as root. Instead of checking a bunch of preconditions, we
+		 * just try if setting realtime scheduling works or not. */
+		if ((err = pthread_getschedparam(pthread_self(), &old_policy, &old_sched_params)) != 0) {
+			pw_log_warn("Failed to check RLIMIT_RTPRIO: %s", strerror(err));
+			return false;
+		}
+		if ((err = get_rt_priority_range(&min, &max)) < 0) {
+			pw_log_warn("Failed to get priority range: %s", strerror(err));
+			return false;
+		}
+		if (try == 2) {
+#ifdef RLIMIT_RTPRIO
+			struct rlimit rlim;
+			/* second try, try to clamp to RLIMIT_RTPRIO */
+			if (getrlimit(RLIMIT_RTPRIO, &rlim) == 0 && max > (int)rlim.rlim_max) {
+				pw_log_info("Clamp rtprio %d to %d", (int)priority, (int)rlim.rlim_max);
+				max = (int)rlim.rlim_max;
+			}
+			else
+#endif
+				break;
+		}
+		if (max < DEFAULT_RT_PRIO_MIN) {
+			pw_log_info("Priority max (%d) must be at least %d", max, DEFAULT_RT_PRIO_MIN);
+			return false;
+		}
 
-	if (sched_setscheduler(0, new_policy, &new_sched_params) == 0) {
-		sched_setscheduler(0, old_policy, &old_sched_params);
-		return true;
-	} else {
-		return false;
+		/* If the current scheduling policy has `SCHED_RESET_ON_FORK` set, then
+		 * this also needs to be set here or `pthread_setschedparam()` will return
+		 * an error code. Similarly, if it is not set, then we don't want to set
+		 * it here as it would irreversible change the current thread's
+		 * scheduling policy. */
+		spa_zero(new_sched_params);
+		new_sched_params.sched_priority = SPA_CLAMP((int)priority, min, max);
+		new_policy = REALTIME_POLICY;
+		if ((old_policy & PW_SCHED_RESET_ON_FORK) != 0)
+			new_policy |= PW_SCHED_RESET_ON_FORK;
+
+		if (pthread_setschedparam(pthread_self(), new_policy, &new_sched_params) == 0) {
+			impl->rt_prio = new_sched_params.sched_priority;
+			pthread_setschedparam(pthread_self(), old_policy, &old_sched_params);
+			return true;
+		}
 	}
+	pw_log_info("Can't set rt prio to %d: %m (try increasing rlimits)", (int)priority);
+	return false;
 }
 
-static int set_nice(struct impl *impl, int nice_level)
+static int sched_set_nice(pid_t pid, int nice_level)
+{
+	if (setpriority(PRIO_PROCESS, pid, nice_level) == 0)
+		return 0;
+	else
+		return -errno;
+}
+
+static int set_nice(struct impl *impl, int nice_level, bool warn)
 {
 	int res = 0;
-	pid_t tid;
 
+#ifdef HAVE_DBUS
 	if (impl->use_rtkit) {
-		if ((res = pw_rtkit_make_high_priority(impl->system_bus, 0, nice_level)) < 0) {
-			pw_log_warn("could not set nice-level to %d: %s",
-					nice_level, spa_strerror(res));
-		} else {
-			pw_log_info("main thread nice level set to %d", nice_level);
+		if (nice_level < impl->min_nice_level) {
+			pw_log_info("clamped nice level %d to %d",
+					nice_level, impl->min_nice_level);
+			nice_level = impl->min_nice_level;
 		}
-	} else {
-		tid = _gettid();
-		if (setpriority(PRIO_PROCESS, tid, nice_level) == 0) {
-			pw_log_info("main thread nice level set to %d",
-					nice_level);
-		} else {
-			res = -errno;
-			pw_log_warn("could not set nice-level to %d: %s",
-					nice_level, spa_strerror(res));
-		}
+		res = pw_rtkit_make_high_priority(impl, impl->main_pid, nice_level);
 	}
+	else
+#endif
+	if (impl->rlimits_enabled)
+		res = sched_set_nice(impl->main_pid, nice_level);
+	else
+		res = -ENOTSUP;
 
+	if (res < 0) {
+		if (warn)
+			pw_log_warn("could not set nice-level to %d: %s",
+					nice_level, spa_strerror(res));
+	} else if (res > 0) {
+		pw_log_info("main thread setting nice level to %d: %s",
+				nice_level, spa_strerror(-res));
+	} else {
+		pw_log_info("main thread nice level set to %d",
+				nice_level);
+	}
 	return res;
 }
 
 static int set_rlimit(struct impl *impl)
 {
-	struct rlimit rl;
-	long long rttime;
 	int res = 0;
 
-	spa_zero(rl);
-	rl.rlim_cur = impl->rt_time_soft;
-	rl.rlim_max = impl->rt_time_hard;
-
-	if (impl->use_rtkit) {
-		rttime = pw_rtkit_get_rttime_usec_max(impl->system_bus);
-		if (rttime >= 0) {
-			if ((rlim_t)rttime < rl.rlim_cur) {
-				pw_log_debug("clamping rt.time.soft from %ld to %lld because of RTKit",
-					     rl.rlim_cur, rttime);
-			}
-
-			rl.rlim_cur = SPA_MIN(rl.rlim_cur, (rlim_t)rttime);
-			rl.rlim_max = SPA_MIN(rl.rlim_max, (rlim_t)rttime);
-		}
-	}
-
-	if (setrlimit(RLIMIT_RTTIME, &rl) < 0)
+	if (setrlimit(RLIMIT_RTTIME, &impl->rl) < 0)
 		res = -errno;
 
 	if (res < 0)
 		pw_log_debug("setrlimit() failed: %s", spa_strerror(res));
 	else
 		pw_log_debug("rt.time.soft:%"PRIi64" rt.time.hard:%"PRIi64,
-				(int64_t)rl.rlim_cur, (int64_t)rl.rlim_max);
+				(int64_t)impl->rl.rlim_cur, (int64_t)impl->rl.rlim_max);
 
 	return res;
 }
 
+static int acquire_rt_sched(struct spa_thread *thread, int priority)
+{
+	int err, min, max;
+	struct sched_param sp;
+	pthread_t pt = (pthread_t)thread;
+
+	if ((err = get_rt_priority_range(&min, &max)) < 0)
+		return err;
+
+	if (priority < min || priority > max) {
+		pw_log_info("clamping priority %d to range %d - %d for policy %d",
+				priority, min, max, REALTIME_POLICY);
+		priority = SPA_CLAMP(priority, min, max);
+	}
+
+	spa_zero(sp);
+	sp.sched_priority = priority;
+	if ((err = pthread_setschedparam(pt, REALTIME_POLICY | PW_SCHED_RESET_ON_FORK, &sp)) != 0) {
+		pw_log_warn("could not make thread %p realtime: %s", thread, strerror(err));
+		return -err;
+	}
+
+	pw_log_info("acquired realtime priority %d for thread %p", priority, thread);
+	return 0;
+}
+
+static int impl_drop_rt_generic(void *object, struct spa_thread *thread)
+{
+	struct sched_param sp;
+	pthread_t pt = (pthread_t)thread;
+	int err;
+
+	spa_zero(sp);
+	if ((err = pthread_setschedparam(pt, SCHED_OTHER | PW_SCHED_RESET_ON_FORK, &sp)) != 0) {
+		pw_log_debug("thread %p: SCHED_OTHER|SCHED_RESET_ON_FORK failed: %s",
+				thread, strerror(err));
+		return -err;
+	}
+	pw_log_info("thread %p dropped realtime priority", thread);
+	return 0;
+}
+
+#ifdef HAVE_DBUS
 static struct thread *find_thread_by_pt(struct impl *impl, pthread_t pt)
 {
 	struct thread *t;
@@ -602,12 +713,12 @@ static void *custom_start(void *data)
 	return this->start(this->arg);
 }
 
-static struct spa_thread *impl_create(void *data, const struct spa_dict *props,
+static struct spa_thread *impl_create(void *object, const struct spa_dict *props,
 		void *(*start_routine)(void*), void *arg)
 {
-	struct impl *impl = data;
+	struct impl *impl = object;
 	struct thread *this;
-	int err;
+	struct spa_thread *thread;
 
 	this = calloc(1, sizeof(*this));
 	this->impl = impl;
@@ -616,27 +727,27 @@ static struct spa_thread *impl_create(void *data, const struct spa_dict *props,
 
 	/* This thread list is only used for the RTKit implementation */
 	pthread_mutex_lock(&impl->lock);
-	err = pthread_create(&this->thread, NULL, custom_start, this);
-	if (err != 0)
+	thread = pw_thread_utils_create(props, custom_start, this);
+	if (thread == NULL)
 		goto exit;
 
+	this->thread = (pthread_t)thread;
 	pthread_cond_wait(&impl->cond, &impl->lock);
 
 	spa_list_append(&impl->threads_list, &this->link);
 exit:
 	pthread_mutex_unlock(&impl->lock);
 
-	if (err != 0) {
-		errno = err;
+	if (thread == NULL) {
 		free(this);
 		return NULL;
 	}
-	return (struct spa_thread*)this->thread;
+	return thread;
 }
 
-static int impl_join(void *data, struct spa_thread *thread, void **retval)
+static int impl_join(void *object, struct spa_thread *thread, void **retval)
 {
-	struct impl *impl = data;
+	struct impl *impl = object;
 	pthread_t pt = (pthread_t)thread;
 	struct thread *thr;
 
@@ -650,106 +761,100 @@ static int impl_join(void *data, struct spa_thread *thread, void **retval)
 	return pthread_join(pt, retval);
 }
 
-static int impl_get_rt_range(void *data, const struct spa_dict *props,
-		int *min, int *max)
-{
-	struct impl *impl = data;
-	if (impl->use_rtkit) {
-		if (min)
-			*min = 1;
-		if (max)
-			*max = pw_rtkit_get_max_realtime_priority(impl->system_bus);
-	} else {
-		if (min)
-			*min = sched_get_priority_min(REALTIME_POLICY);
-		if (max)
-			*max = sched_get_priority_max(REALTIME_POLICY);
-	}
 
+static int get_rtkit_priority_range(struct impl *impl, int *min, int *max)
+{
+	if (min)
+		*min = 1;
+	if (max) {
+		*max = impl->max_rtprio;
+		if (*max < 1)
+			*max = 1;
+	}
 	return 0;
 }
 
-static pid_t impl_gettid(struct impl *impl, pthread_t pt)
+static int impl_get_rt_range(void *object, const struct spa_dict *props,
+		int *min, int *max)
 {
-	struct thread *thr;
-	pid_t pid;
-
-	pthread_mutex_lock(&impl->lock);
-	if ((thr = find_thread_by_pt(impl, pt)) != NULL)
-		pid = thr->pid;
+	struct impl *impl = object;
+	int res;
+	if (impl->use_rtkit)
+		res = get_rtkit_priority_range(impl, min, max);
 	else
-		pid = _gettid();
-	pthread_mutex_unlock(&impl->lock);
-
-	return pid;
+		res = get_rt_priority_range(min, max);
+	return res;
 }
 
-static int impl_acquire_rt(void *data, struct spa_thread *thread, int priority)
-{
-	struct impl *impl = data;
-	struct sched_param sp;
-	int err, rtprio_limit;
-	pthread_t pt = (pthread_t)thread;
+struct rt_params {
 	pid_t pid;
+	int priority;
+};
+
+static int do_make_realtime(struct spa_loop *loop, bool async, uint32_t seq,
+		const void *data, size_t size, void *user_data)
+{
+	struct impl *impl = user_data;
+	const struct rt_params *params = data;
+	int err, min, max, priority = params->priority;
+	pid_t pid = params->pid;
+
+	pw_log_debug("rtkit realtime");
+
+	if ((err = get_rtkit_priority_range(impl, &min, &max)) < 0)
+		return err;
+
+	if (priority < min || priority > max) {
+		pw_log_info("clamping requested priority %d for thread %d "
+				"between %d  and %d", priority, pid, min, max);
+		priority = SPA_CLAMP(priority, min, max);
+	}
+
+	if ((err = pw_rtkit_make_realtime(impl, pid, priority)) < 0) {
+		pw_log_warn("could not make thread %d realtime using RTKit: %s", pid, spa_strerror(err));
+		return err;
+	}
+
+	pw_log_info("acquired realtime priority %d for thread %d using RTKit", priority, pid);
+	return 0;
+}
+
+static int impl_acquire_rt(void *object, struct spa_thread *thread, int priority)
+{
+	struct impl *impl = object;
+	struct sched_param sp;
+	pthread_t pt = (pthread_t)thread;
+	int res;
 
 	/* See the docstring on `spa_thread_utils_methods::acquire_rt` */
 	if (priority == -1) {
 		priority = impl->rt_prio;
 	}
-
 	if (impl->use_rtkit) {
-		pid = impl_gettid(impl, pt);
-		rtprio_limit = pw_rtkit_get_max_realtime_priority(impl->system_bus);
-		if (rtprio_limit >= 0 && rtprio_limit < priority) {
-			pw_log_info("dropping requested priority %d for thread %d down to %d because of RTKit limits", priority, pid, rtprio_limit);
-			priority = rtprio_limit;
-		}
+		struct rt_params params;
+		struct thread *thr;
 
 		spa_zero(sp);
-		sp.sched_priority = priority;
-
 		if (pthread_setschedparam(pt, SCHED_OTHER | PW_SCHED_RESET_ON_FORK, &sp) == 0) {
 			pw_log_debug("SCHED_OTHER|SCHED_RESET_ON_FORK worked.");
 		}
 
-		if ((err = pw_rtkit_make_realtime(impl->system_bus, pid, priority)) < 0) {
-			pw_log_warn("could not make thread %d realtime using RTKit: %s", pid, spa_strerror(err));
-		} else {
-			pw_log_info("acquired realtime priority %d for thread %d using RTKit", priority, pid);
-		}
+		params.priority = priority;
+
+		pthread_mutex_lock(&impl->lock);
+		if ((thr = find_thread_by_pt(impl, pt)) != NULL)
+			params.pid = thr->pid;
+		else
+			params.pid = _gettid();
+
+		res = pw_loop_invoke(pw_thread_loop_get_loop(impl->thread_loop),
+				do_make_realtime, 0, &params, sizeof(params), false, impl);
+		pthread_mutex_unlock(&impl->lock);
+
+		return res;
 	} else {
-		if (priority < sched_get_priority_min(REALTIME_POLICY) ||
-		    priority > sched_get_priority_max(REALTIME_POLICY)) {
-			pw_log_warn("invalid priority %d for policy %d", priority, REALTIME_POLICY);
-			return -EINVAL;
-		}
-
-		spa_zero(sp);
-		sp.sched_priority = priority;
-		if ((err = pthread_setschedparam(pt, REALTIME_POLICY | PW_SCHED_RESET_ON_FORK, &sp)) != 0) {
-			pw_log_warn("could not make thread %p realtime: %s", thread, strerror(err));
-			return -err;
-		}
-		pw_log_info("acquired realtime priority %d for thread %p", priority, thread);
+		return acquire_rt_sched(thread, priority);
 	}
-
-	return 0;
-}
-
-static int impl_drop_rt(void *data, struct spa_thread *thread)
-{
-	struct sched_param sp;
-	pthread_t pt = (pthread_t)thread;
-	int err;
-
-	spa_zero(sp);
-	if ((err = pthread_setschedparam(pt, SCHED_OTHER | PW_SCHED_RESET_ON_FORK, &sp)) != 0) {
-		pw_log_debug("thread %p: SCHED_OTHER|SCHED_RESET_ON_FORK failed: %s",
-				thread, strerror(err));
-		return -err;
-	}
-	pw_log_info("thread %p dropped realtime priority", thread);
-	return 0;
 }
 
 static const struct spa_thread_utils_methods impl_thread_utils = {
@@ -758,35 +863,167 @@ static const struct spa_thread_utils_methods impl_thread_utils = {
 	.join = impl_join,
 	.get_rt_range = impl_get_rt_range,
 	.acquire_rt = impl_acquire_rt,
-	.drop_rt = impl_drop_rt,
+	.drop_rt = impl_drop_rt_generic,
 };
 
+#else /* HAVE_DBUS */
+
+static struct spa_thread *impl_create(void *object, const struct spa_dict *props,
+		void *(*start_routine)(void*), void *arg)
+{
+	return pw_thread_utils_create(props, start_routine, arg);
+}
+
+static int impl_join(void *object, struct spa_thread *thread, void **retval)
+{
+	return pw_thread_utils_join(thread, retval);
+}
+
+static int impl_get_rt_range(void *object, const struct spa_dict *props,
+		int *min, int *max)
+{
+	return get_rt_priority_range(min, max);
+}
+
+static int impl_acquire_rt(void *object, struct spa_thread *thread, int priority)
+{
+	struct impl *impl = object;
+
+	/* See the docstring on `spa_thread_utils_methods::acquire_rt` */
+	if (priority == -1)
+		priority = impl->rt_prio;
+
+	return acquire_rt_sched(thread, priority);
+}
+
+static const struct spa_thread_utils_methods impl_thread_utils = {
+	SPA_VERSION_THREAD_UTILS_METHODS,
+	.create = impl_create,
+	.join = impl_join,
+	.get_rt_range = impl_get_rt_range,
+	.acquire_rt = impl_acquire_rt,
+	.drop_rt = impl_drop_rt_generic,
+};
+#endif /* HAVE_DBUS */
+
+
+#ifdef HAVE_DBUS
+static int check_rtkit(struct impl *impl, struct pw_context *context, bool *can_use_rtkit)
+{
+	const struct pw_properties *context_props;
+	const char *str;
+
+	*can_use_rtkit = true;
+
+	if ((context_props = pw_context_get_properties(context)) != NULL &&
+	    (str = pw_properties_get(context_props, "support.dbus")) != NULL &&
+	    !pw_properties_parse_bool(str))
+		*can_use_rtkit = false;
+
+	return 0;
+}
+
+static int rtkit_get_bus(struct impl *impl)
+{
+	int res;
+
+	pw_log_debug("enter rtkit get bus");
+
+	/* Checking xdg-desktop-portal. It works fine in all situations. */
+	if (impl->rtportal_enabled)
+		impl->rtkit_bus = pw_rtkit_bus_get_session();
+	else
+		pw_log_info("Portal Realtime disabled");
+
+	if (impl->rtkit_bus != NULL) {
+		if (pw_rtkit_check_xdg_portal(impl->rtkit_bus)) {
+			impl->service_name = XDG_PORTAL_SERVICE_NAME;
+			impl->object_path = XDG_PORTAL_OBJECT_PATH;
+			impl->interface = XDG_PORTAL_INTERFACE;
+		} else {
+			pw_log_info("found session bus but no portal, trying RTKit fallback");
+			pw_rtkit_bus_free(impl->rtkit_bus);
+			impl->rtkit_bus = NULL;
+		}
+	}
+	/* Failed to get xdg-desktop-portal, try to use rtkit. */
+	if (impl->rtkit_bus == NULL) {
+		if (impl->rtkit_enabled)
+			impl->rtkit_bus = pw_rtkit_bus_get_system();
+		else
+			pw_log_info("RTkit disabled");
+
+		if (impl->rtkit_bus != NULL) {
+			impl->service_name = RTKIT_SERVICE_NAME;
+			impl->object_path = RTKIT_OBJECT_PATH;
+			impl->interface = RTKIT_INTERFACE;
+		} else {
+			res = -errno;
+			pw_log_warn("Realtime scheduling disabled: unsufficient realtime privileges, "
+				"Portal not found on session bus, and no system bus for RTKit: %m");
+			return res;
+		}
+	}
+
+	return 0;
+}
+
+static int do_rtkit_setup(struct spa_loop *loop, bool async, uint32_t seq,
+		const void *data, size_t size, void *user_data)
+{
+	struct impl *impl = user_data;
+	long long retval;
+
+	pw_log_debug("enter rtkit setup");
+
+	/* get some properties */
+	if (rtkit_get_int_property(impl, "MaxRealtimePriority", &retval) < 0) {
+		retval = 1;
+		pw_log_warn("RTKit does not give us MaxRealtimePriority, using %lld", retval);
+	}
+	impl->max_rtprio = retval;
+	if (rtkit_get_int_property(impl, "MinNiceLevel", &retval) < 0) {
+		retval = 0;
+		pw_log_warn("RTKit does not give us MinNiceLevel, using %lld", retval);
+	}
+	impl->min_nice_level = retval;
+	if (rtkit_get_int_property(impl, "RTTimeUSecMax", &retval) < 0) {
+		retval = impl->rl.rlim_cur;
+		pw_log_warn("RTKit does not give us RTTimeUSecMax, using %lld", retval);
+	}
+	impl->rttime_max = retval;
+
+	/* Retry set_nice with rtkit */
+	if (IS_VALID_NICE_LEVEL(impl->nice_level))
+		set_nice(impl, impl->nice_level, true);
+
+	/* Set rlimit with rtkit limits */
+	if (impl->rttime_max < impl->rl.rlim_cur) {
+		pw_log_debug("clamping rt.time.soft from %llu to %lld because of RTKit",
+			     (long long)impl->rl.rlim_cur, (long long)impl->rttime_max);
+	}
+	impl->rl.rlim_cur = SPA_MIN(impl->rl.rlim_cur, impl->rttime_max);
+	impl->rl.rlim_max = SPA_MIN(impl->rl.rlim_max, impl->rttime_max);
+
+	set_rlimit(impl);
+
+	return 0;
+}
+#endif /* HAVE_DBUS */
 
 SPA_EXPORT
 int pipewire__module_init(struct pw_impl_module *module, const char *args)
 {
 	struct pw_context *context = pw_impl_module_get_context(module);
 	struct impl *impl;
-	const struct pw_properties *context_props;
 	struct pw_properties *props;
-	const char *str;
-	bool use_rtkit = true;
 	int res = 0;
 
 	PW_LOG_TOPIC_INIT(mod_topic);
 
-	if ((context_props = pw_context_get_properties(context)) != NULL &&
-	    (str = pw_properties_get(context_props, "support.dbus")) != NULL &&
-	    !pw_properties_parse_bool(str))
-		use_rtkit = false;
-
 	impl = calloc(1, sizeof(struct impl));
 	if (impl == NULL)
 		return -ENOMEM;
-
-	spa_list_init(&impl->threads_list);
-	pthread_mutex_init(&impl->lock, NULL);
-	pthread_cond_init(&impl->cond, NULL);
 
 	pw_log_debug("module %p: new", impl);
 
@@ -801,57 +1038,103 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->rt_prio = pw_properties_get_int32(props, "rt.prio", DEFAULT_RT_PRIO);
 	impl->rt_time_soft = pw_properties_get_int32(props, "rt.time.soft", DEFAULT_RT_TIME_SOFT);
 	impl->rt_time_hard = pw_properties_get_int32(props, "rt.time.hard", DEFAULT_RT_TIME_HARD);
+	impl->rlimits_enabled = pw_properties_get_bool(props, "rlimits.enabled", true);
+	impl->rtportal_enabled = pw_properties_get_bool(props, "rtportal.enabled", true);
+	impl->rtkit_enabled = pw_properties_get_bool(props, "rtkit.enabled", true);
 
-	/* If the user has permissions to use regular realtime scheduling, then
-	 * we'll use that instead of RTKit */
-	if (check_realtime_priviliges(impl->rt_prio)) {
-		use_rtkit = false;
-	} else {
-		if (!use_rtkit) {
-			res = -ENOTSUP;
-			pw_log_warn("neither regular realtime scheduling nor RTKit are available");
-			goto error;
-		}
+	impl->rl.rlim_cur = impl->rt_time_soft;
+	impl->rl.rlim_max = impl->rt_time_hard;
+	impl->main_pid = _gettid();
 
-		/* TODO: Should this be pw_log_warn or pw_log_debug instead? */
-		pw_log_info("could not use realtime scheduling, falling back to using RTKit instead");
+	bool can_use_rtkit = false, use_rtkit = false;
+
+	if (!IS_VALID_NICE_LEVEL(impl->nice_level)) {
+		pw_log_info("invalid nice level %d (not between %d and %d). "
+				"nice level will not be adjusted",
+				impl->nice_level, MIN_NICE_LEVEL, MAX_NICE_LEVEL);
 	}
 
+#ifdef HAVE_DBUS
+	spa_list_init(&impl->threads_list);
+	pthread_mutex_init(&impl->lock, NULL);
+	pthread_cond_init(&impl->cond, NULL);
+
+	if ((res = check_rtkit(impl, context, &can_use_rtkit)) < 0)
+		goto error;
+
+#endif
+	/* If the user has permissions to use regular realtime scheduling, as well as
+	 * the nice level we want, then we'll use that instead of RTKit */
+	if (!check_realtime_privileges(impl)) {
+		if (!can_use_rtkit) {
+			res = -ENOTSUP;
+			pw_log_warn("regular realtime scheduling not available"
+					" (Portal/RTKit fallback disabled)");
+			goto error;
+		}
+		use_rtkit = true;
+	}
+
+	if (IS_VALID_NICE_LEVEL(impl->nice_level)) {
+		if (set_nice(impl, impl->nice_level, !can_use_rtkit) < 0)
+			use_rtkit = can_use_rtkit;
+	}
+	if (!use_rtkit)
+		set_rlimit(impl);
+
+#ifdef HAVE_DBUS
 	impl->use_rtkit = use_rtkit;
 	if (impl->use_rtkit) {
-		impl->system_bus = pw_rtkit_bus_get_system();
-		if (impl->system_bus == NULL) {
+		struct spa_dict_item items[] = {
+			{ "thread-loop.start-signal", "true" }
+		};
+		if ((res = rtkit_get_bus(impl)) < 0)
+			goto error;
+
+		impl->thread_loop = pw_thread_loop_new("module-rt",
+			&SPA_DICT_INIT_ARRAY(items));
+		if (impl->thread_loop == NULL) {
 			res = -errno;
-			pw_log_warn("could not get system bus: %m");
 			goto error;
 		}
-	}
+		pw_thread_loop_lock(impl->thread_loop);
+		pw_thread_loop_start(impl->thread_loop);
+		pw_thread_loop_wait(impl->thread_loop);
+		pw_thread_loop_unlock(impl->thread_loop);
 
-	if (IS_VALID_NICE_LEVEL(impl->nice_level))
-		set_nice(impl, impl->nice_level);
-	set_rlimit(impl);
+		pw_loop_invoke(pw_thread_loop_get_loop(impl->thread_loop),
+				do_rtkit_setup, 0, NULL, 0, false, impl);
+
+		pw_log_debug("initialized using RTKit");
+	} else {
+		pw_log_debug("initialized using regular realtime scheduling");
+	}
+#else
+	pw_log_debug("initialized using regular realtime scheduling");
+#endif
 
 	impl->thread_utils.iface = SPA_INTERFACE_INIT(
 			SPA_TYPE_INTERFACE_ThreadUtils,
 			SPA_VERSION_THREAD_UTILS,
 			&impl_thread_utils, impl);
-	pw_thread_utils_set(&impl->thread_utils);
+
+	pw_context_set_object(context, SPA_TYPE_INTERFACE_ThreadUtils,
+			&impl->thread_utils);
 
 	pw_impl_module_add_listener(module, &impl->module_listener, &module_events, impl);
 
 	pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(module_props));
 	pw_impl_module_update_properties(module, &props->dict);
 
-	if (impl->use_rtkit) {
-		pw_log_debug("initialized using RTKit");
-	} else {
-		pw_log_debug("initialized using regular realtime scheduling");
-	}
 	goto done;
 
 error:
-	if (impl->system_bus)
-		pw_rtkit_bus_free(impl->system_bus);
+#ifdef HAVE_DBUS
+	if (impl->thread_loop)
+		pw_thread_loop_destroy(impl->thread_loop);
+	if (impl->rtkit_bus)
+		pw_rtkit_bus_free(impl->rtkit_bus);
+#endif
 	free(impl);
 done:
 	pw_properties_free(props);

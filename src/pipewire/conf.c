@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2021 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include "config.h"
 
@@ -38,14 +18,17 @@
 #ifdef HAVE_PWD_H
 #include <pwd.h>
 #endif
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__MidnightBSD__)
+#ifndef O_PATH
 #define O_PATH 0
+#endif
 #endif
 
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
 #include <spa/utils/json.h>
 
+#include <pipewire/cleanup.h>
 #include <pipewire/impl.h>
 #include <pipewire/private.h>
 
@@ -190,6 +173,9 @@ static int get_config_dir(char *path, size_t size, const char *prefix, const cha
 		return -ENOENT;
 	}
 
+	if (pw_check_option("no-config", "true"))
+		goto no_config;
+
 	if ((res = get_envconf_path(path, size, prefix, name)) != 0) {
 		if ((*level)++ == 0)
 			return res;
@@ -198,20 +184,18 @@ static int get_config_dir(char *path, size_t size, const char *prefix, const cha
 
 	if (*level == 0) {
 		(*level)++;
-		if ((res = get_confdata_path(path, size, prefix, name)) != 0)
+		if ((res = get_homeconf_path(path, size, prefix, name)) != 0)
 			return res;
 	}
-	if (pw_check_option("no-config", "true"))
-		return 0;
-
 	if (*level == 1) {
 		(*level)++;
 		if ((res = get_configdir_path(path, size, prefix, name)) != 0)
 			return res;
 	}
 	if (*level == 2) {
+no_config:
 		(*level)++;
-		if ((res = get_homeconf_path(path, size, prefix, name)) != 0)
+		if ((res = get_confdata_path(path, size, prefix, name)) != 0)
 			return res;
 	}
 	return 0;
@@ -358,11 +342,12 @@ found:
 }
 
 SPA_EXPORT
-int pw_conf_save_state(const char *prefix, const char *name, struct pw_properties *conf)
+int pw_conf_save_state(const char *prefix, const char *name, const struct pw_properties *conf)
 {
 	char path[PATH_MAX];
 	char *tmp_name;
-	int res, sfd, fd, count = 0;
+	spa_autoclose int sfd = -1;
+	int res, fd, count = 0;
 	FILE *f;
 
 	if ((sfd = open_write_dir(path, sizeof(path), prefix)) < 0)
@@ -371,9 +356,9 @@ int pw_conf_save_state(const char *prefix, const char *name, struct pw_propertie
 	tmp_name = alloca(strlen(name)+5);
 	sprintf(tmp_name, "%s.tmp", name);
 	if ((fd = openat(sfd, tmp_name,  O_CLOEXEC | O_CREAT | O_WRONLY | O_TRUNC, 0600)) < 0) {
-		pw_log_error("can't open file '%s': %m", tmp_name);
 		res = -errno;
-		goto error;
+		pw_log_error("can't open file '%s': %m", tmp_name);
+		return res;
 	}
 
 	f = fdopen(fd, "w");
@@ -383,53 +368,75 @@ int pw_conf_save_state(const char *prefix, const char *name, struct pw_propertie
 	fclose(f);
 
 	if (renameat(sfd, tmp_name, sfd, name) < 0) {
-		pw_log_error("can't rename temp file '%s': %m", tmp_name);
 		res = -errno;
-		goto error;
+		pw_log_error("can't rename temp file '%s': %m", tmp_name);
+		return res;
 	}
-	res = 0;
+
 	pw_log_info("%p: saved state '%s%s'", conf, path, name);
-error:
-	close(sfd);
-	return res;
+
+	return 0;
 }
 
 static int conf_load(const char *path, struct pw_properties *conf)
 {
 	char *data;
 	struct stat sbuf;
-	int fd, count;
+	int count;
 
-	if ((fd = open(path,  O_CLOEXEC | O_RDONLY)) < 0)
+	spa_autoclose int fd = open(path,  O_CLOEXEC | O_RDONLY);
+	if (fd < 0)
 		goto error;
 
 	if (fstat(fd, &sbuf) < 0)
-		goto error_close;
-	if ((data = mmap(NULL, sbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
-		goto error_close;
-	close(fd);
+		goto error;
 
-	count = pw_properties_update_string(conf, data, sbuf.st_size);
-	munmap(data, sbuf.st_size);
+	if (sbuf.st_size > 0) {
+		if ((data = mmap(NULL, sbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
+			goto error;
+
+		count = pw_properties_update_string(conf, data, sbuf.st_size);
+		munmap(data, sbuf.st_size);
+	} else {
+		count = 0;
+	}
 
 	pw_log_info("%p: loaded config '%s' with %d items", conf, path, count);
 
 	return 0;
 
-error_close:
-	close(fd);
 error:
 	pw_log_warn("%p: error loading config '%s': %m", conf, path);
 	return -errno;
 }
 
+static bool check_override(struct pw_properties *conf, const char *name, int level)
+{
+	const struct spa_dict_item *it;
+
+	spa_dict_for_each(it, &conf->dict) {
+		int lev, idx;
+
+		if (!spa_streq(name, it->value))
+			continue;
+		if (sscanf(it->key, "override.%d.%d.config.name", &lev, &idx) != 2)
+			continue;
+		if (lev < level)
+			return false;
+	}
+	return true;
+}
+
 static void add_override(struct pw_properties *conf, struct pw_properties *override,
-		const char *path, int level, int index)
+		const char *path, const char *name, int level, int index)
 {
 	const struct spa_dict_item *it;
 	char key[1024];
+
 	snprintf(key, sizeof(key), "override.%d.%d.config.path", level, index);
 	pw_properties_set(conf, key, path);
+	snprintf(key, sizeof(key), "override.%d.%d.config.name", level, index);
+	pw_properties_set(conf, key, name);
 	spa_dict_for_each(it, &override->dict) {
 		snprintf(key, sizeof(key), "override.%d.%d.%s", level, index, it->key);
 		pw_properties_set(conf, key, it->value);
@@ -447,7 +454,7 @@ int pw_conf_load_conf(const char *prefix, const char *name, struct pw_properties
 	char path[PATH_MAX];
 	char fname[PATH_MAX + 256];
 	int i, res, level = 0;
-	struct pw_properties *override = NULL;
+	spa_autoptr(pw_properties) override = NULL;
 	const char *dname;
 
 	if (name == NULL) {
@@ -488,15 +495,21 @@ int pw_conf_load_conf(const char *prefix, const char *name, struct pw_properties
 			return -errno;
 
 		for (i = 0; i < n; i++) {
-			snprintf(fname, sizeof(fname), "%s/%s", path, entries[i]->d_name);
-			if (conf_load(fname, override) >= 0)
-				add_override(conf, override, fname, level, i);
-			pw_properties_clear(override);
+			const char *name = entries[i]->d_name;
+
+			snprintf(fname, sizeof(fname), "%s/%s", path, name);
+			if (check_override(conf, name, level)) {
+				if (conf_load(fname, override) >= 0)
+					add_override(conf, override, fname, name, level, i);
+				pw_properties_clear(override);
+			} else {
+				pw_log_info("skip override %s with lower priority", fname);
+			}
 			free(entries[i]);
 		}
 		free(entries);
 	}
-	pw_properties_free(override);
+
 	return 0;
 }
 
@@ -571,10 +584,84 @@ static int load_module(struct pw_context *context, const char *key, const char *
 }
 
 /*
+ * {
+ *     # all keys must match the value. ~ in value starts regex.
+ *     # ! as the first char of the value negates the match
+ *     <key> = <value>
+ *     ...
+ * }
+ */
+static bool find_match(struct spa_json *arr, const struct spa_dict *props)
+{
+	struct spa_json it[1];
+
+	while (spa_json_enter_object(arr, &it[0]) > 0) {
+		char key[256], val[1024];
+		const char *str, *value;
+		int match = 0, fail = 0;
+		int len, skip = 0;
+
+		while (spa_json_get_string(&it[0], key, sizeof(key)) > 0) {
+			bool success = false;
+
+			if ((len = spa_json_next(&it[0], &value)) <= 0)
+				break;
+
+			str = spa_dict_lookup(props, key);
+
+			if (spa_json_is_null(value, len)) {
+				success = str == NULL;
+			} else {
+				if (spa_json_parse_stringn(value, len, val, sizeof(val)) < 0)
+					continue;
+				value = val;
+				len = strlen(val);
+				if (len > 0 && value[0] == '!') {
+					success = !success;
+					skip++;
+				}
+			}
+			if (str != NULL) {
+				if (value[skip] == '~') {
+					regex_t preg;
+					int res;
+					skip++;
+					if ((res = regcomp(&preg, value+skip, REG_EXTENDED | REG_NOSUB)) != 0) {
+						char errbuf[1024];
+						regerror(res, &preg, errbuf, sizeof(errbuf));
+						pw_log_warn("invalid regex %s: %s", value+skip, errbuf);
+					} else {
+						if (regexec(&preg, str, 0, NULL, 0) == 0)
+							success = !success;
+						regfree(&preg);
+					}
+				} else if (strncmp(str, value+skip, len-skip) == 0 &&
+				    strlen(str) == (size_t)(len-skip)) {
+					success = !success;
+				}
+			}
+			if (success) {
+				match++;
+				pw_log_debug("'%s' match '%s' < > '%.*s'", key, str, len, value);
+			}
+			else {
+				pw_log_debug("'%s' fail '%s' < > '%.*s'", key, str, len, value);
+				fail++;
+				break;
+			}
+		}
+		if (match > 0 && fail == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
  * context.modules = [
  *   {   name = <module-name>
- *       [ args = { <key> = <value> ... } ]
- *       [ flags = [ [ ifexists ] [ nofail ] ]
+ *       ( args = { <key> = <value> ... } )
+ *       ( flags = [ ( ifexists ) ( nofail ) ]
+ *       ( condition = [ { key = value, .. } .. ] )
  *   }
  * ]
  */
@@ -583,20 +670,20 @@ static int parse_modules(void *user_data, const char *location,
 {
 	struct data *d = user_data;
 	struct pw_context *context = d->context;
-	struct spa_json it[3];
-	char key[512], *s;
+	struct spa_json it[4];
+	char key[512];
 	int res = 0;
 
-	s = strndup(str, len);
+	spa_autofree char *s = strndup(str, len);
 	spa_json_init(&it[0], s, len);
 	if (spa_json_enter_array(&it[0], &it[1]) < 0) {
 		pw_log_error("config file error: context.modules is not an array");
-		res = -EINVAL;
-		goto exit;
+		return -EINVAL;
 	}
 
 	while (spa_json_enter_object(&it[1], &it[2]) > 0) {
 		char *name = NULL, *args = NULL, *flags = NULL;
+		bool have_match = true;
 
 		while (spa_json_get_string(&it[2], key, sizeof(key)) > 0) {
 			const char *val;
@@ -619,8 +706,16 @@ static int parse_modules(void *user_data, const char *location,
 					len = spa_json_container_len(&it[2], val, len);
 				flags = (char*)val;
 				spa_json_parse_stringn(val, len, flags, len+1);
+			} else if (spa_streq(key, "condition")) {
+				if (!spa_json_is_array(val, len))
+					break;
+				spa_json_enter(&it[2], &it[3]);
+				have_match = find_match(&it[3], &context->properties->dict);
 			}
 		}
+		if (!have_match)
+			continue;
+
 		if (name != NULL)
 			res = load_module(context, name, args, flags);
 
@@ -629,8 +724,7 @@ static int parse_modules(void *user_data, const char *location,
 
 		d->count++;
 	}
-exit:
-	free(s);
+
 	return res;
 }
 
@@ -664,8 +758,9 @@ static int create_object(struct pw_context *context, const char *key, const char
 /*
  * context.objects = [
  *   {   factory = <factory-name>
- *       [ args  = { <key> = <value> ... } ]
- *       [ flags = [ [ nofail ] ] ]
+ *       ( args  = { <key> = <value> ... } )
+ *       ( flags = [ ( nofail ) ] )
+ *       ( condition = [ { key = value, .. } .. ] )
  *   }
  * ]
  */
@@ -674,20 +769,20 @@ static int parse_objects(void *user_data, const char *location,
 {
 	struct data *d = user_data;
 	struct pw_context *context = d->context;
-	struct spa_json it[3];
-	char key[512], *s;
+	struct spa_json it[4];
+	char key[512];
 	int res = 0;
 
-	s = strndup(str, len);
+	spa_autofree char *s = strndup(str, len);
 	spa_json_init(&it[0], s, len);
 	if (spa_json_enter_array(&it[0], &it[1]) < 0) {
 		pw_log_error("config file error: context.objects is not an array");
-		res = -EINVAL;
-		goto exit;
+		return -EINVAL;
 	}
 
 	while (spa_json_enter_object(&it[1], &it[2]) > 0) {
 		char *factory = NULL, *args = NULL, *flags = NULL;
+		bool have_match = true;
 
 		while (spa_json_get_string(&it[2], key, sizeof(key)) > 0) {
 			const char *val;
@@ -711,8 +806,16 @@ static int parse_objects(void *user_data, const char *location,
 
 				flags = (char*)val;
 				spa_json_parse_stringn(val, len, flags, len+1);
+			} else if (spa_streq(key, "condition")) {
+				if (!spa_json_is_array(val, len))
+					break;
+				spa_json_enter(&it[2], &it[3]);
+				have_match = find_match(&it[3], &context->properties->dict);
 			}
 		}
+		if (!have_match)
+			continue;
+
 		if (factory != NULL)
 			res = create_object(context, factory, args, flags);
 
@@ -720,8 +823,7 @@ static int parse_objects(void *user_data, const char *location,
 			break;
 		d->count++;
 	}
-exit:
-	free(s);
+
 	return res;
 }
 
@@ -773,8 +875,9 @@ static int do_exec(struct pw_context *context, const char *key, const char *args
 
 /*
  * context.exec = [
- *   { path = <program-name>
- *     [ args = "<arguments>" ]
+ *   {   path = <program-name>
+ *       ( args = "<arguments>" )
+ *       ( condition = [ { key = value, .. } .. ] )
  *   }
  * ]
  */
@@ -783,20 +886,20 @@ static int parse_exec(void *user_data, const char *location,
 {
 	struct data *d = user_data;
 	struct pw_context *context = d->context;
-	struct spa_json it[3];
-	char key[512], *s;
+	struct spa_json it[4];
+	char key[512];
 	int res = 0;
 
-	s = strndup(str, len);
+	spa_autofree char *s = strndup(str, len);
 	spa_json_init(&it[0], s, len);
 	if (spa_json_enter_array(&it[0], &it[1]) < 0) {
 		pw_log_error("config file error: context.exec is not an array");
-		res = -EINVAL;
-		goto exit;
+		return -EINVAL;
 	}
 
 	while (spa_json_enter_object(&it[1], &it[2]) > 0) {
 		char *path = NULL, *args = NULL;
+		bool have_match = true;
 
 		while (spa_json_get_string(&it[2], key, sizeof(key)) > 0) {
 			const char *val;
@@ -811,8 +914,16 @@ static int parse_exec(void *user_data, const char *location,
 			} else if (spa_streq(key, "args")) {
 				args = (char*)val;
 				spa_json_parse_stringn(val, len, args, len+1);
+			} else if (spa_streq(key, "condition")) {
+				if (!spa_json_is_array(val, len))
+					break;
+				spa_json_enter(&it[2], &it[3]);
+				have_match = find_match(&it[3], &context->properties->dict);
 			}
 		}
+		if (!have_match)
+			continue;
+
 		if (path != NULL)
 			res = do_exec(context, path, args);
 
@@ -821,24 +932,22 @@ static int parse_exec(void *user_data, const char *location,
 
 		d->count++;
 	}
-exit:
-	free(s);
+
 	return res;
 }
 
 
 SPA_EXPORT
-int pw_context_conf_section_for_each(struct pw_context *context, const char *section,
+int pw_conf_section_for_each(const struct spa_dict *conf, const char *section,
 		int (*callback) (void *data, const char *location, const char *section,
 			const char *str, size_t len),
 		void *data)
 {
-	struct pw_properties *conf = context->conf;
 	const char *path = NULL;
 	const struct spa_dict_item *it;
 	int res = 0;
 
-	spa_dict_for_each(it, &conf->dict) {
+	spa_dict_for_each(it, conf) {
 		if (spa_strendswith(it->key, "config.path")) {
 			path = it->value;
 			continue;
@@ -858,31 +967,6 @@ int pw_context_conf_section_for_each(struct pw_context *context, const char *sec
 	return res;
 }
 
-SPA_EXPORT
-int pw_context_parse_conf_section(struct pw_context *context,
-		struct pw_properties *conf, const char *section)
-{
-	struct data data = { .context = context };
-	int res;
-
-	if (spa_streq(section, "context.spa-libs"))
-		res = pw_context_conf_section_for_each(context, section,
-				parse_spa_libs, &data);
-	else if (spa_streq(section, "context.modules"))
-		res = pw_context_conf_section_for_each(context, section,
-				parse_modules, &data);
-	else if (spa_streq(section, "context.objects"))
-		res = pw_context_conf_section_for_each(context, section,
-				parse_objects, &data);
-	else if (spa_streq(section, "context.exec"))
-		res = pw_context_conf_section_for_each(context, section,
-				parse_exec, &data);
-	else
-		res = -EINVAL;
-
-	return res == 0 ? data.count : res;
-}
-
 static int update_props(void *user_data, const char *location, const char *key,
 			const char *val, size_t len)
 {
@@ -892,90 +976,118 @@ static int update_props(void *user_data, const char *location, const char *key,
 }
 
 SPA_EXPORT
-int pw_context_conf_update_props(struct pw_context *context,
+int pw_conf_section_update_props(const struct spa_dict *conf,
 		const char *section, struct pw_properties *props)
 {
-	struct data data = { .context = context, .props = props };
+	struct data data = { .props = props };
 	int res;
-	res = pw_context_conf_section_for_each(context, section,
+	const char *str;
+
+	res = pw_conf_section_for_each(conf, section,
+			update_props, &data);
+
+	str = pw_properties_get(props, "config.ext");
+	if (res == 0 && str != NULL) {
+		char key[128];
+		snprintf(key, sizeof(key), "%s.%s", section, str);
+		res = pw_conf_section_for_each(conf, key,
 				update_props, &data);
+	}
 	return res == 0 ? data.count : res;
 }
 
-struct match {
-	const struct spa_dict *props;
-	int (*matched) (void *data, const char *location, const char *action,
-			const char *val, size_t len);
-	void *data;
-};
-
-/*
- * {
- *     # all keys must match the value. ~ in value starts regex.
- *     <key> = <value>
- *     ...
- * }
- */
-static bool find_match(struct spa_json *arr, const struct spa_dict *props)
+static bool valid_conf_name(const char *str)
 {
-	struct spa_json it[1];
+	return spa_streq(str, "null") || spa_strendswith(str, ".conf");
+}
 
-	while (spa_json_enter_object(arr, &it[0]) > 0) {
-		char key[256], val[1024];
-		const char *str, *value;
-		int match = 0, fail = 0;
-		int len;
+static int try_load_conf(const char *conf_prefix, const char *conf_name,
+			 struct pw_properties *conf)
+{
+	int res;
 
-		while (spa_json_get_string(&it[0], key, sizeof(key)) > 0) {
-			bool success = false;
-
-			if ((len = spa_json_next(&it[0], &value)) <= 0)
-				break;
-
-			str = spa_dict_lookup(props, key);
-
-			if (spa_json_is_null(value, len)) {
-				success = str == NULL;
-			} else {
-				if (spa_json_parse_stringn(value, len, val, sizeof(val)) < 0)
-					continue;
-				value = val;
-				len = strlen(val);
-			}
-			if (str != NULL) {
-				if (value[0] == '~') {
-					regex_t preg;
-					if (regcomp(&preg, value+1, REG_EXTENDED | REG_NOSUB) == 0) {
-						if (regexec(&preg, str, 0, NULL, 0) == 0)
-							success = true;
-						regfree(&preg);
-					}
-				} else if (strncmp(str, value, len) == 0 &&
-				    strlen(str) == (size_t)len) {
-					success = true;
-				}
-			}
-			if (success) {
-				match++;
-				pw_log_debug("'%s' match '%s' < > '%.*s'", key, str, len, value);
-			}
-			else
-				fail++;
-		}
-		if (match > 0 && fail == 0)
-			return true;
+	if (conf_name == NULL)
+		return -EINVAL;
+	if (spa_streq(conf_name, "null"))
+		return 0;
+	if ((res = pw_conf_load_conf(conf_prefix, conf_name, conf)) < 0) {
+		bool skip_prefix = conf_prefix == NULL || conf_name[0] == '/';
+		pw_log_warn("can't load config %s%s%s: %s",
+				skip_prefix ? "" : conf_prefix,
+				skip_prefix ? "" : "/",
+				conf_name, spa_strerror(res));
 	}
-	return false;
+	return res;
+}
+
+SPA_EXPORT
+int pw_conf_load_conf_for_context(struct pw_properties *props, struct pw_properties *conf)
+{
+	const char *conf_prefix, *conf_name;
+	int res;
+
+	conf_prefix = getenv("PIPEWIRE_CONFIG_PREFIX");
+	if (conf_prefix == NULL)
+		conf_prefix = pw_properties_get(props, PW_KEY_CONFIG_PREFIX);
+
+	conf_name = getenv("PIPEWIRE_CONFIG_NAME");
+	if ((res = try_load_conf(conf_prefix, conf_name, conf)) < 0) {
+		conf_name = pw_properties_get(props, PW_KEY_CONFIG_NAME);
+		if (conf_name == NULL)
+			conf_name = "client.conf";
+		else if (!valid_conf_name(conf_name)) {
+			pw_log_error("%s '%s' does not end with .conf",
+				PW_KEY_CONFIG_NAME, conf_name);
+			return -EINVAL;
+		}
+		if ((res = try_load_conf(conf_prefix, conf_name, conf)) < 0) {
+			pw_log_error("can't load config %s: %s",
+				conf_name, spa_strerror(res));
+			return res;
+		}
+	}
+
+	conf_name = pw_properties_get(props, PW_KEY_CONFIG_OVERRIDE_NAME);
+	if (conf_name != NULL) {
+		struct pw_properties *override;
+		const char *path, *name;
+
+		if (!valid_conf_name(conf_name)) {
+			pw_log_error("%s '%s' does not end with .conf",
+				PW_KEY_CONFIG_OVERRIDE_NAME, conf_name);
+			return -EINVAL;
+		}
+
+		override = pw_properties_new(NULL, NULL);
+		if (override == NULL) {
+			res = -errno;
+			return res;
+		}
+
+		conf_prefix = pw_properties_get(props, PW_KEY_CONFIG_OVERRIDE_PREFIX);
+		if ((res = try_load_conf(conf_prefix, conf_name, override)) < 0) {
+			pw_log_error("can't load default override config %s: %s",
+				conf_name, spa_strerror(res));
+			pw_properties_free (override);
+			return res;
+		}
+		path = pw_properties_get(override, "config.path");
+		name = pw_properties_get(override, "config.name");
+		add_override(conf, override, path, name, 0, 1);
+		pw_properties_free(override);
+	}
+
+	return res;
 }
 
 /**
- * rules = [
+ * [
  *     {
  *         matches = [
- *             # any of the items in matches needs to match, it one does,
+ *             # any of the items in matches needs to match, if one does,
  *             # actions are emited.
  *             {
- *                 # all keys must match the value. ~ in value starts regex.
+ *                 # all keys must match the value. ! negates. ~ starts regex.
  *                 <key> = <value>
  *                 ...
  *             }
@@ -988,11 +1100,13 @@ static bool find_match(struct spa_json *arr, const struct spa_dict *props)
  *     }
  * ]
  */
-static int match_rules(void *data, const char *location, const char *section,
-		const char *str, size_t len)
+SPA_EXPORT
+int pw_conf_match_rules(const char *str, size_t len, const char *location,
+		const struct spa_dict *props,
+		int (*callback) (void *data, const char *location, const char *action,
+			const char *str, size_t len),
+		void *data)
 {
-	struct match *match = data;
-	const struct spa_dict *props = match->props;
 	const char *val;
 	struct spa_json it[4], actions;
 
@@ -1031,16 +1145,31 @@ static int match_rules(void *data, const char *location, const char *section,
 			if (spa_json_is_container(val, len))
 				len = spa_json_container_len(&actions, val, len);
 
-			if ((res = match->matched(match->data, location, key, val, len)) < 0)
+			if ((res = callback(data, location, key, val, len)) < 0)
 				return res;
 		}
 	}
 	return 0;
 }
 
+struct match {
+	const struct spa_dict *props;
+	int (*matched) (void *data, const char *location, const char *action,
+			const char *val, size_t len);
+	void *data;
+};
+
+static int match_rules(void *data, const char *location, const char *section,
+		const char *str, size_t len)
+{
+	struct match *match = data;
+	return pw_conf_match_rules(str, len, location,
+		match->props, match->matched, match->data);
+}
+
 SPA_EXPORT
-int pw_context_conf_section_match_rules(struct pw_context *context, const char *section,
-		struct spa_dict *props,
+int pw_conf_section_match_rules(const struct spa_dict *conf, const char *section,
+		const struct spa_dict *props,
 		int (*callback) (void *data, const char *location, const char *action,
 			const char *str, size_t len),
 		void *data)
@@ -1049,5 +1178,72 @@ int pw_context_conf_section_match_rules(struct pw_context *context, const char *
 		.props = props,
 		.matched = callback,
 		.data = data };
-	return pw_context_conf_section_for_each(context, section, match_rules, &match);
+	int res;
+	const char *str;
+
+	res = pw_conf_section_for_each(conf, section,
+			match_rules, &match);
+
+	str = spa_dict_lookup(props, "config.ext");
+	if (res == 0 && str != NULL) {
+		char key[128];
+		snprintf(key, sizeof(key), "%s.%s", section, str);
+		res = pw_conf_section_for_each(conf, key,
+				match_rules, &match);
+	}
+	return res;
+}
+
+SPA_EXPORT
+int pw_context_conf_update_props(struct pw_context *context,
+		const char *section, struct pw_properties *props)
+{
+	return pw_conf_section_update_props(&context->conf->dict,
+			section, props);
+}
+
+SPA_EXPORT
+int pw_context_conf_section_for_each(struct pw_context *context, const char *section,
+		int (*callback) (void *data, const char *location, const char *section,
+			const char *str, size_t len),
+		void *data)
+{
+	return pw_conf_section_for_each(&context->conf->dict, section, callback, data);
+}
+
+
+SPA_EXPORT
+int pw_context_parse_conf_section(struct pw_context *context,
+		struct pw_properties *conf, const char *section)
+{
+	struct data data = { .context = context };
+	int res;
+
+	if (spa_streq(section, "context.spa-libs"))
+		res = pw_context_conf_section_for_each(context, section,
+				parse_spa_libs, &data);
+	else if (spa_streq(section, "context.modules"))
+		res = pw_context_conf_section_for_each(context, section,
+				parse_modules, &data);
+	else if (spa_streq(section, "context.objects"))
+		res = pw_context_conf_section_for_each(context, section,
+				parse_objects, &data);
+	else if (spa_streq(section, "context.exec"))
+		res = pw_context_conf_section_for_each(context, section,
+				parse_exec, &data);
+	else
+		res = -EINVAL;
+
+	return res == 0 ? data.count : res;
+}
+
+SPA_EXPORT
+int pw_context_conf_section_match_rules(struct pw_context *context, const char *section,
+		const struct spa_dict *props,
+		int (*callback) (void *data, const char *location, const char *action,
+			const char *str, size_t len),
+		void *data)
+{
+	return pw_conf_section_match_rules(&context->conf->dict, section,
+			props, callback, data);
 }

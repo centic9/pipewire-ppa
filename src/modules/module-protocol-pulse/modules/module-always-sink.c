@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2022 Wim Taymans <wim.taymans@gmail.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2022 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
 
 #include <pipewire/pipewire.h>
 
@@ -51,7 +31,7 @@ static const struct pw_impl_module_events module_events = {
 	.destroy = module_destroy
 };
 
-static int module_always_sink_load(struct client *client, struct module *module)
+static int module_always_sink_load(struct module *module)
 {
 	struct module_always_sink_data *data = module->user_data;
 	FILE *f;
@@ -94,12 +74,6 @@ static int module_always_sink_unload(struct module *module)
 	return 0;
 }
 
-static const struct module_methods module_always_sink_methods = {
-	VERSION_MODULE_METHODS,
-	.load = module_always_sink_load,
-	.unload = module_always_sink_unload,
-};
-
 static const struct spa_dict_item module_always_sink_info[] = {
 	{ PW_KEY_MODULE_AUTHOR, "Pauli Virtanen <pav@iki.fi>" },
 	{ PW_KEY_MODULE_DESCRIPTION, "Always keeps at least one sink loaded even if it's a null one" },
@@ -107,32 +81,22 @@ static const struct spa_dict_item module_always_sink_info[] = {
 	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
 };
 
-struct module *create_module_always_sink(struct impl *impl, const char *argument)
+static int module_always_sink_prepare(struct module * const module)
 {
-	struct module *module;
-	struct pw_properties *props = NULL;
-	int res;
-
 	PW_LOG_TOPIC_INIT(mod_topic);
 
-	props = pw_properties_new_dict(&SPA_DICT_INIT_ARRAY(module_always_sink_info));
-	if (props == NULL) {
-		res = -EINVAL;
-		goto out;
-	}
-	if (argument)
-		module_args_add_props(props, argument);
+	struct module_always_sink_data * const data = module->user_data;
+	data->module = module;
 
-	module = module_new(impl, &module_always_sink_methods, sizeof(struct module_always_sink_data));
-	if (module == NULL) {
-		res = -errno;
-		goto out;
-	}
-	module->props = props;
-
-	return module;
-out:
-	pw_properties_free(props);
-	errno = -res;
-	return NULL;
+	return 0;
 }
+
+DEFINE_MODULE_INFO(module_always_sink) = {
+	.name = "module-always-sink",
+	.load_once = true,
+	.prepare = module_always_sink_prepare,
+	.load = module_always_sink_load,
+	.unload = module_always_sink_unload,
+	.properties = &SPA_DICT_INIT_ARRAY(module_always_sink_info),
+	.data_size = sizeof(struct module_always_sink_data),
+};

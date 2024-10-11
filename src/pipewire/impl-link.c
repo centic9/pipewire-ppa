@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
 #include <string.h>
@@ -31,13 +11,10 @@
 #include <spa/pod/parser.h>
 #include <spa/pod/compare.h>
 #include <spa/param/param.h>
+#include <spa/debug/types.h>
 
 #include "pipewire/impl-link.h"
 #include "pipewire/private.h"
-
-#include <spa/debug/node.h>
-#include <spa/debug/pod.h>
-#include <spa/debug/format.h>
 
 PW_LOG_TOPIC_EXTERN(log_link);
 #define PW_LOG_TOPIC_DEFAULT log_link
@@ -50,7 +27,6 @@ PW_LOG_TOPIC_EXTERN(log_link);
 struct impl {
 	struct pw_impl_link this;
 
-	unsigned int io_set:1;
 	unsigned int activated:1;
 
 	struct pw_work_queue *work;
@@ -74,6 +50,79 @@ struct impl {
 };
 
 /** \endcond */
+
+static struct pw_node_peer *pw_node_peer_ref(struct pw_impl_node *onode, struct pw_impl_node *inode)
+{
+	struct pw_node_peer *peer;
+
+	spa_list_for_each(peer, &onode->peer_list, link) {
+		if (peer->target.id == inode->info.id) {
+			pw_log_debug("exiting peer %p from %p to %p", peer, onode, inode);
+			peer->ref++;
+			return peer;
+		}
+	}
+	peer = calloc(1, sizeof(*peer));
+	if (peer == NULL)
+		return NULL;
+
+	peer->ref = 1;
+	peer->output = onode;
+	peer->active_count = 0;
+	copy_target(&peer->target, &inode->rt.target);
+	peer->target.flags = PW_NODE_TARGET_PEER;
+
+	spa_list_append(&onode->peer_list, &peer->link);
+	pw_log_debug("new peer %p from %p to %p", peer, onode, inode);
+	pw_impl_node_emit_peer_added(onode, inode);
+
+	return peer;
+}
+
+static void pw_node_peer_unref(struct pw_node_peer *peer)
+{
+	if (--peer->ref > 0)
+		return;
+	spa_list_remove(&peer->link);
+	pw_log_debug("remove peer %p from %p to %p", peer, peer->output, peer->target.node);
+	pw_impl_node_emit_peer_removed(peer->output, peer->target.node);
+	free(peer);
+}
+
+static void pw_node_peer_activate(struct pw_node_peer *peer)
+{
+	struct pw_node_activation_state *state;
+
+	state = &peer->target.activation->state[0];
+
+	if (peer->active_count++ == 0) {
+		spa_list_append(&peer->output->rt.target_list, &peer->target.link);
+		if (!peer->target.active && peer->output->rt.driver_target.node != NULL) {
+			state->required++;
+			peer->target.active = true;
+		}
+	}
+	pw_log_trace("%p: node:%s state:%p pending:%d/%d", peer->output,
+			peer->target.name, state, state->pending, state->required);
+}
+
+static void pw_node_peer_deactivate(struct pw_node_peer *peer)
+{
+	struct pw_node_activation_state *state;
+	state = &peer->target.activation->state[0];
+	if (--peer->active_count == 0) {
+
+		spa_list_remove(&peer->target.link);
+
+		if (peer->target.active) {
+			state->required--;
+			peer->target.active = false;
+		}
+	}
+	pw_log_trace("%p: node:%s state:%p pending:%d/%d", peer->output,
+			peer->target.name, state, state->pending, state->required);
+}
+
 
 static void info_changed(struct pw_impl_link *link)
 {
@@ -108,12 +157,16 @@ static void link_update_state(struct pw_impl_link *link, enum pw_link_state stat
 		     pw_link_state_as_string(state), error);
 
 	if (state == PW_LINK_STATE_ERROR) {
-		pw_log_error("(%s) %s -> error (%s)", link->name,
-				pw_link_state_as_string(old), error);
+		pw_log_error("(%s) %s -> error (%s) (%s-%s)", link->name,
+				pw_link_state_as_string(old), error,
+				pw_impl_port_state_as_string(link->output->state),
+				pw_impl_port_state_as_string(link->input->state));
 	} else {
-		pw_log_info("(%s) %s -> %s", link->name,
+		pw_log_info("(%s) %s -> %s (%s-%s)", link->name,
 				pw_link_state_as_string(old),
-				pw_link_state_as_string(state));
+				pw_link_state_as_string(state),
+				pw_impl_port_state_as_string(link->output->state),
+				pw_impl_port_state_as_string(link->input->state));
 	}
 
 	pw_impl_link_emit_state_changed(link, old, state, error);
@@ -281,8 +334,10 @@ static int do_negotiate(struct pw_impl_link *this)
 	/* find a common format for the ports */
 	if ((res = pw_context_find_format(context,
 					output, input, NULL, 0, NULL,
-					&format, &b, &error)) < 0)
+					&format, &b, &error)) < 0) {
+		format = NULL;
 		goto error;
+	}
 
 	format = spa_pod_copy(format);
 	spa_pod_fixate(format);
@@ -431,7 +486,6 @@ static int port_set_io(struct pw_impl_link *this, struct pw_impl_port *port, uin
 {
 	int res = 0;
 
-	mix->io = data;
 	pw_log_debug("%p: %s port %p %d.%d set io: %d %p %zd", this,
 			pw_direction_as_string(port->direction),
 			port, port->port_id, mix->port.port_id, id, data, size);
@@ -515,6 +569,9 @@ static int do_allocation(struct pw_impl_link *this)
 		if (output->node->remote || input->node->remote)
 			alloc_flags |= PW_BUFFERS_FLAG_SHARED_MEM;
 
+		if (output->node->driver)
+			alloc_flags |= PW_BUFFERS_FLAG_IN_PRIORITY;
+
 		/* if output port can alloc buffers, alloc skeleton buffers */
 		if (SPA_FLAG_IS_SET(out_flags, SPA_PORT_FLAG_CAN_ALLOC_BUFFERS)) {
 			SPA_FLAG_SET(alloc_flags, PW_BUFFERS_FLAG_NO_MEM);
@@ -584,28 +641,9 @@ do_activate_link(struct spa_loop *loop,
 		 bool async, uint32_t seq, const void *data, size_t size, void *user_data)
 {
 	struct pw_impl_link *this = user_data;
-	struct impl *impl = SPA_CONTAINER_OF(this, struct impl, this);
-
 	pw_log_trace("%p: activate", this);
-
-	spa_list_append(&this->output->rt.mix_list, &this->rt.out_mix.rt_link);
-	spa_list_append(&this->input->rt.mix_list, &this->rt.in_mix.rt_link);
-
-	if (impl->inode != impl->onode) {
-		struct pw_node_activation_state *state;
-
-		this->rt.target.activation = impl->inode->rt.activation;
-		spa_list_append(&impl->onode->rt.target_list, &this->rt.target.link);
-
-		state = &this->rt.target.activation->state[0];
-		if (!this->rt.target.active && impl->onode->rt.driver_target.node != NULL) {
-			state->required++;
-			this->rt.target.active = true;
-		}
-
-		pw_log_trace("%p: node:%p state:%p pending:%d/%d", this, impl->inode,
-				state, state->pending, state->required);
-	}
+	if (this->peer)
+		pw_node_peer_activate(this->peer);
 	return 0;
 }
 
@@ -617,19 +655,21 @@ int pw_impl_link_activate(struct pw_impl_link *this)
 	pw_log_debug("%p: activate activated:%d state:%s", this, impl->activated,
 			pw_link_state_as_string(this->info.state));
 
-	if (impl->activated || !this->prepared || !impl->inode->active || !impl->onode->active)
+	if (this->destroyed || impl->activated || !this->prepared ||
+		!impl->inode->runnable || !impl->onode->runnable)
 		return 0;
 
-	if (!impl->io_set) {
-		if ((res = port_set_io(this, this->output, SPA_IO_Buffers, this->io,
-				sizeof(struct spa_io_buffers), &this->rt.out_mix)) < 0)
-			return res;
+	if ((res = port_set_io(this, this->input, SPA_IO_Buffers, this->io,
+			sizeof(struct spa_io_buffers), &this->rt.in_mix)) < 0)
+		return res;
 
-		if ((res = port_set_io(this, this->input, SPA_IO_Buffers, this->io,
-				sizeof(struct spa_io_buffers), &this->rt.in_mix)) < 0)
-			return res;
-		impl->io_set = true;
+	if ((res = port_set_io(this, this->output, SPA_IO_Buffers, this->io,
+			sizeof(struct spa_io_buffers), &this->rt.out_mix)) < 0) {
+		port_set_io(this, this->input, SPA_IO_Buffers, NULL, 0,
+				&this->rt.in_mix);
+		return res;
 	}
+
 	pw_loop_invoke(this->output->node->data_loop,
 	       do_activate_link, SPA_ID_INVALID, NULL, 0, false, this);
 
@@ -776,14 +816,14 @@ int pw_impl_link_prepare(struct pw_impl_link *this)
 {
 	struct impl *impl = SPA_CONTAINER_OF(this, struct impl, this);
 
-	pw_log_debug("%p: prepared:%d preparing:%d in_active:%d out_active:%d",
+	pw_log_debug("%p: prepared:%d preparing:%d in_active:%d out_active:%d passive:%u",
 			this, this->prepared, this->preparing,
-			impl->inode->active, impl->onode->active);
+			impl->inode->active, impl->onode->active, this->passive);
 
 	if (!impl->inode->active || !impl->onode->active)
 		return 0;
 
-	if (this->preparing || this->prepared)
+	if (this->destroyed || this->preparing || this->prepared)
 		return 0;
 
 	this->preparing = true;
@@ -799,27 +839,9 @@ do_deactivate_link(struct spa_loop *loop,
 		   bool async, uint32_t seq, const void *data, size_t size, void *user_data)
 {
         struct pw_impl_link *this = user_data;
-	struct impl *impl = SPA_CONTAINER_OF(this, struct impl, this);
-
-	pw_log_trace("%p: disable %p and %p", this, &this->rt.in_mix, &this->rt.out_mix);
-
-	spa_list_remove(&this->rt.out_mix.rt_link);
-	spa_list_remove(&this->rt.in_mix.rt_link);
-
-	if (this->input->node != this->output->node) {
-		struct pw_node_activation_state *state;
-
-		spa_list_remove(&this->rt.target.link);
-		state = &this->rt.target.activation->state[0];
-		if (this->rt.target.active) {
-			state->required--;
-			this->rt.target.active = false;
-		}
-
-		pw_log_trace("%p: node:%p state:%p pending:%d/%d", this, impl->inode,
-				state, state->pending, state->required);
-	}
-
+	pw_log_trace("%p: disable out %p", this, &this->rt.out_mix);
+	if (this->peer)
+		pw_node_peer_deactivate(this->peer);
 	return 0;
 }
 
@@ -840,19 +862,19 @@ int pw_impl_link_deactivate(struct pw_impl_link *this)
 	port_set_io(this, this->input, SPA_IO_Buffers, NULL, 0,
 			&this->rt.in_mix);
 
-	impl->io_set = false;
 	impl->activated = false;
 	pw_log_info("(%s) deactivated", this->name);
-	link_update_state(this, PW_LINK_STATE_PAUSED, 0, NULL);
-
+	link_update_state(this, this->destroyed ?
+			PW_LINK_STATE_INIT : PW_LINK_STATE_PAUSED,
+			0, NULL);
 	return 0;
 }
 
 static int
-global_bind(void *_data, struct pw_impl_client *client, uint32_t permissions,
+global_bind(void *object, struct pw_impl_client *client, uint32_t permissions,
 	       uint32_t version, uint32_t id)
 {
-	struct pw_impl_link *this = _data;
+	struct pw_impl_link *this = object;
 	struct pw_global *global = this->global;
 	struct pw_resource *resource;
 
@@ -1108,18 +1130,84 @@ static void try_unlink_controls(struct impl *impl, struct pw_impl_port *output, 
 	}
 }
 
+static int check_owner_permissions(struct pw_context *context,
+		struct pw_impl_node *node, struct pw_global *other, uint32_t permissions)
+{
+	const char *str;
+	struct pw_impl_client *client;
+	struct pw_global *global;
+	uint32_t perms;
+	uint32_t client_id;
+
+	str = pw_properties_get(node->properties, PW_KEY_CLIENT_ID);
+	if (str == NULL)
+		/* node not owned by client */
+		return 0;
+
+	if (!spa_atou32(str, &client_id, 0))
+		/* invalid client_id, something is wrong */
+		return -EIO;
+	if ((global = pw_context_find_global(context, client_id)) == NULL)
+		/* current client can't see the owner client */
+		return -errno;
+	if (!pw_global_is_type(global, PW_TYPE_INTERFACE_Client) ||
+	    (client = global->object) == NULL)
+		/* not the right object, something wrong */
+		return -EIO;
+
+	perms = pw_global_get_permissions(other, client);
+	if ((perms & permissions) != permissions)
+		/* owner client can't see other node */
+		return -EPERM;
+
+	return 0;
+}
+
 static int
 check_permission(struct pw_context *context,
 		 struct pw_impl_port *output,
 		 struct pw_impl_port *input,
 		 struct pw_properties *properties)
 {
+	int res;
+	uint32_t in_perms, out_perms;
+	struct pw_global *in_global, *out_global;
+
+	if ((in_global = input->node->global) == NULL)
+		return -ENOENT;
+	if ((out_global = output->node->global) == NULL)
+		return -ENOENT;
+
+	in_perms = out_perms = PW_PERM_R | PW_PERM_L;
+	if (context->current_client != NULL) {
+		in_perms = pw_global_get_permissions(in_global, context->current_client);
+		out_perms = pw_global_get_permissions(out_global, context->current_client);
+	}
+	/* current client can't see input node or output node */
+	if (!PW_PERM_IS_R(in_perms) || !PW_PERM_IS_R(out_perms))
+		return -ENOENT;
+
+	if ((res = check_owner_permissions(context, output->node,
+					in_global, PW_PERM_R)) < 0) {
+		/* output node owner can't see input node, check if the current
+		 * client has universal link permissions for the output node */
+		if (!PW_PERM_IS_L(out_perms))
+			return res;
+	}
+	if ((res = check_owner_permissions(context, input->node,
+					out_global, PW_PERM_R)) < 0) {
+		/* input node owner can't see output node, check if the current
+		 * client has universal link permissions for the input node */
+		if (!PW_PERM_IS_L(in_perms))
+			return res;
+	}
 	return 0;
 }
 
 static void permissions_changed(struct pw_impl_link *this, struct pw_impl_port *other,
 		struct pw_impl_client *client, uint32_t old, uint32_t new)
 {
+	int res;
 	uint32_t perm;
 
 	perm = pw_global_get_permissions(other->global, client);
@@ -1127,17 +1215,36 @@ static void permissions_changed(struct pw_impl_link *this, struct pw_impl_port *
 	new &= perm;
 	pw_log_debug("%p: permissions changed %08x -> %08x", this, old, new);
 
-	if (check_permission(this->context, this->output, this->input, this->properties) < 0) {
+	if ((res = check_permission(this->context, this->output, this->input, this->properties)) < 0) {
+		pw_log_info("%p: link permissions removed: %s", this, spa_strerror(res));
 		pw_impl_link_destroy(this);
 	} else if (this->global != NULL) {
 		pw_global_update_permissions(this->global, client, old, new);
 	}
 }
 
+static bool is_port_owner(struct pw_impl_client *client, struct pw_impl_port *port)
+{
+	const char *str;
+	uint32_t client_id;
+
+	str = pw_properties_get(port->node->properties, PW_KEY_CLIENT_ID);
+	if (str == NULL)
+		return false;
+
+	if (!spa_atou32(str, &client_id, 0))
+		return false;
+
+	return client_id == client->info.id;
+}
+
 static void output_permissions_changed(void *data,
 		struct pw_impl_client *client, uint32_t old, uint32_t new)
 {
 	struct pw_impl_link *this = data;
+	if (!is_port_owner(client, this->output) &&
+	    !is_port_owner(client, this->input))
+		return;
 	permissions_changed(this, this->input, client, old, new);
 }
 
@@ -1150,6 +1257,9 @@ static void input_permissions_changed(void *data,
 		struct pw_impl_client *client, uint32_t old, uint32_t new)
 {
 	struct pw_impl_link *this = data;
+	if (!is_port_owner(client, this->output) &&
+	    !is_port_owner(client, this->input))
+		return;
 	permissions_changed(this, this->output, client, old, new);
 }
 
@@ -1169,6 +1279,7 @@ struct pw_impl_link *pw_context_create_link(struct pw_context *context,
 	struct impl *impl;
 	struct pw_impl_link *this;
 	struct pw_impl_node *input_node, *output_node;
+	const char *str;
 	int res;
 
 	if (output == input)
@@ -1218,7 +1329,13 @@ struct pw_impl_link *pw_context_create_link(struct pw_context *context,
 	this->input = input;
 
 	/* passive means that this link does not make the nodes active */
-	this->passive = pw_properties_get_bool(properties, PW_KEY_LINK_PASSIVE, false);
+	str = pw_properties_get(properties, PW_KEY_LINK_PASSIVE);
+	this->passive = str ? spa_atob(str) :
+		(output->passive && input_node->can_suspend) ||
+		(input->passive && output_node->can_suspend) ||
+		(input->passive && output->passive);
+	if (this->passive && str == NULL)
+		 pw_properties_set(properties, PW_KEY_LINK_PASSIVE, "true");
 
 	spa_hook_list_init(&this->listener_list);
 
@@ -1262,17 +1379,13 @@ struct pw_impl_link *pw_context_create_link(struct pw_context *context,
 		impl->inode = input_node;
 	}
 
-	this->rt.target.signal = impl->inode->rt.target.signal;
-	this->rt.target.data = impl->inode->rt.target.data;
-
 	pw_log_debug("%p: constructed out:%p:%d.%d -> in:%p:%d.%d", impl,
 		     output_node, output->port_id, this->rt.out_mix.port.port_id,
 		     input_node, input->port_id, this->rt.in_mix.port.port_id);
 
-	if (asprintf(&this->name, "%d.%d -> %d.%d",
-			output_node->info.id, output->port_id,
-			input_node->info.id, input->port_id) < 0)
-		this->name = NULL;
+	this->name = spa_aprintf("%d.%d.%d -> %d.%d.%d",
+			output_node->info.id, output->port_id, this->rt.out_mix.port.port_id,
+			input_node->info.id, input->port_id, this->rt.in_mix.port.port_id);
 	pw_log_info("(%s) (%s) -> (%s)", this->name, output_node->name, input_node->name);
 
 	pw_impl_port_emit_link_added(output, this);
@@ -1283,7 +1396,8 @@ struct pw_impl_link *pw_context_create_link(struct pw_context *context,
 	pw_impl_port_recalc_latency(output);
 	pw_impl_port_recalc_latency(input);
 
-	pw_impl_node_emit_peer_added(impl->onode, impl->inode);
+	if (impl->onode != impl->inode)
+		this->peer = pw_node_peer_ref(impl->onode, impl->inode);
 
 	return this;
 
@@ -1322,9 +1436,9 @@ error_exit:
 	return NULL;
 }
 
-static void global_destroy(void *object)
+static void global_destroy(void *data)
 {
-	struct pw_impl_link *link = object;
+	struct pw_impl_link *link = data;
 	spa_hook_remove(&link->global_listener);
 	link->global = NULL;
 	pw_impl_link_destroy(link);
@@ -1369,6 +1483,7 @@ int pw_impl_link_register(struct pw_impl_link *link,
 	link->global = pw_global_new(context,
 				     PW_TYPE_INTERFACE_Link,
 				     PW_VERSION_LINK,
+				     PW_LINK_PERM_MASK,
 				     properties,
 				     global_bind,
 				     link);
@@ -1411,6 +1526,8 @@ void pw_impl_link_destroy(struct pw_impl_link *link)
 
 	pw_log_debug("%p: destroy", impl);
 	pw_log_info("(%s) destroy", link->name);
+
+	link->destroyed = true;
 	pw_impl_link_emit_destroy(link);
 
 	pw_impl_link_deactivate(link);
@@ -1418,7 +1535,8 @@ void pw_impl_link_destroy(struct pw_impl_link *link)
 	if (link->registered)
 		spa_list_remove(&link->link);
 
-	pw_impl_node_emit_peer_removed(impl->onode, impl->inode);
+	if (link->peer)
+		pw_node_peer_unref(link->peer);
 
 	try_unlink_controls(impl, link->output, link->input);
 

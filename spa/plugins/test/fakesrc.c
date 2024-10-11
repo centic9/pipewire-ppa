@@ -1,26 +1,6 @@
-/* Spa
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* Spa */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
 #include <stddef.h>
@@ -32,6 +12,7 @@
 #include <spa/support/log.h>
 #include <spa/support/loop.h>
 #include <spa/utils/list.h>
+#include <spa/utils/result.h>
 #include <spa/utils/string.h>
 #include <spa/node/node.h>
 #include <spa/node/utils.h>
@@ -181,6 +162,7 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 	case SPA_PARAM_Props:
 	{
 		struct props *p = &this->props;
+		struct port *port = &this->port;
 
 		if (param == NULL) {
 			reset_props(this, p);
@@ -192,9 +174,9 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 			SPA_PROP_patternType, SPA_POD_OPT_Id(&p->pattern));
 
 		if (p->live)
-			this->info.flags |= SPA_PORT_FLAG_LIVE;
+			port->info.flags |= SPA_PORT_FLAG_LIVE;
 		else
-			this->info.flags &= ~SPA_PORT_FLAG_LIVE;
+			port->info.flags &= ~SPA_PORT_FLAG_LIVE;
 		break;
 	}
 	default:
@@ -229,15 +211,20 @@ static void set_timer(struct impl *this, bool enabled)
 	}
 }
 
-static inline void read_timer(struct impl *this)
+static inline int read_timer(struct impl *this)
 {
 	uint64_t expirations;
+	int res = 0;
 
 	if (this->callbacks.funcs || this->props.live) {
-		if (spa_system_timerfd_read(this->data_system,
-					this->timer_source.fd, &expirations) < 0)
-			perror("read timerfd");
+		if ((res = spa_system_timerfd_read(this->data_system,
+					this->timer_source.fd, &expirations)) < 0) {
+			if (res != -EAGAIN)
+				spa_log_error(this->log, NAME " %p: timerfd error: %s",
+						this, spa_strerror(res));
+		}
 	}
+	return res;
 }
 
 static int make_buffer(struct impl *this)
@@ -247,7 +234,8 @@ static int make_buffer(struct impl *this)
 	struct spa_io_buffers *io = port->io;
 	int n_bytes;
 
-	read_timer(this);
+	if (read_timer(this) < 0)
+		return 0;
 
 	if (spa_list_is_empty(&port->empty)) {
 		set_timer(this, false);
@@ -589,10 +577,12 @@ impl_node_port_use_buffers(void *object,
 	spa_return_val_if_fail(CHECK_PORT(this, direction, port_id), -EINVAL);
 	port = &this->port;
 
-	if (!port->have_format)
-		return -EIO;
-
 	clear_buffers(this, port);
+
+	if (n_buffers > 0 && !port->have_format)
+		return -EIO;
+	if (n_buffers > MAX_BUFFERS)
+		return -ENOSPC;
 
 	for (i = 0; i < n_buffers; i++) {
 		struct buffer *b;
@@ -679,8 +669,8 @@ static int impl_node_process(void *object)
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 
 	port = &this->port;
-	io = port->io;
-	spa_return_val_if_fail(io != NULL, -EIO);
+	if ((io = port->io) == NULL)
+		return -EIO;
 
 	if (io->status == SPA_STATUS_HAVE_DATA)
 		return SPA_STATUS_HAVE_DATA;
@@ -731,6 +721,13 @@ static int impl_get_interface(struct spa_handle *handle, const char *type, void 
 	return 0;
 }
 
+static int do_remove_timer(struct spa_loop *loop, bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct impl *this = user_data;
+	spa_loop_remove_source(this->data_loop, &this->timer_source);
+	return 0;
+}
+
 static int impl_clear(struct spa_handle *handle)
 {
 	struct impl *this;
@@ -740,7 +737,7 @@ static int impl_clear(struct spa_handle *handle)
 	this = (struct impl *) handle;
 
 	if (this->data_loop)
-		spa_loop_remove_source(this->data_loop, &this->timer_source);
+		spa_loop_invoke(this->data_loop, do_remove_timer, 0, NULL, 0, true, this);
 	spa_system_close(this->data_system, this->timer_source.fd);
 
 	return 0;

@@ -60,8 +60,9 @@ context.spa-libs = {
 
 context.modules = [
     #{ name = <module-name>
-    #    [ args  = { <key> = <value> ... } ]
-    #    [ flags = [ [ ifexists ] [ nofail ] ]
+    #    ( args  = { <key> = <value> ... } )
+    #    ( flags = [ ( ifexists ) ( nofail ) ] )
+    #    ( condition = [ { <key> = <value> ... } ... ] )
     #}
     #
     # Loads a module with the given parameters.
@@ -135,8 +136,9 @@ context.modules = [
 
 context.objects = [
     #{ factory = <factory-name>
-    #    [ args  = { <key> = <value> ... } ]
-    #    [ flags = [ [ nofail ] ]
+    #    ( args  = { <key> = <value> ... } )
+    #    ( flags = [ ( nofail ) ] )
+    #    ( condition = [ { <key> = <value> ... } ... ] )
     #}
     #
     # Creates an object from a PipeWire factory with the given parameters.
@@ -150,7 +152,15 @@ context.objects = [
     #{ factory = spa-node-factory   args = { factory.name = api.vulkan.compute.source node.name = my-compute-source } }
 
     # Make a default metadata store
-    { factory = metadata            args = { metadata.name = default } }
+    { factory = metadata
+        args = {
+            metadata.name = default
+    #       metadata.values = [
+    #            { key = default.audio.sink   value = { name = somesink } }
+    #            { key = default.audio.source value = { name = somesource } }
+    #        ]
+        }
+    }
 
     # A default dummy driver. This handles nodes marked with the "node.always-driver"
     # property when no other driver is currently active. JACK clients need this.
@@ -202,15 +212,17 @@ context.objects = [
             #resample.quality       = 4
             resample.disable       = true
             #monitor.channel-volumes = false
-            #channelmix.normalize   = true
-            #channelmix.mix-lfe     = false
-            #channelmix.upmix       = false
-            #channelmix.lfe-cutoff  = 0
-            #channelmix.fc-cutoff  = 0
+            #channelmix.normalize   = false
+            #channelmix.mix-lfe     = true
+            #channelmix.upmix       = true
+            #channelmix.upmix-method = psd  # none, simple
+            #channelmix.lfe-cutoff  = 150
+            #channelmix.fc-cutoff   = 12000
             #channelmix.rear-delay  = 12.0
             #channelmix.stereo-widen = 0.0
             #channelmix.hilbert-taps = 0
             channelmix.disable     = true
+            #dither.noise = 0
             #node.param.Props      = {
             #    params = [
             #        audio.channels 6
@@ -219,6 +231,7 @@ context.objects = [
             adapter.auto-port-config = {
                 mode = dsp
                 monitor = false
+                control = false
                 position = unknown   # aux, preserve
             }
             #node.param.PortConfig    = {
@@ -261,15 +274,17 @@ context.objects = [
             #audio.position         = "FL,FR"
             #resample.quality      = 4
             resample.disable      = true
-            #channelmix.normalize  = true
-            #channelmix.mix-lfe    = false
-            #channelmix.upmix      = false
-            #channelmix.lfe-cutoff = 0
-            #channelmix.fc-cutoff  = 0
+            #channelmix.normalize  = false
+            #channelmix.mix-lfe    = true
+            #channelmix.upmix      = true
+            #channelmix.upmix-method = psd  # none, simple
+            #channelmix.lfe-cutoff = 150
+            #channelmix.fc-cutoff  = 12000
             #channelmix.rear-delay = 12.0
             #channelmix.stereo-widen = 0.0
             #channelmix.hilbert-taps = 0
             channelmix.disable     = true
+            #dither.noise = 0
             #node.param.Props      = {
             #    params = [
             #        audio.format  S16
@@ -278,6 +293,7 @@ context.objects = [
             adapter.auto-port-config = {
                 mode = dsp
                 monitor = false
+                control = false
                 position = unknown   # aux, preserve
             }
             #node.param.PortConfig    = {
@@ -318,7 +334,6 @@ context.objects = [
     #        link.output.port = capture_1
     #        link.input.node  = my-mic
     #        link.input.port  = input_FL
-    #        link.passive     = true
     #    }
     #}
     #{ factory = link-factory
@@ -327,13 +342,15 @@ context.objects = [
     #        link.output.port = capture_2
     #        link.input.node  = my-mic
     #        link.input.port  = input_FR
-    #        link.passive     = true
     #    }
     #}
 ]
 
 context.exec = [
-    #{ path = <program-name> [ args = "<arguments>" ] }
+    #{   path = <program-name>
+    #    ( args = "<arguments>" )
+    #    ( condition = [ { <key> = <value> ... } ... ] )
+    #}
     #
     # Execute the given program with arguments.
     #

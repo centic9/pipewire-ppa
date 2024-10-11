@@ -1,27 +1,7 @@
-/* PipeWire
- *
- * Copyright © 2019 Collabora Ltd.
- *   @author George Kiagiadakis <george.kiagiadakis@collabora.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2019 Collabora Ltd. */
+/*                         @author George Kiagiadakis <george.kiagiadakis@collabora.com> */
+/* SPDX-License-Identifier: MIT */
 
 #ifndef PIPEWIRE_EXT_SESSION_MANAGER_INTERFACES_H
 #define PIPEWIRE_EXT_SESSION_MANAGER_INTERFACES_H
@@ -41,18 +21,22 @@ extern "C" {
  */
 
 #define PW_TYPE_INTERFACE_Session		PW_TYPE_INFO_INTERFACE_BASE "Session"
+#define PW_SESSION_PERM_MASK			PW_PERM_RWX
 #define PW_VERSION_SESSION			0
 struct pw_session;
 
 #define PW_TYPE_INTERFACE_Endpoint		PW_TYPE_INFO_INTERFACE_BASE "Endpoint"
+#define PW_ENDPOINT_PERM_MASK			PW_PERM_RWX
 #define PW_VERSION_ENDPOINT			0
 struct pw_endpoint;
 
 #define PW_TYPE_INTERFACE_EndpointStream	PW_TYPE_INFO_INTERFACE_BASE "EndpointStream"
+#define PW_ENDPOINT_STREAM_PERM_MASK		PW_PERM_RWX
 #define PW_VERSION_ENDPOINT_STREAM		0
 struct pw_endpoint_stream;
 
 #define PW_TYPE_INTERFACE_EndpointLink		PW_TYPE_INFO_INTERFACE_BASE "EndpointLink"
+#define PW_ENDPOINT_LINK_PERM_MASK		PW_PERM_RWX
 #define PW_VERSION_ENDPOINT_LINK		0
 struct pw_endpoint_link;
 
@@ -71,7 +55,7 @@ struct pw_session_events {
 	 *
 	 * \param info info about the session
 	 */
-	void (*info) (void *object, const struct pw_session_info *info);
+	void (*info) (void *data, const struct pw_session_info *info);
 
 	/**
 	 * Notify a session param
@@ -84,7 +68,7 @@ struct pw_session_events {
 	 * \param next the param index of the next param
 	 * \param param the parameter
 	 */
-	void (*param) (void *object, int seq,
+	void (*param) (void *data, int seq,
 		       uint32_t id, uint32_t index, uint32_t next,
 		       const struct spa_pod *param);
 };
@@ -113,6 +97,8 @@ struct pw_session_methods {
 	 *
 	 * \param ids an array of param ids
 	 * \param n_ids the number of ids in \a ids
+	 *
+	 * This requires X permissions.
 	 */
 	int (*subscribe_params) (void *object, uint32_t *ids, uint32_t n_ids);
 
@@ -127,6 +113,8 @@ struct pw_session_methods {
 	 * \param start the start index or 0 for the first param
 	 * \param num the maximum number of params to retrieve
 	 * \param filter a param filter or NULL
+	 *
+	 * This requires X permissions.
 	 */
 	int (*enum_params) (void *object, int seq,
 			uint32_t id, uint32_t start, uint32_t num,
@@ -138,6 +126,8 @@ struct pw_session_methods {
 	 * \param id the parameter id to set
 	 * \param flags extra parameter flags
 	 * \param param the parameter to set
+	 *
+	 * This requires X and W permissions.
 	 */
 	int (*set_param) (void *object, uint32_t id, uint32_t flags,
 			  const struct spa_pod *param);
@@ -173,7 +163,7 @@ struct pw_endpoint_events {
 	 *
 	 * \param info info about the endpoint
 	 */
-	void (*info) (void *object, const struct pw_endpoint_info *info);
+	void (*info) (void *data, const struct pw_endpoint_info *info);
 
 	/**
 	 * Notify a endpoint param
@@ -186,7 +176,7 @@ struct pw_endpoint_events {
 	 * \param next the param index of the next param
 	 * \param param the parameter
 	 */
-	void (*param) (void *object, int seq,
+	void (*param) (void *data, int seq,
 		       uint32_t id, uint32_t index, uint32_t next,
 		       const struct spa_pod *param);
 };
@@ -215,6 +205,8 @@ struct pw_endpoint_methods {
 	 *
 	 * \param ids an array of param ids
 	 * \param n_ids the number of ids in \a ids
+	 *
+	 * This requires X permissions.
 	 */
 	int (*subscribe_params) (void *object, uint32_t *ids, uint32_t n_ids);
 
@@ -229,6 +221,8 @@ struct pw_endpoint_methods {
 	 * \param start the start index or 0 for the first param
 	 * \param num the maximum number of params to retrieve
 	 * \param filter a param filter or NULL
+	 *
+	 * This requires X permissions.
 	 */
 	int (*enum_params) (void *object, int seq,
 			uint32_t id, uint32_t start, uint32_t num,
@@ -240,10 +234,17 @@ struct pw_endpoint_methods {
 	 * \param id the parameter id to set
 	 * \param flags extra parameter flags
 	 * \param param the parameter to set
+	 *
+	 * This requires X and W permissions.
 	 */
 	int (*set_param) (void *object, uint32_t id, uint32_t flags,
 			  const struct spa_pod *param);
 
+	/**
+	 * Create a link
+	 *
+	 * This requires X permissions.
+	 */
 	int (*create_link) (void *object, const struct spa_dict *props);
 };
 
@@ -277,7 +278,7 @@ struct pw_endpoint_stream_events {
 	 *
 	 * \param info info about the endpoint stream
 	 */
-	void (*info) (void *object, const struct pw_endpoint_stream_info *info);
+	void (*info) (void *data, const struct pw_endpoint_stream_info *info);
 
 	/**
 	 * Notify a endpoint stream param
@@ -290,7 +291,7 @@ struct pw_endpoint_stream_events {
 	 * \param next the param index of the next param
 	 * \param param the parameter
 	 */
-	void (*param) (void *object, int seq,
+	void (*param) (void *data, int seq,
 		       uint32_t id, uint32_t index, uint32_t next,
 		       const struct spa_pod *param);
 };
@@ -318,6 +319,8 @@ struct pw_endpoint_stream_methods {
 	 *
 	 * \param ids an array of param ids
 	 * \param n_ids the number of ids in \a ids
+	 *
+	 * This requires X permissions.
 	 */
 	int (*subscribe_params) (void *object, uint32_t *ids, uint32_t n_ids);
 
@@ -332,6 +335,8 @@ struct pw_endpoint_stream_methods {
 	 * \param start the start index or 0 for the first param
 	 * \param num the maximum number of params to retrieve
 	 * \param filter a param filter or NULL
+	 *
+	 * This requires X permissions.
 	 */
 	int (*enum_params) (void *object, int seq,
 			uint32_t id, uint32_t start, uint32_t num,
@@ -343,6 +348,8 @@ struct pw_endpoint_stream_methods {
 	 * \param id the parameter id to set
 	 * \param flags extra parameter flags
 	 * \param param the parameter to set
+	 *
+	 * This requires X and W permissions.
 	 */
 	int (*set_param) (void *object, uint32_t id, uint32_t flags,
 			  const struct spa_pod *param);
@@ -377,7 +384,7 @@ struct pw_endpoint_link_events {
 	 *
 	 * \param info info about the endpoint link
 	 */
-	void (*info) (void *object, const struct pw_endpoint_link_info *info);
+	void (*info) (void *data, const struct pw_endpoint_link_info *info);
 
 	/**
 	 * Notify a endpoint link param
@@ -390,7 +397,7 @@ struct pw_endpoint_link_events {
 	 * \param next the param index of the next param
 	 * \param param the parameter
 	 */
-	void (*param) (void *object, int seq,
+	void (*param) (void *data, int seq,
 		       uint32_t id, uint32_t index, uint32_t next,
 		       const struct spa_pod *param);
 };
@@ -420,6 +427,8 @@ struct pw_endpoint_link_methods {
 	 *
 	 * \param ids an array of param ids
 	 * \param n_ids the number of ids in \a ids
+	 *
+	 * This requires X permissions.
 	 */
 	int (*subscribe_params) (void *object, uint32_t *ids, uint32_t n_ids);
 
@@ -434,6 +443,8 @@ struct pw_endpoint_link_methods {
 	 * \param start the start index or 0 for the first param
 	 * \param num the maximum number of params to retrieve
 	 * \param filter a param filter or NULL
+	 *
+	 * This requires X permissions.
 	 */
 	int (*enum_params) (void *object, int seq,
 			uint32_t id, uint32_t start, uint32_t num,
@@ -445,10 +456,17 @@ struct pw_endpoint_link_methods {
 	 * \param id the parameter id to set
 	 * \param flags extra parameter flags
 	 * \param param the parameter to set
+	 *
+	 * This requires X and W permissions.
 	 */
 	int (*set_param) (void *object, uint32_t id, uint32_t flags,
 			  const struct spa_pod *param);
 
+	/**
+	 * Request a state on the link.
+	 *
+	 * This requires X and W permissions.
+	 */
 	int (*request_state) (void *object, enum pw_endpoint_link_state state);
 };
 

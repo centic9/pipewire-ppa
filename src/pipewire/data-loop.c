@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <pthread.h>
 #include <errno.h>
@@ -40,11 +20,11 @@ int pw_data_loop_wait(struct pw_data_loop *this, int timeout)
 	int res;
 
 	while (true) {
-		if (!this->running) {
+		if (SPA_UNLIKELY(!this->running)) {
 			res = -ECANCELED;
 			break;
 		}
-		if ((res = pw_loop_iterate(this->loop, timeout)) < 0) {
+		if (SPA_UNLIKELY((res = pw_loop_iterate(this->loop, timeout)) < 0)) {
 			if (res == -EINTR)
 				continue;
 		}
@@ -71,14 +51,18 @@ static void *do_loop(void *user_data)
 {
 	struct pw_data_loop *this = user_data;
 	int res;
+	struct spa_callbacks *cb = &this->loop->control->iface.cb;
+	const struct spa_loop_control_methods *m = cb->funcs;
+	void *data = cb->data;
+	int (*iterate) (void *object, int timeout) = m->iterate;
 
 	pw_log_debug("%p: enter thread", this);
 	pw_loop_enter(this->loop);
 
 	pthread_cleanup_push(thread_cleanup, this);
 
-	while (this->running) {
-		if ((res = pw_loop_iterate(this->loop, -1)) < 0) {
+	while (SPA_LIKELY(this->running)) {
+		if (SPA_UNLIKELY((res = iterate(data, -1)) < 0)) {
 			if (res == -EINTR)
 				continue;
 			pw_log_error("%p: iterate error %d (%s)",
@@ -197,16 +181,21 @@ SPA_EXPORT
 int pw_data_loop_start(struct pw_data_loop *loop)
 {
 	if (!loop->running) {
+		struct spa_thread_utils *utils;
 		struct spa_thread *thr;
 
 		loop->running = true;
-		thr = pw_thread_utils_create(NULL, do_loop, loop);
+
+		if ((utils = loop->thread_utils) == NULL)
+			utils = pw_thread_utils_get();
+		thr = spa_thread_utils_create(utils, NULL, do_loop, loop);
 		loop->thread = (pthread_t)thr;
 		if (thr == NULL) {
 			pw_log_error("%p: can't create thread: %m", loop);
 			loop->running = false;
 			return -errno;
 		}
+		spa_thread_utils_acquire_rt(utils, thr, -1);
 	}
 	return 0;
 }
@@ -223,6 +212,7 @@ int pw_data_loop_stop(struct pw_data_loop *loop)
 {
 	pw_log_debug("%p stopping", loop);
 	if (loop->running) {
+		struct spa_thread_utils *utils;
 		if (loop->cancel) {
 			pw_log_debug("%p cancel", loop);
 			pthread_cancel(loop->thread);
@@ -231,7 +221,9 @@ int pw_data_loop_stop(struct pw_data_loop *loop)
 			pw_loop_invoke(loop->loop, do_stop, 1, NULL, 0, false, loop);
 		}
 		pw_log_debug("%p join", loop);
-		pw_thread_utils_join((struct spa_thread*)loop->thread, NULL);
+		if ((utils = loop->thread_utils) == NULL)
+			utils = pw_thread_utils_get();
+		spa_thread_utils_join(utils, (struct spa_thread*)loop->thread, NULL);
 		pw_log_debug("%p joined", loop);
 	}
 	pw_log_debug("%p stopped", loop);
@@ -246,7 +238,7 @@ int pw_data_loop_stop(struct pw_data_loop *loop)
 SPA_EXPORT
 bool pw_data_loop_in_thread(struct pw_data_loop * loop)
 {
-	return pthread_equal(loop->thread, pthread_self());
+	return loop->running && pthread_equal(loop->thread, pthread_self());
 }
 
 /** Get the thread object.
@@ -266,10 +258,19 @@ int pw_data_loop_invoke(struct pw_data_loop *loop,
 		spa_invoke_func_t func, uint32_t seq, const void *data, size_t size,
 		bool block, void *user_data)
 {
-	int res;
-	if (loop->running)
-		res = pw_loop_invoke(loop->loop, func, seq, data, size, block, user_data);
-	else
-		res = func(loop->loop->loop, false, seq, data, size, user_data);
-	return res;
+	return pw_loop_invoke(loop->loop, func, seq, data, size, block, user_data);
+}
+
+/** Set a thread utils implementation.
+ * \param loop the data loop to set the thread utils on
+ * \param impl the thread utils implementation
+ *
+ * This configures a custom spa_thread_utils implementation for this data
+ * loop. Use NULL to restore the system default implementation.
+ */
+SPA_EXPORT
+void pw_data_loop_set_thread_utils(struct pw_data_loop *loop,
+		struct spa_thread_utils *impl)
+{
+	loop->thread_utils = impl;
 }

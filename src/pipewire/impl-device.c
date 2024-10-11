@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
 
@@ -235,7 +215,7 @@ static void remove_busy_resource(struct resource_data *d)
 
 	if (d->end != -1) {
 		if (d->pi && d->data.cache) {
-			pw_param_update(&impl->param_list, &impl->pending_list);
+			pw_param_update(&impl->param_list, &impl->pending_list, 0, NULL);
 			d->pi->user = 1;
 			d->pi = NULL;
 		}
@@ -281,8 +261,8 @@ static void result_device_params(void *data, int seq, int res, uint32_t type, co
 		if (d->cache) {
 			pw_log_debug("%p: add param %d", impl, r->id);
 			if (d->count++ == 0)
-				pw_param_add(&impl->pending_list, r->id, NULL);
-			pw_param_add(&impl->pending_list, r->id, r->param);
+				pw_param_add(&impl->pending_list, seq, r->id, NULL);
+			pw_param_add(&impl->pending_list, seq, r->id, r->param);
 		}
 		break;
 	}
@@ -333,10 +313,10 @@ int pw_impl_device_for_each_param(struct pw_impl_device *device,
 		result.next = 0;
 
 		spa_list_for_each(p, &impl->param_list, link) {
-			result.index = result.next++;
 			if (p->id != param_id)
 				continue;
 
+			result.index = result.next++;
 			if (result.index < index)
 				continue;
 
@@ -364,7 +344,7 @@ int pw_impl_device_for_each_param(struct pw_impl_device *device,
 		spa_hook_remove(&listener);
 
 		if (!SPA_RESULT_IS_ASYNC(res) && user_data.cache) {
-			pw_param_update(&impl->param_list, &impl->pending_list);
+			pw_param_update(&impl->param_list, &impl->pending_list, 0, NULL);
 			pi->user = 1;
 		}
 	}
@@ -502,10 +482,10 @@ static const struct pw_device_methods device_methods = {
 };
 
 static int
-global_bind(void *_data, struct pw_impl_client *client, uint32_t permissions,
+global_bind(void *object, struct pw_impl_client *client, uint32_t permissions,
 		  uint32_t version, uint32_t id)
 {
-	struct pw_impl_device *this = _data;
+	struct pw_impl_device *this = object;
 	struct pw_global *global = this->global;
 	struct pw_resource *resource;
 	struct resource_data *data;
@@ -540,9 +520,9 @@ error_resource:
 	return -errno;
 }
 
-static void global_destroy(void *object)
+static void global_destroy(void *data)
 {
-	struct pw_impl_device *device = object;
+	struct pw_impl_device *device = data;
 	spa_hook_remove(&device->global_listener);
 	device->global = NULL;
 	pw_impl_device_destroy(device);
@@ -580,6 +560,7 @@ int pw_impl_device_register(struct pw_impl_device *device,
         device->global = pw_global_new(context,
 				       PW_TYPE_INTERFACE_Device,
 				       PW_VERSION_DEVICE,
+				       PW_DEVICE_PERM_MASK,
 				       properties,
 				       global_bind,
 				       device);

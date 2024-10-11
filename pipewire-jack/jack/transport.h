@@ -14,7 +14,7 @@
 
     You should have received a copy of the GNU Lesser General Public License
     along with this program; if not, write to the Free Software
-    Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA.
 
 */
 
@@ -238,7 +238,7 @@ void jack_get_transport_info (jack_client_t *client,
 void jack_set_transport_info (jack_client_t *client,
 			      jack_transport_info_t *tinfo) JACK_OPTIONAL_WEAK_EXPORT;
 
-/*@}*/
+/**@}*/
 
 #ifdef __cplusplus
 }

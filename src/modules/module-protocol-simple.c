@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2021 Wim Taymans <wim.taymans@gmail.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
 
 #include <string.h>
 #include <stdio.h>
@@ -50,6 +30,77 @@
 #include <pipewire/impl.h>
 
 /** \page page_module_protocol_simple PipeWire Module: Protocol Simple
+ *
+ * The simple protocol provides a bidirectional audio stream on a network
+ * socket.
+ *
+ * It is meant to be used with the `simple protocol player` app, available on
+ * Android to play and record a stream.
+ *
+ * Each client that connects will create a capture and/or playback stream,
+ * depending on the configuration options.
+ *
+ * ## Module Options
+ *
+ *  - `capture`: boolean if capture is enabled. This will create a capture stream
+ *               for each connected client.
+ *  - `playback`: boolean if playback is enabled. This will create a playback
+ *               stream for each connected client.
+ *  - `capture.node`: an optional node serial or name to use for capture.
+ *  - `playback.node`: an optional node serial or name to use for playback.
+ *  - `server.address = []`: an array of server addresses to listen on as
+ *                            tcp:(<ip>:)<port>.
+ *
+ * ## General options
+ *
+ * Options with well-known behavior.
+ *
+ * - \ref PW_KEY_REMOTE_NAME
+ * - \ref PW_KEY_AUDIO_RATE
+ * - \ref PW_KEY_AUDIO_FORMAT
+ * - \ref PW_KEY_AUDIO_CHANNELS
+ * - \ref SPA_KEY_AUDIO_POSITION
+ * - \ref PW_KEY_NODE_LATENCY
+ * - \ref PW_KEY_NODE_RATE
+ * - \ref PW_KEY_STREAM_CAPTURE_SINK
+ *
+ * By default the server will work with stereo 16 bits samples at 44.1KHz.
+ *
+ * ## Example configuration
+ *
+ *\code{.unparsed}
+ * context.modules = [
+ * {   name = libpipewire-module-protocol-simple
+ *     args = {
+ *         # Provide capture stream, clients can capture data from PipeWire
+ *         capture = true
+ *         #
+ *         # Provide playback stream, client can send data to PipeWire for playback
+ *         playback = true
+ *         #
+ *         # The node name or id to use for capture.
+ *         #capture.node = null
+ *         #
+ *         # To make the capture stream capture the monitor ports
+ *         #stream.capture.sink = false
+ *         #
+ *         # The node name or id to use for playback.
+ *         #playback.node = null
+ *         #
+ *         #audio.rate = 44100
+ *         #audio.format = S16
+ *         #audio.channels = 2
+ *         #audio.position = [ FL FR ]
+ *         #
+ *         # The addresses this server listens on for new
+ *         # client connections
+ *         server.address = [
+ *             "tcp:4711"
+ *         ]
+ *     }
+ * }
+ * ]
+ *\endcode
  */
 
 #define NAME "protocol-simple"
@@ -61,24 +112,25 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define DEFAULT_SERVER "[ \"tcp:"SPA_STRINGIFY(DEFAULT_PORT)"\" ]"
 
 #define DEFAULT_FORMAT "S16"
-#define DEFAULT_RATE "44100"
+#define DEFAULT_RATE 44100
 #define DEFAULT_CHANNELS 2
 #define DEFAULT_POSITION "[ FL FR ]"
 #define DEFAULT_LATENCY "1024/44100"
 
 #define MAX_CLIENTS	10
 
-#define MODULE_USAGE	"[ capture=<bool> ] "						\
-			"[ playback=<bool> ] "						\
-			"[ node.latency=<num/denom, default:"DEFAULT_LATENCY"> ] "	\
-			"[ node.rate=<1/rate, default:1/"DEFAULT_RATE"> ] "	\
-			"[ capture.node=<source-target> [ stream.capture.sink=true ]] "	\
-			"[ playback.node=<sink-target> ] "				\
-			"[ audio.rate=<sample-rate, default:"DEFAULT_RATE"> ] "		\
-			"[ audio.format=<format, default:"DEFAULT_FORMAT"> ] "		\
-			"[ audio.channels=<channels, default: 2> ] "	\
-			"[ audio.position=<position, default:"DEFAULT_POSITION"> ] "	\
-			"[ server.address=<[ tcp:[<ip>:]<port>[,...] ], default:"DEFAULT_SERVER">"	\
+#define MODULE_USAGE	"( capture=<bool> ) "						\
+			"( playback=<bool> ) "						\
+			"( remote.name=<remote> ) "					\
+			"( node.latency=<num/denom, default:"DEFAULT_LATENCY"> ) "	\
+			"( node.rate=<1/rate, default:1/"SPA_STRINGIFY(DEFAULT_RATE)"> ) "	\
+			"( capture.node=<source-target> ( stream.capture.sink=true )) "	\
+			"( playback.node=<sink-target> ) "				\
+			"( audio.rate=<sample-rate, default:"SPA_STRINGIFY(DEFAULT_RATE)"> ) "		\
+			"( audio.format=<format, default:"DEFAULT_FORMAT"> ) "		\
+			"( audio.channels=<channels, default: "SPA_STRINGIFY(DEFAULT_CHANNELS)"> ) "	\
+			"( audio.position=<position, default:"DEFAULT_POSITION"> ) "	\
+			"( server.address=<[ tcp:(<ip>:)<port>(,...) ], default:"DEFAULT_SERVER"> )"	\
 
 static const struct spa_dict_item module_props[] = {
 	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
@@ -120,8 +172,6 @@ struct client {
 
 	struct pw_stream *playback;
 	struct spa_hook playback_listener;
-
-	struct spa_io_rate_match *rate_match;
 
 	unsigned int disconnect:1;
 	unsigned int disconnecting:1;
@@ -240,11 +290,8 @@ static void capture_process(void *data)
 	}
 	d = &buf->buffer->datas[0];
 
-	size = d->chunk->size;
-	offset = d->chunk->offset;
-
-	if (size + offset > d->maxsize)
-		size = d->maxsize - SPA_MIN(offset, d->maxsize);
+	offset = SPA_MIN(d->chunk->offset, d->maxsize);
+	size = SPA_MIN(d->chunk->size, d->maxsize - offset);
 
 	while (size > 0) {
 		res = send(client->source->fd,
@@ -282,12 +329,9 @@ static void playback_process(void *data)
 	}
 	d = &buf->buffer->datas[0];
 
-	if (client->rate_match) {
-		size = client->rate_match->size * impl->frame_size;
-		size = SPA_MIN(size, d->maxsize);
-	} else {
-		size = d->maxsize;
-	}
+	size = d->maxsize;
+	if (buf->requested)
+		size = SPA_MIN(size, buf->requested * impl->frame_size);
 
 	offset = 0;
 	while (size > 0) {
@@ -354,16 +398,6 @@ static void playback_destroy(void *data)
 	client->playback = NULL;
 }
 
-static void playback_io_changed(void *data, uint32_t id, void *area, uint32_t size)
-{
-	struct client *client = data;
-	switch (id) {
-	case SPA_IO_RateMatch:
-		client->rate_match = area;
-		break;
-	}
-}
-
 static const struct pw_stream_events capture_stream_events = {
 	PW_VERSION_STREAM_EVENTS,
 	.destroy = capture_destroy,
@@ -375,7 +409,6 @@ static const struct pw_stream_events playback_stream_events = {
 	PW_VERSION_STREAM_EVENTS,
 	.destroy = playback_destroy,
 	.state_changed = on_stream_state_changed,
-	.io_changed = playback_io_changed,
 	.process = playback_process
 };
 
@@ -394,10 +427,9 @@ static int create_streams(struct impl *impl, struct client *client)
 
 	if (impl->capture) {
 		props = pw_properties_new(
-			PW_KEY_NODE_GROUP, "pipewire.dummy",
 			PW_KEY_NODE_LATENCY, latency,
 			PW_KEY_NODE_RATE, pw_properties_get(impl->props, PW_KEY_NODE_RATE),
-			PW_KEY_NODE_TARGET, pw_properties_get(impl->props, "capture.node"),
+			PW_KEY_TARGET_OBJECT, pw_properties_get(impl->props, "capture.node"),
 			PW_KEY_STREAM_CAPTURE_SINK, pw_properties_get(impl->props,
 				PW_KEY_STREAM_CAPTURE_SINK),
 			PW_KEY_NODE_NETWORK, "true",
@@ -418,10 +450,9 @@ static int create_streams(struct impl *impl, struct client *client)
 	}
 	if (impl->playback) {
 		props = pw_properties_new(
-			PW_KEY_NODE_GROUP, "pipewire.dummy",
 			PW_KEY_NODE_LATENCY, latency,
 			PW_KEY_NODE_RATE, pw_properties_get(impl->props, PW_KEY_NODE_RATE),
-			PW_KEY_NODE_TARGET, pw_properties_get(impl->props, "playback.node"),
+			PW_KEY_TARGET_OBJECT, pw_properties_get(impl->props, "playback.node"),
 			PW_KEY_NODE_NETWORK, "true",
 			NULL);
 		if (props == NULL)
@@ -492,7 +523,7 @@ on_connect(void *data, int fd, uint32_t mask)
 	struct pw_properties *props = NULL;
 
 	addrlen = sizeof(addr);
-	client_fd = accept4(fd, &addr, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+	client_fd = accept4(fd, (struct sockaddr *) &addr, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 	if (client_fd < 0)
 		goto error;
 
@@ -525,6 +556,8 @@ on_connect(void *data, int fd, uint32_t mask)
 
 	props = pw_properties_new(
 			PW_KEY_CLIENT_API, "protocol-simple",
+			PW_KEY_REMOTE_NAME,
+				pw_properties_get(impl->props, PW_KEY_REMOTE_NAME),
 			NULL);
 	if (props == NULL)
 		goto error;
@@ -751,9 +784,7 @@ static int parse_params(struct impl *impl)
 		pw_log_error("invalid format '%s'", str);
 		return -EINVAL;
 	}
-	if ((str = pw_properties_get(impl->props, "audio.rate")) == NULL)
-		str = DEFAULT_RATE;
-	impl->info.rate = atoi(str);
+	impl->info.rate = pw_properties_get_uint32(impl->props, "audio.rate", DEFAULT_RATE);
 	if (impl->info.rate == 0) {
 		pw_log_error("invalid rate '%s'", str);
 		return -EINVAL;

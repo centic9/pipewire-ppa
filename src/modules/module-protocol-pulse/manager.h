@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #ifndef PIPEWIRE_MANAGER_H
 #define PIPEWIRE_MANAGER_H
@@ -55,6 +35,9 @@ struct pw_manager_events {
 			const char *type, const char *value);
 
 	void (*disconnect) (void *data);
+
+	void (*object_data_timeout) (void *data, struct pw_manager_object *object,
+			const char *key);
 };
 
 struct pw_manager {
@@ -69,6 +52,7 @@ struct pw_manager {
 
 struct pw_manager_param {
 	uint32_t id;
+	int32_t seq;
 	struct spa_list link;           /**< link in manager_object param_list */
 	struct spa_pod *param;
 };
@@ -87,8 +71,13 @@ struct pw_manager_object {
 	int (*message_handler)(struct pw_manager *m, struct pw_manager_object *o,
 	                       const char *message, const char *params, char **response);
 
-	int changed;
 	void *info;
+	struct spa_param_info *params;
+	uint32_t n_params;
+
+#define PW_MANAGER_OBJECT_FLAG_SOURCE	(1<<0)
+#define PW_MANAGER_OBJECT_FLAG_SINK	(1<<1)
+	uint64_t change_mask;	/* object specific params change mask */
 	struct spa_list param_list;
 	unsigned int creating:1;
 	unsigned int removing:1;
@@ -115,6 +104,8 @@ int pw_manager_for_each_object(struct pw_manager *manager,
 
 void *pw_manager_object_add_data(struct pw_manager_object *o, const char *key, size_t size);
 void *pw_manager_object_get_data(struct pw_manager_object *obj, const char *key);
+void *pw_manager_object_add_temporary_data(struct pw_manager_object *o, const char *key,
+		size_t size, uint64_t lifetime_nsec);
 
 bool pw_manager_object_is_client(struct pw_manager_object *o);
 bool pw_manager_object_is_module(struct pw_manager_object *o);
@@ -123,6 +114,7 @@ bool pw_manager_object_is_sink(struct pw_manager_object *o);
 bool pw_manager_object_is_source(struct pw_manager_object *o);
 bool pw_manager_object_is_monitor(struct pw_manager_object *o);
 bool pw_manager_object_is_virtual(struct pw_manager_object *o);
+bool pw_manager_object_is_network(struct pw_manager_object *o);
 bool pw_manager_object_is_source_or_monitor(struct pw_manager_object *o);
 bool pw_manager_object_is_sink_input(struct pw_manager_object *o);
 bool pw_manager_object_is_source_output(struct pw_manager_object *o);

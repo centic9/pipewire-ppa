@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2021 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #ifndef PIPEWIRE_RTSP_CLIENT_H
 #define PIPEWIRE_RTSP_CLIENT_H
@@ -57,6 +37,7 @@ struct pw_rtsp_client * pw_rtsp_client_new(struct pw_loop *main_loop,
 void pw_rtsp_client_destroy(struct pw_rtsp_client *client);
 
 void *pw_rtsp_client_get_user_data(struct pw_rtsp_client *client);
+const char *pw_rtsp_client_get_url(struct pw_rtsp_client *client);
 
 void pw_rtsp_client_add_listener(struct pw_rtsp_client *client,
 		struct spa_hook *listener,
@@ -71,10 +52,16 @@ int pw_rtsp_client_disconnect(struct pw_rtsp_client *client);
 int pw_rtsp_client_get_local_ip(struct pw_rtsp_client *client,
 		int *version, char *ip, size_t len);
 
+int pw_rtsp_client_url_send(struct pw_rtsp_client *client, const char *url,
+		const char *cmd, const struct spa_dict *headers,
+		const char *content_type, const void *content, size_t content_length,
+		int (*reply) (void *user_data, int status, const struct spa_dict *headers, const struct pw_array *content),
+		void *user_data);
+
 int pw_rtsp_client_send(struct pw_rtsp_client *client,
 		const char *cmd, const struct spa_dict *headers,
 		const char *content_type, const char *content,
-		void (*reply) (void *user_data, int status, const struct spa_dict *headers),
+		int (*reply) (void *user_data, int status, const struct spa_dict *headers, const struct pw_array *content),
 		void *user_data);
 
 

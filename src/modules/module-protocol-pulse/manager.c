@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include "manager.h"
 
@@ -33,19 +13,20 @@
 #include "log.h"
 #include "module-protocol-pulse/server.h"
 
-#define MAX_PARAMS 32
-
-#define manager_emit_sync(m) spa_hook_list_call(&m->hooks, struct pw_manager_events, sync, 0)
-#define manager_emit_added(m,o) spa_hook_list_call(&m->hooks, struct pw_manager_events, added, 0, o)
-#define manager_emit_updated(m,o) spa_hook_list_call(&m->hooks, struct pw_manager_events, updated, 0, o)
-#define manager_emit_removed(m,o) spa_hook_list_call(&m->hooks, struct pw_manager_events, removed, 0, o)
-#define manager_emit_metadata(m,o,s,k,t,v) spa_hook_list_call(&m->hooks, struct pw_manager_events, metadata,0,o,s,k,t,v)
-#define manager_emit_disconnect(m) spa_hook_list_call(&m->hooks, struct pw_manager_events, disconnect, 0)
+#define manager_emit_sync(m) spa_hook_list_call(&(m)->hooks, struct pw_manager_events, sync, 0)
+#define manager_emit_added(m,o) spa_hook_list_call(&(m)->hooks, struct pw_manager_events, added, 0, o)
+#define manager_emit_updated(m,o) spa_hook_list_call(&(m)->hooks, struct pw_manager_events, updated, 0, o)
+#define manager_emit_removed(m,o) spa_hook_list_call(&(m)->hooks, struct pw_manager_events, removed, 0, o)
+#define manager_emit_metadata(m,o,s,k,t,v) spa_hook_list_call(&(m)->hooks, struct pw_manager_events, metadata,0,o,s,k,t,v)
+#define manager_emit_disconnect(m) spa_hook_list_call(&(m)->hooks, struct pw_manager_events, disconnect, 0)
+#define manager_emit_object_data_timeout(m,o,k) spa_hook_list_call(&(m)->hooks, struct pw_manager_events, object_data_timeout,0,o,k)
 
 struct object;
 
 struct manager {
 	struct pw_manager this;
+
+	struct pw_loop *loop;
 
 	struct spa_hook core_listener;
 	struct spa_hook registry_listener;
@@ -64,8 +45,10 @@ struct object_info {
 
 struct object_data {
 	struct spa_list link;
+	struct object *object;
 	const char *key;
 	size_t size;
+	struct spa_source *timer;
 };
 
 struct object {
@@ -75,12 +58,11 @@ struct object {
 
 	const struct object_info *info;
 
+	int changed;
 	struct spa_list pending_list;
 
 	struct spa_hook proxy_listener;
 	struct spa_hook object_listener;
-
-	int param_seq[MAX_PARAMS];
 
 	struct spa_list data_list;
 };
@@ -108,7 +90,7 @@ static uint32_t clear_params(struct spa_list *param_list, uint32_t id)
 }
 
 static struct pw_manager_param *add_param(struct spa_list *params,
-		int seq, int *param_seq, uint32_t id, const struct spa_pod *param)
+		int seq, uint32_t id, const struct spa_pod *param)
 {
 	struct pw_manager_param *p;
 
@@ -120,24 +102,12 @@ static struct pw_manager_param *add_param(struct spa_list *params,
 		id = SPA_POD_OBJECT_ID(param);
 	}
 
-	if (id >= MAX_PARAMS) {
-		pw_log_error("too big param id %d", id);
-		errno = EINVAL;
-		return NULL;
-	}
-
-	if (seq != param_seq[id]) {
-		pw_log_debug("ignoring param %d, seq:%d != current_seq:%d",
-				id, seq, param_seq[id]);
-		errno = EBUSY;
-		return NULL;
-	}
-
 	p = malloc(sizeof(*p) + (param != NULL ? SPA_POD_SIZE(param) : 0));
 	if (p == NULL)
 		return NULL;
 
 	p->id = id;
+	p->seq = seq;
 	if (param != NULL) {
 		p->param = SPA_PTROFF(p, sizeof(*p), struct spa_pod);
 		memcpy(p->param, param, SPA_POD_SIZE(param));
@@ -162,7 +132,6 @@ static bool has_param(struct spa_list *param_list, struct pw_manager_param *p)
 	return false;
 }
 
-
 static struct object *find_object_by_id(struct manager *m, uint32_t id)
 {
 	struct object *o;
@@ -175,7 +144,19 @@ static struct object *find_object_by_id(struct manager *m, uint32_t id)
 
 static void object_update_params(struct object *o)
 {
-	struct pw_manager_param *p;
+	struct pw_manager_param *p, *t;
+	uint32_t i;
+
+	for (i = 0; i < o->this.n_params; i++) {
+		spa_list_for_each_safe(p, t, &o->pending_list, link) {
+			if (p->id == o->this.params[i].id &&
+			    p->seq != o->this.params[i].seq &&
+			    p->param != NULL) {
+				spa_list_remove(&p->link);
+				free(p);
+			}
+		}
+	}
 
 	spa_list_consume(p, &o->pending_list, link) {
 		spa_list_remove(&p->link);
@@ -186,6 +167,16 @@ static void object_update_params(struct object *o)
 			spa_list_append(&o->this.param_list, &p->link);
 		}
 	}
+}
+
+static void object_data_free(struct object_data *d)
+{
+	spa_list_remove(&d->link);
+	if (d->timer) {
+		pw_loop_destroy_source(d->object->manager->loop, d->timer);
+		d->timer = NULL;
+	}
+	free(d);
 }
 
 static void object_destroy(struct object *o)
@@ -201,10 +192,8 @@ static void object_destroy(struct object *o)
 		free(o->this.message_object_path);
 	clear_params(&o->this.param_list, SPA_ID_INVALID);
 	clear_params(&o->pending_list, SPA_ID_INVALID);
-	spa_list_consume(d, &o->data_list, link) {
-		spa_list_remove(&d->link);
-		free(d);
-	}
+	spa_list_consume(d, &o->data_list, link)
+		object_data_free(d);
 	free(o);
 }
 
@@ -215,20 +204,22 @@ static const struct object_info core_info = {
 };
 
 /* client */
-static void client_event_info(void *object, const struct pw_client_info *info)
+static void client_event_info(void *data, const struct pw_client_info *info)
 {
-	struct object *o = object;
+	struct object *o = data;
 	int changed = 0;
 
 	pw_log_debug("object %p: id:%d change-mask:%08"PRIx64, o, o->this.id, info->change_mask);
 
-	info = o->this.info = pw_client_info_merge(o->this.info, info, o->this.changed == 0);
+	info = o->this.info = pw_client_info_merge(o->this.info, info, o->changed == 0);
+	if (info == NULL)
+		return;
 
 	if (info->change_mask & PW_CLIENT_CHANGE_MASK_PROPS)
 		changed++;
 
 	if (changed) {
-		o->this.changed += changed;
+		o->changed += changed;
 		core_sync(o->manager);
 	}
 }
@@ -254,20 +245,22 @@ static const struct object_info client_info = {
 };
 
 /* module */
-static void module_event_info(void *object, const struct pw_module_info *info)
+static void module_event_info(void *data, const struct pw_module_info *info)
 {
-	struct object *o = object;
+	struct object *o = data;
 	int changed = 0;
 
 	pw_log_debug("object %p: id:%d change-mask:%08"PRIx64, o, o->this.id, info->change_mask);
 
-	info = o->this.info = pw_module_info_merge(o->this.info, info, o->this.changed == 0);
+	info = o->this.info = pw_module_info_merge(o->this.info, info, o->changed == 0);
+	if (info == NULL)
+		return;
 
 	if (info->change_mask & PW_MODULE_CHANGE_MASK_PROPS)
 		changed++;
 
 	if (changed) {
-		o->this.changed += changed;
+		o->changed += changed;
 		core_sync(o->manager);
 	}
 }
@@ -293,14 +286,19 @@ static const struct object_info module_info = {
 };
 
 /* device */
-static void device_event_info(void *object, const struct pw_device_info *info)
+static void device_event_info(void *data, const struct pw_device_info *info)
 {
-	struct object *o = object;
+	struct object *o = data;
 	uint32_t i, changed = 0;
 
 	pw_log_debug("object %p: id:%d change-mask:%08"PRIx64, o, o->this.id, info->change_mask);
 
-	info = o->this.info = pw_device_info_merge(o->this.info, info, o->this.changed == 0);
+	info = o->this.info = pw_device_info_merge(o->this.info, info, o->changed == 0);
+	if (info == NULL)
+		return;
+
+	o->this.n_params = info->n_params;
+	o->this.params = info->params;
 
 	if (info->change_mask & PW_DEVICE_CHANGE_MASK_PROPS)
 		changed++;
@@ -314,11 +312,6 @@ static void device_event_info(void *object, const struct pw_device_info *info)
 				continue;
 			info->params[i].user = 0;
 
-			if (id >= MAX_PARAMS) {
-				pw_log_error("too big param id %d", id);
-				continue;
-			}
-
 			switch (id) {
 			case SPA_PARAM_EnumProfile:
 			case SPA_PARAM_Profile:
@@ -328,18 +321,18 @@ static void device_event_info(void *object, const struct pw_device_info *info)
 			case SPA_PARAM_Route:
 				break;
 			}
-			add_param(&o->pending_list, o->param_seq[id], o->param_seq, id, NULL);
+			add_param(&o->pending_list, info->params[i].seq, id, NULL);
 			if (!(info->params[i].flags & SPA_PARAM_INFO_READ))
 				continue;
 
 			res = pw_device_enum_params((struct pw_device*)o->this.proxy,
-					++o->param_seq[id], id, 0, -1, NULL);
+					++info->params[i].seq, id, 0, -1, NULL);
 			if (SPA_RESULT_IS_ASYNC(res))
-				o->param_seq[id] = res;
+				info->params[i].seq = res;
 		}
 	}
 	if (changed) {
-		o->this.changed += changed;
+		o->changed += changed;
 		core_sync(o->manager);
 	}
 }
@@ -364,15 +357,15 @@ static struct object *find_device(struct manager *m, uint32_t card_id, uint32_t 
 	return NULL;
 }
 
-static void device_event_param(void *object, int seq,
+static void device_event_param(void *data, int seq,
 		uint32_t id, uint32_t index, uint32_t next,
 		const struct spa_pod *param)
 {
-	struct object *o = object, *dev;
+	struct object *o = data, *dev;
 	struct manager *m = o->manager;
 	struct pw_manager_param *p;
 
-	p = add_param(&o->pending_list, seq, o->param_seq, id, param);
+	p = add_param(&o->pending_list, seq, id, param);
 	if (p == NULL)
 		return;
 
@@ -385,7 +378,7 @@ static void device_event_param(void *object, int seq,
 			return;
 
 		if ((dev = find_device(m, o->this.id, device)) != NULL) {
-			dev->this.changed++;
+			dev->changed++;
 			core_sync(o->manager);
 		}
 	}
@@ -413,14 +406,19 @@ static const struct object_info device_info = {
 };
 
 /* node */
-static void node_event_info(void *object, const struct pw_node_info *info)
+static void node_event_info(void *data, const struct pw_node_info *info)
 {
-	struct object *o = object;
+	struct object *o = data;
 	uint32_t i, changed = 0;
 
 	pw_log_debug("object %p: id:%d change-mask:%08"PRIx64, o, o->this.id, info->change_mask);
 
-	info = o->this.info = pw_node_info_merge(o->this.info, info, o->this.changed == 0);
+	info = o->this.info = pw_node_info_merge(o->this.info, info, o->changed == 0);
+	if (info == NULL)
+		return;
+
+	o->this.n_params = info->n_params;
+	o->this.params = info->params;
 
 	if (info->change_mask & PW_NODE_CHANGE_MASK_STATE)
 		changed++;
@@ -437,34 +435,29 @@ static void node_event_info(void *object, const struct pw_node_info *info)
 				continue;
 			info->params[i].user = 0;
 
-			if (id >= MAX_PARAMS) {
-				pw_log_error("too big param id %d", id);
-				continue;
-			}
-
 			changed++;
-			add_param(&o->pending_list, o->param_seq[id], o->param_seq, id, NULL);
+			add_param(&o->pending_list, info->params[i].seq, id, NULL);
 			if (!(info->params[i].flags & SPA_PARAM_INFO_READ))
 				continue;
 
 			res = pw_node_enum_params((struct pw_node*)o->this.proxy,
-					++o->param_seq[id], id, 0, -1, NULL);
+					++info->params[i].seq, id, 0, -1, NULL);
 			if (SPA_RESULT_IS_ASYNC(res))
-				o->param_seq[id] = res;
+				info->params[i].seq = res;
 		}
 	}
 	if (changed) {
-		o->this.changed += changed;
+		o->changed += changed;
 		core_sync(o->manager);
 	}
 }
 
-static void node_event_param(void *object, int seq,
+static void node_event_param(void *data, int seq,
 		uint32_t id, uint32_t index, uint32_t next,
 		const struct spa_pod *param)
 {
-	struct object *o = object;
-	add_param(&o->pending_list, seq, o->param_seq, id, param);
+	struct object *o = data;
+	add_param(&o->pending_list, seq, id, param);
 }
 
 static const struct pw_node_events node_events = {
@@ -495,13 +488,13 @@ static const struct object_info link_info = {
 };
 
 /* metadata */
-static int metadata_property(void *object,
+static int metadata_property(void *data,
 			uint32_t subject,
 			const char *key,
 			const char *type,
 			const char *value)
 {
-	struct object *o = object;
+	struct object *o = data;
 	struct manager *m = o->manager;
 	manager_emit_metadata(m, &o->this, subject, key, type, value);
 	return 0;
@@ -540,11 +533,10 @@ static const struct object_info *objects[] =
 
 static const struct object_info *find_info(const char *type, uint32_t version)
 {
-	size_t i;
-	for (i = 0; i < SPA_N_ELEMENTS(objects); i++) {
-		if (spa_streq(objects[i]->type, type) &&
-		    objects[i]->version <= version)
-			return objects[i];
+	SPA_FOR_EACH_ELEMENT_VAR(objects, i) {
+		if (spa_streq((*i)->type, type) &&
+		    (*i)->version <= version)
+			return *i;
 	}
 	return NULL;
 }
@@ -639,9 +631,9 @@ static void registry_event_global(void *data, uint32_t id,
 	core_sync(m);
 }
 
-static void registry_event_global_remove(void *object, uint32_t id)
+static void registry_event_global_remove(void *data, uint32_t id)
 {
-	struct manager *m = object;
+	struct manager *m = data;
 	struct object *o;
 
 	if ((o = find_object_by_id(m, id)) == NULL)
@@ -649,9 +641,10 @@ static void registry_event_global_remove(void *object, uint32_t id)
 
 	o->this.removing = true;
 
-	if (!o->this.creating)
+	if (!o->this.creating) {
+		o->this.change_mask = ~0;
 		manager_emit_removed(m, &o->this);
-
+	}
 	object_destroy(o);
 }
 
@@ -687,10 +680,10 @@ static void on_core_done(void *data, uint32_t id, int seq)
 			if (o->this.creating) {
 				o->this.creating = false;
 				manager_emit_added(m, &o->this);
-				o->this.changed = 0;
-			} else if (o->this.changed > 0) {
+				o->changed = 0;
+			} else if (o->changed > 0) {
 				manager_emit_updated(m, &o->this);
-				o->this.changed = 0;
+				o->changed = 0;
 			}
 		}
 	}
@@ -716,6 +709,7 @@ static const struct pw_core_events core_events = {
 struct pw_manager *pw_manager_new(struct pw_core *core)
 {
 	struct manager *m;
+	struct pw_context *context;
 
 	m = calloc(1, sizeof(*m));
 	if (m == NULL)
@@ -728,6 +722,9 @@ struct pw_manager *pw_manager_new(struct pw_core *core)
 		free(m);
 		return NULL;
 	}
+
+	context = pw_core_get_context(core);
+	m->loop = pw_context_get_main_loop(context);
 
 	spa_hook_list_init(&m->hooks);
 
@@ -812,6 +809,8 @@ void pw_manager_destroy(struct pw_manager *manager)
 	struct manager *m = SPA_CONTAINER_OF(manager, struct manager, this);
 	struct object *o;
 
+	spa_hook_list_clean(&m->hooks);
+
 	spa_hook_remove(&m->core_listener);
 
 	spa_list_consume(o, &m->this.object_list, this.link)
@@ -845,11 +844,14 @@ void *pw_manager_object_add_data(struct pw_manager_object *obj, const char *key,
 	if (d != NULL) {
 		if (d->size == size)
 			goto done;
-		spa_list_remove(&d->link);
-		free(d);
+		object_data_free(d);
 	}
 
 	d = calloc(1, sizeof(struct object_data) + size);
+	if (d == NULL)
+		return NULL;
+
+	d->object = o;
 	d->key = key;
 	d->size = size;
 
@@ -857,6 +859,49 @@ void *pw_manager_object_add_data(struct pw_manager_object *obj, const char *key,
 
 done:
 	return SPA_PTROFF(d, sizeof(struct object_data), void);
+}
+
+static void object_data_timeout(void *data, uint64_t count)
+{
+	struct object_data *d = data;
+	struct object *o = d->object;
+	struct manager *m = o->manager;
+
+	pw_log_debug("manager:%p object id:%d data '%s' lifetime ends",
+			m, o->this.id, d->key);
+
+	if (d->timer) {
+		pw_loop_destroy_source(m->loop, d->timer);
+		d->timer = NULL;
+	}
+
+	manager_emit_object_data_timeout(m, &o->this, d->key);
+}
+
+void *pw_manager_object_add_temporary_data(struct pw_manager_object *obj, const char *key,
+		size_t size, uint64_t lifetime_nsec)
+{
+	struct object *o = SPA_CONTAINER_OF(obj, struct object, this);
+	struct object_data *d;
+	void *data;
+	struct timespec timeout = {0}, interval = {0};
+
+	data = pw_manager_object_add_data(obj, key, size);
+	if (data == NULL)
+		return NULL;
+
+	d = SPA_PTROFF(data, -sizeof(struct object_data), void);
+
+	if (d->timer == NULL)
+		d->timer = pw_loop_add_timer(o->manager->loop, object_data_timeout, d);
+	if (d->timer == NULL)
+		return NULL;
+
+	timeout.tv_sec = lifetime_nsec / SPA_NSEC_PER_SEC;
+	timeout.tv_nsec = lifetime_nsec % SPA_NSEC_PER_SEC;
+	pw_loop_update_timer(o->manager->loop, d->timer, &timeout, &interval, false);
+
+	return data;
 }
 
 void *pw_manager_object_get_data(struct pw_manager_object *obj, const char *id)
@@ -928,6 +973,16 @@ bool pw_manager_object_is_virtual(struct pw_manager_object *o)
 	return spa_streq(o->type, PW_TYPE_INTERFACE_Node) &&
 		(info = o->info) != NULL && info->props != NULL &&
 		(str = spa_dict_lookup(info->props, PW_KEY_NODE_VIRTUAL)) != NULL &&
+		pw_properties_parse_bool(str);
+}
+
+bool pw_manager_object_is_network(struct pw_manager_object *o)
+{
+	const char *str;
+	struct pw_node_info *info;
+	return spa_streq(o->type, PW_TYPE_INTERFACE_Node) &&
+		(info = o->info) != NULL && info->props != NULL &&
+		(str = spa_dict_lookup(info->props, PW_KEY_NODE_NETWORK)) != NULL &&
 		pw_properties_parse_bool(str);
 }
 

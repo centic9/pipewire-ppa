@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include "config.h"
 
@@ -34,7 +14,6 @@
 #include <pipewire/log.h>
 
 #include "log.h"
-#define spa_debug pw_log_debug
 
 #include <spa/support/cpu.h>
 #include <spa/utils/result.h>
@@ -49,14 +28,15 @@
 #include <spa/utils/ringbuffer.h>
 #include <spa/utils/json.h>
 
+#include <pipewire/cleanup.h>
 #include <pipewire/pipewire.h>
-#include <pipewire/private.h>
 #include <pipewire/extensions/metadata.h>
 
 #include "pulse-server.h"
 #include "client.h"
 #include "collect.h"
 #include "commands.h"
+#include "cmd.h"
 #include "dbus-name.h"
 #include "defs.h"
 #include "extension.h"
@@ -71,28 +51,40 @@
 #include "quirks.h"
 #include "reply.h"
 #include "sample.h"
-#include "sample-play.h"
 #include "server.h"
 #include "stream.h"
 #include "utils.h"
 #include "volume.h"
 
-#define DEFAULT_MIN_REQ		"256/48000"
+#define DEFAULT_MIN_REQ		"128/48000"
 #define DEFAULT_DEFAULT_REQ	"960/48000"
-#define DEFAULT_MIN_FRAG	"256/48000"
+#define DEFAULT_MIN_FRAG	"128/48000"
 #define DEFAULT_DEFAULT_FRAG	"96000/48000"
 #define DEFAULT_DEFAULT_TLENGTH	"96000/48000"
-#define DEFAULT_MIN_QUANTUM	"256/48000"
+#define DEFAULT_MIN_QUANTUM	"128/48000"
 #define DEFAULT_FORMAT		"F32"
 #define DEFAULT_POSITION	"[ FL FR ]"
+#define DEFAULT_IDLE_TIMEOUT	"0"
 
 #define MAX_FORMATS	32
+/* The max amount of data we send in one block when capturing. In PulseAudio this
+ * size is derived from the mempool PA_MEMPOOL_SLOT_SIZE */
+#define MAX_BLOCK	(64*1024)
+
+#define TEMPORARY_MOVE_TIMEOUT	(SPA_NSEC_PER_SEC)
+
+PW_LOG_TOPIC_EXTERN(pulse_conn);
 
 bool debug_messages = false;
 
 struct latency_offset_data {
 	int64_t prev_latency_offset;
-	unsigned int initialized:1;
+	uint8_t initialized:1;
+};
+
+struct temporary_move_data {
+	uint32_t peer_index;
+	uint8_t used:1;
 };
 
 static struct sample *find_sample(struct impl *impl, uint32_t index, const char *name)
@@ -216,13 +208,15 @@ static int send_object_event(struct client *client, struct pw_manager_object *o,
 {
 	uint32_t event = 0, mask = 0, res_index = o->index;
 
-	if (pw_manager_object_is_sink(o)) {
+	pw_log_debug("index:%d id:%d %08lx type:%u", o->index, o->id, o->change_mask, type);
+
+	if (pw_manager_object_is_sink(o) && o->change_mask & PW_MANAGER_OBJECT_FLAG_SINK) {
 		client_queue_subscribe_event(client,
 				SUBSCRIPTION_MASK_SINK,
 				SUBSCRIPTION_EVENT_SINK | type,
 				res_index);
 	}
-	if (pw_manager_object_is_source_or_monitor(o)) {
+	if (pw_manager_object_is_source_or_monitor(o) && o->change_mask & PW_MANAGER_OBJECT_FLAG_SOURCE) {
 		mask = SUBSCRIPTION_MASK_SOURCE;
 		event = SUBSCRIPTION_EVENT_SOURCE;
 	}
@@ -254,6 +248,75 @@ static int send_object_event(struct client *client, struct pw_manager_object *o,
 				event | type,
 				res_index);
 	return 0;
+}
+
+static uint32_t get_temporary_move_target(struct client *client, struct pw_manager_object *o)
+{
+	struct temporary_move_data *d;
+
+	d = pw_manager_object_get_data(o, "temporary_move_data");
+	if (d == NULL || d->peer_index == SPA_ID_INVALID)
+		return SPA_ID_INVALID;
+
+	pw_log_debug("[%s] using temporary move target for index:%d -> index:%d",
+			client->name, o->index, d->peer_index);
+	d->used = true;
+	return d->peer_index;
+}
+
+static void set_temporary_move_target(struct client *client, struct pw_manager_object *o, uint32_t index)
+{
+	struct temporary_move_data *d;
+
+	if (!pw_manager_object_is_sink_input(o) && !pw_manager_object_is_source_output(o))
+		return;
+
+	if (index == SPA_ID_INVALID) {
+		d = pw_manager_object_get_data(o, "temporary_move_data");
+		if (d == NULL)
+			return;
+		if (d->peer_index != SPA_ID_INVALID)
+			pw_log_debug("cleared temporary move target for index:%d", o->index);
+		d->peer_index = SPA_ID_INVALID;
+		d->used = false;
+		return;
+	}
+
+	d = pw_manager_object_add_temporary_data(o, "temporary_move_data",
+			sizeof(struct temporary_move_data),
+			TEMPORARY_MOVE_TIMEOUT);
+	if (d == NULL)
+		return;
+
+	pw_log_debug("[%s] set temporary move target for index:%d to index:%d",
+			client->name, o->index, index);
+	d->peer_index = index;
+	d->used = false;
+}
+
+static void temporary_move_target_timeout(struct client *client, struct pw_manager_object *o)
+{
+	struct temporary_move_data *d = pw_manager_object_get_data(o, "temporary_move_data");
+	struct pw_manager_object *peer;
+
+	/*
+	 * Send change event if the temporary data was used, and the peer
+	 * is not what we claimed.
+	 */
+
+	if (d == NULL || d->peer_index == SPA_ID_INVALID || !d->used)
+		goto done;
+
+	peer = find_linked(client->manager, o->id, pw_manager_object_is_sink_input(o) ?
+			PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT);
+	if (peer == NULL || peer->index != d->peer_index) {
+		pw_log_debug("[%s] temporary move timeout for index:%d, send change event",
+				client->name, o->index);
+		send_object_event(client, o, SUBSCRIPTION_EVENT_CHANGE);
+	}
+
+done:
+	set_temporary_move_target(client, o, SPA_ID_INVALID);
 }
 
 static struct pw_manager_object *find_device(struct client *client,
@@ -366,26 +429,44 @@ static uint32_t frac_to_bytes_round_up(struct spa_fraction val, const struct sam
 	return (uint32_t) u;
 }
 
-static uint32_t fix_playback_buffer_attr(struct stream *s, struct buffer_attr *attr)
+static void clamp_latency(struct stream *s, struct spa_fraction *lat)
 {
-	uint32_t frame_size, max_prebuf, minreq, latency, max_latency;
+	if (lat->num * s->min_quantum.denom / lat->denom < s->min_quantum.num)
+		lat->num = (s->min_quantum.num * lat->denom +
+				(s->min_quantum.denom -1)) / s->min_quantum.denom;
+}
+
+static uint64_t fix_playback_buffer_attr(struct stream *s, struct buffer_attr *attr,
+		uint32_t rate, struct spa_fraction *lat)
+{
+	uint32_t frame_size, max_prebuf, minreq, latency, max_latency, maxlength;
 	struct defs *defs = &s->impl->defs;
 
-	frame_size = s->frame_size;
+	if ((frame_size = s->frame_size) == 0)
+		frame_size = sample_spec_frame_size(&s->ss);
+	if (frame_size == 0)
+		frame_size = 4;
+
+	maxlength = SPA_ROUND_DOWN(MAXLENGTH, frame_size);
+
+	pw_log_info("[%s] maxlength:%u tlength:%u minreq:%u prebuf:%u max:%u",
+			s->client->name, attr->maxlength, attr->tlength,
+			attr->minreq, attr->prebuf, maxlength);
+
 	minreq = frac_to_bytes_round_up(s->min_req, &s->ss);
 	max_latency = defs->quantum_limit * frame_size;
 
-	if (attr->maxlength == (uint32_t) -1 || attr->maxlength > MAXLENGTH)
-		attr->maxlength = MAXLENGTH;
-	attr->maxlength = SPA_ROUND_UP(attr->maxlength, frame_size);
+	if (attr->maxlength == (uint32_t) -1 || attr->maxlength > maxlength)
+		attr->maxlength = maxlength;
+	else
+		attr->maxlength = SPA_ROUND_DOWN(attr->maxlength, frame_size);
 
 	minreq = SPA_MIN(minreq, attr->maxlength);
 
 	if (attr->tlength == (uint32_t) -1)
 		attr->tlength = frac_to_bytes_round_up(s->default_tlength, &s->ss);
-	attr->tlength = SPA_MIN(attr->tlength, attr->maxlength);
+	attr->tlength = SPA_CLAMP(attr->tlength, minreq, attr->maxlength);
 	attr->tlength = SPA_ROUND_UP(attr->tlength, frame_size);
-	attr->tlength = SPA_MAX(attr->tlength, minreq);
 
 	if (attr->minreq == (uint32_t) -1) {
 		uint32_t process = frac_to_bytes_round_up(s->default_req, &s->ss);
@@ -437,11 +518,15 @@ static uint32_t fix_playback_buffer_attr(struct stream *s, struct buffer_attr *a
 
 	attr->fragsize = 0;
 
-	pw_log_info("[%s] maxlength:%u tlength:%u minreq:%u/%u prebuf:%u latency:%u %u",
-			s->client->name, attr->maxlength, attr->tlength,
-			attr->minreq, minreq, attr->prebuf, latency, frame_size);
+	lat->num = latency / frame_size;
+	lat->denom = rate;
+	clamp_latency(s, lat);
 
-	return latency / frame_size;
+	pw_log_info("[%s] maxlength:%u tlength:%u minreq:%u/%u prebuf:%u latency:%u/%u %u",
+			s->client->name, attr->maxlength, attr->tlength,
+			attr->minreq, minreq, attr->prebuf, lat->num, lat->denom, frame_size);
+
+	return lat->num * SPA_USEC_PER_SEC / lat->denom;
 }
 
 static uint64_t set_playback_buffer_attr(struct stream *s, struct buffer_attr *attr)
@@ -455,15 +540,9 @@ static uint64_t set_playback_buffer_attr(struct stream *s, struct buffer_attr *a
 	char attr_prebuf[32];
 	char attr_minreq[32];
 
-	lat.denom = s->ss.rate;
-	lat.num = fix_playback_buffer_attr(s, attr);
+	lat_usec = fix_playback_buffer_attr(s, attr, s->ss.rate, &lat);
 
 	s->attr = *attr;
-
-	if (lat.num * s->min_quantum.denom / lat.denom < s->min_quantum.num)
-		lat.num = (s->min_quantum.num * lat.denom +
-				(s->min_quantum.denom -1)) / s->min_quantum.denom;
-	lat_usec = lat.num * SPA_USEC_PER_SEC / lat.denom;
 
 	snprintf(latency, sizeof(latency), "%u/%u", lat.num, lat.denom);
 	snprintf(rate, sizeof(rate), "1/%u", lat.denom);
@@ -503,6 +582,7 @@ static int reply_create_playback_stream(struct stream *stream, struct pw_manager
 
 	missing = stream_pop_missing(stream);
 	stream->index = id_to_index(manager, stream->id);
+	stream->lat_usec = lat_usec;
 
 	pw_log_info("[%s] reply CREATE_PLAYBACK_STREAM tag:%u index:%u missing:%u lat:%"PRIu64,
 			client->name, stream->create_tag, stream->index, missing, lat_usec);
@@ -558,43 +638,57 @@ static int reply_create_playback_stream(struct stream *stream, struct pw_manager
 	return client_queue_message(client, reply);
 }
 
-static uint32_t fix_record_buffer_attr(struct stream *s, struct buffer_attr *attr)
+static uint64_t fix_record_buffer_attr(struct stream *s, struct buffer_attr *attr,
+		uint32_t rate, struct spa_fraction *lat)
 {
-	uint32_t frame_size, minfrag, latency;
+	uint32_t frame_size, minfrag, latency, maxlength;
 
-	frame_size = s->frame_size;
+	if ((frame_size = s->frame_size) == 0)
+		frame_size = sample_spec_frame_size(&s->ss);
+	if (frame_size == 0)
+		frame_size = 4;
 
-	if (attr->maxlength == (uint32_t) -1 || attr->maxlength > MAXLENGTH)
-		attr->maxlength = MAXLENGTH;
-	attr->maxlength -= attr->maxlength % frame_size;
+	maxlength = SPA_ROUND_DOWN(MAXLENGTH, frame_size);
+
+	pw_log_info("[%s] maxlength:%u fragsize:%u framesize:%u",
+			s->client->name, attr->maxlength, attr->fragsize,
+			frame_size);
+
+	if (attr->maxlength == (uint32_t) -1 || attr->maxlength > maxlength)
+		attr->maxlength = maxlength;
+	else
+		attr->maxlength = SPA_ROUND_DOWN(attr->maxlength, frame_size);
 	attr->maxlength = SPA_MAX(attr->maxlength, frame_size);
 
 	minfrag = frac_to_bytes_round_up(s->min_frag, &s->ss);
 
 	if (attr->fragsize == (uint32_t) -1 || attr->fragsize == 0)
 		attr->fragsize = frac_to_bytes_round_up(s->default_frag, &s->ss);
-	attr->fragsize -= attr->fragsize % frame_size;
-	attr->fragsize = SPA_MAX(attr->fragsize, minfrag);
-	attr->fragsize = SPA_MAX(attr->fragsize, frame_size);
-
-	if (attr->fragsize > attr->maxlength)
-		attr->fragsize = attr->maxlength;
+	attr->fragsize = SPA_CLAMP(attr->fragsize, minfrag, attr->maxlength);
+	attr->fragsize = SPA_ROUND_UP(attr->fragsize, frame_size);
 
 	attr->tlength = attr->minreq = attr->prebuf = 0;
 
-	if (s->early_requests) {
-		latency = attr->fragsize;
-	} else if (s->adjust_latency) {
-		latency = attr->fragsize;
-	} else {
-		latency = attr->fragsize;
+	/* make sure we can queue at least to fragsize without overruns */
+	if (attr->maxlength < attr->fragsize * 4) {
+		attr->maxlength = attr->fragsize * 4;
+		if (attr->maxlength > maxlength) {
+			attr->maxlength = maxlength;
+			attr->fragsize = SPA_ROUND_DOWN(maxlength / 4, frame_size);
+		}
 	}
 
-	pw_log_info("[%s] maxlength:%u fragsize:%u minfrag:%u latency:%u",
-			s->client->name, attr->maxlength, attr->fragsize, minfrag,
-			latency);
+	latency = attr->fragsize;
 
-	return latency / frame_size;
+	lat->num = latency / frame_size;
+	lat->denom = rate;
+	clamp_latency(s, lat);
+
+	pw_log_info("[%s] maxlength:%u fragsize:%u minfrag:%u latency:%u/%u",
+			s->client->name, attr->maxlength, attr->fragsize, minfrag,
+			lat->num, lat->denom);
+
+	return lat->num * SPA_USEC_PER_SEC / lat->denom;
 }
 
 static uint64_t set_record_buffer_attr(struct stream *s, struct buffer_attr *attr)
@@ -606,13 +700,9 @@ static uint64_t set_record_buffer_attr(struct stream *s, struct buffer_attr *att
 	struct spa_fraction lat;
 	uint64_t lat_usec;
 
-	lat.denom = s->ss.rate;
-	lat.num = fix_record_buffer_attr(s, &s->attr);
+	lat_usec = fix_record_buffer_attr(s, attr, s->ss.rate, &lat);
 
-	if (lat.num * s->min_quantum.denom / lat.denom < s->min_quantum.num)
-		lat.num = (s->min_quantum.num * lat.denom +
-				(s->min_quantum.denom -1)) / s->min_quantum.denom;
-	lat_usec = lat.num * SPA_USEC_PER_SEC / lat.denom;
+	s->attr = *attr;
 
 	snprintf(latency, sizeof(latency), "%u/%u", lat.num, lat.denom);
 	snprintf(rate, sizeof(rate), "1/%u", lat.denom);
@@ -646,6 +736,7 @@ static int reply_create_record_stream(struct stream *stream, struct pw_manager_o
 	lat_usec = set_record_buffer_attr(stream, &stream->attr);
 
 	stream->index = id_to_index(manager, stream->id);
+	stream->lat_usec = lat_usec;
 
 	pw_log_info("[%s] reply CREATE_RECORD_STREAM tag:%u index:%u latency:%"PRIu64,
 			client->name, stream->create_tag, stream->index, lat_usec);
@@ -660,13 +751,12 @@ static int reply_create_record_stream(struct stream *stream, struct pw_manager_o
 		peer = find_linked(manager, peer->id, PW_DIRECTION_OUTPUT);
 	if (peer && pw_manager_object_is_source_or_monitor(peer)) {
 		name = pw_properties_get(peer->props, PW_KEY_NODE_NAME);
+		peer_index = peer->index;
 		if (!pw_manager_object_is_source(peer)) {
 			size_t len = (name ? strlen(name) : 5) + 10;
-			peer_index = peer->index;
 			peer_name = tmp = alloca(len);
 			snprintf(tmp, len, "%s.monitor", name ? name : "sink");
 		} else {
-			peer_index = peer->index;
 			peer_name = name;
 		}
 	} else {
@@ -710,6 +800,7 @@ static int reply_create_record_stream(struct stream *stream, struct pw_manager_o
 
 static int reply_create_stream(struct stream *stream, struct pw_manager_object *peer)
 {
+	stream->peer_index = peer->index;
 	return stream->direction == PW_DIRECTION_OUTPUT ?
 			reply_create_playback_stream(stream, peer) :
 			reply_create_record_stream(stream, peer);
@@ -719,6 +810,7 @@ static void manager_added(void *data, struct pw_manager_object *o)
 {
 	struct client *client = data;
 	struct pw_manager *manager = client->manager;
+	struct impl *impl = client->impl;
 	const char *str;
 
 	register_object_message_handlers(o);
@@ -740,21 +832,51 @@ static void manager_added(void *data, struct pw_manager_object *o)
 	}
 
 	if (spa_streq(o->type, PW_TYPE_INTERFACE_Link)) {
-		struct stream *s;
+		struct stream *s, *t;
 		struct pw_manager_object *peer = NULL;
-		spa_list_for_each(s, &client->pending_streams, link) {
-			peer = find_linked(manager, s->id, s->direction);
-			if (peer)
-				break;
+		union pw_map_item *item;
+		pw_array_for_each(item, &client->streams.items) {
+			struct stream *s = item->data;
+			const char *peer_name;
+
+			if (pw_map_item_is_free(item) || s->pending)
+				continue;
+			if (s->peer_index == SPA_ID_INVALID)
+				continue;
+
+			peer = find_peer_for_link(manager, o, s->id, s->direction);
+			if (peer == NULL || peer->props == NULL ||
+			    peer->index == s->peer_index)
+				continue;
+
+			s->peer_index = peer->index;
+
+			peer_name = pw_properties_get(peer->props, PW_KEY_NODE_NAME);
+			if (peer_name && s->direction == PW_DIRECTION_INPUT &&
+			    pw_manager_object_is_monitor(peer)) {
+				int len = strlen(peer_name) + 10;
+				char *tmp = alloca(len);
+				snprintf(tmp, len, "%s.monitor", peer_name);
+				peer_name = tmp;
+			}
+			if (peer_name != NULL)
+				stream_send_moved(s, peer->index, peer_name);
 		}
-		if (peer) {
-			reply_create_stream(s, peer);
-			spa_list_remove(&s->link);
-			s->pending = false;
+		spa_list_for_each_safe(s, t, &client->pending_streams, link) {
+			peer = find_peer_for_link(manager, o, s->id, s->direction);
+			if (peer) {
+				reply_create_stream(s, peer);
+				spa_list_remove(&s->link);
+				s->pending = false;
+			}
 		}
 	}
 
+	update_object_info(manager, o, &impl->defs);
+
 	send_object_event(client, o, SUBSCRIPTION_EVENT_NEW);
+
+	o->change_mask = 0;
 
 	/* Adding sinks etc. may also change defaults */
 	send_default_change_subscribe_event(client, pw_manager_object_is_sink(o), pw_manager_object_is_source_or_monitor(o));
@@ -763,8 +885,16 @@ static void manager_added(void *data, struct pw_manager_object *o)
 static void manager_updated(void *data, struct pw_manager_object *o)
 {
 	struct client *client = data;
+	struct pw_manager *manager = client->manager;
+	struct impl *impl = client->impl;
+
+	update_object_info(manager, o, &impl->defs);
 
 	send_object_event(client, o, SUBSCRIPTION_EVENT_CHANGE);
+
+	o->change_mask = 0;
+
+	set_temporary_move_target(client, o, SPA_ID_INVALID);
 
 	send_latency_offset_subscribe_event(client, o);
 	send_default_change_subscribe_event(client, pw_manager_object_is_sink(o), pw_manager_object_is_source_or_monitor(o));
@@ -784,6 +914,14 @@ static void manager_removed(void *data, struct pw_manager_object *o)
 		    (str = pw_properties_get(o->props, PW_KEY_METADATA_NAME)) != NULL)
 			handle_metadata(client, o, NULL, str);
 	}
+}
+
+static void manager_object_data_timeout(void *data, struct pw_manager_object *o, const char *key)
+{
+	struct client *client = data;
+
+	if (spa_streq(key, "temporary_move_data"))
+		temporary_move_target_timeout(client, o);
 }
 
 static int json_object_find(const char *obj, const char *key, char *value, size_t len)
@@ -833,6 +971,8 @@ static void manager_metadata(void *data, struct pw_manager_object *o,
 				free(client->default_sink);
 				client->default_sink = value ? strdup(value) : NULL;
 			}
+			free(client->temporary_default_sink);
+			client->temporary_default_sink = NULL;
 		}
 		if (key == NULL || spa_streq(key, "default.audio.source")) {
 			if (value != NULL) {
@@ -846,6 +986,8 @@ static void manager_metadata(void *data, struct pw_manager_object *o,
 				free(client->default_source);
 				client->default_source = value ? strdup(value) : NULL;
 			}
+			free(client->temporary_default_source);
+			client->temporary_default_source = NULL;
 		}
 		if (changed)
 			send_default_change_subscribe_event(client, true, true);
@@ -880,7 +1022,8 @@ static const struct pw_manager_events manager_events = {
 	.updated = manager_updated,
 	.removed = manager_removed,
 	.metadata = manager_metadata,
-	.disconnect = manager_disconnect
+	.disconnect = manager_disconnect,
+	.object_data_timeout = manager_object_data_timeout,
 };
 
 static int do_set_client_name(struct client *client, uint32_t command, uint32_t tag, struct message *m)
@@ -905,11 +1048,11 @@ static int do_set_client_name(struct client *client, uint32_t command, uint32_t 
 		changed++;
 	}
 
+	client_update_quirks(client);
+
 	client->name = pw_properties_get(client->props, PW_KEY_APP_NAME);
 	pw_log_info("[%s] %s tag:%d", client->name,
 			commands[command].name, tag);
-
-	client_update_quirks(client);
 
 	if (client->core == NULL) {
 		client->core = pw_context_connect(impl->context,
@@ -968,13 +1111,17 @@ static void stream_control_info(void *data, uint32_t id,
 
 	switch (id) {
 	case SPA_PROP_channelVolumes:
-		stream->volume.channels = control->n_values;
-		memcpy(stream->volume.values, control->values, control->n_values * sizeof(float));
-		pw_log_info("stream %p: volume changed %f", stream, stream->volume.values[0]);
+		if (!stream->volume_set) {
+			stream->volume.channels = control->n_values;
+			memcpy(stream->volume.values, control->values, control->n_values * sizeof(float));
+			pw_log_info("stream %p: volume changed %f", stream, stream->volume.values[0]);
+		}
 		break;
 	case SPA_PROP_mute:
-		stream->muted = control->values[0] >= 0.5;
-		pw_log_info("stream %p: mute changed %d", stream, stream->muted);
+		if (!stream->muted_set) {
+			stream->muted = control->values[0] >= 0.5;
+			pw_log_info("stream %p: mute changed %d", stream, stream->muted);
+		}
 		break;
 	}
 }
@@ -1024,30 +1171,25 @@ static const struct spa_pod *get_buffers_param(struct stream *s,
 		struct buffer_attr *attr, struct spa_pod_builder *b)
 {
 	const struct spa_pod *param;
-	uint32_t blocks, buffers, size, maxsize, stride;
+	uint32_t blocks, size, stride;
 	struct defs *defs = &s->impl->defs;
 
 	blocks = 1;
 	stride = s->frame_size;
 
-	maxsize = defs->quantum_limit * 32 * s->frame_size;
-	if (s->direction == PW_DIRECTION_OUTPUT) {
-		size = attr->minreq;
-	} else {
-		size = attr->fragsize;
-	}
-	buffers = SPA_CLAMP(maxsize / size, MIN_BUFFERS, MAX_BUFFERS);
+	size = defs->quantum_limit * s->frame_size;
 
-	pw_log_info("[%s] stride %d maxsize %d size %u buffers %d", s->client->name,
-			stride, maxsize, size, buffers);
+	pw_log_info("[%s] stride %d size %u", s->client->name, stride, size);
 
 	param = spa_pod_builder_add_object(b,
 			SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers,
+			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(2,
 				MIN_BUFFERS, MAX_BUFFERS),
 			SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(blocks),
 			SPA_PARAM_BUFFERS_size,    SPA_POD_CHOICE_RANGE_Int(
-								size, size, maxsize),
+								size,
+								16 * s->frame_size,
+								INT32_MAX),
 			SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(stride));
 	return param;
 }
@@ -1084,16 +1226,18 @@ static void stream_param_changed(void *data, uint32_t id, const struct spa_pod *
 		struct pw_manager_object *peer;
 
 		if (stream->volume_set) {
+			stream->volume_set = false;
 			pw_stream_set_control(stream->stream,
 				SPA_PROP_channelVolumes, stream->volume.channels, stream->volume.values, 0);
 		}
 		if (stream->muted_set) {
 			float val = stream->muted ? 1.0f : 0.0f;
+			stream->muted_set = false;
 			pw_stream_set_control(stream->stream,
 				SPA_PROP_mute, 1, &val, 0);
 		}
 		if (stream->corked)
-			pw_stream_set_active(stream->stream, false);
+			stream_set_paused(stream, true, "cork after create");
 
 		/* if peer exists, reply immediately, otherwise reply when the link is created */
 		peer = find_linked(stream->client->manager, stream->id, stream->direction);
@@ -1113,9 +1257,6 @@ static void stream_io_changed(void *data, uint32_t id, void *area, uint32_t size
 {
 	struct stream *stream = data;
 	switch (id) {
-	case SPA_IO_RateMatch:
-		stream->rate_match = area;
-		break;
 	case SPA_IO_Position:
 		stream->position = area;
 		break;
@@ -1131,6 +1272,7 @@ struct process_data {
 	uint32_t minreq;
 	uint32_t quantum;
 	unsigned int underrun:1;
+	unsigned int idle:1;
 };
 
 static int
@@ -1145,10 +1287,9 @@ do_process_done(struct spa_loop *loop,
 	int32_t avail;
 
 	stream->timestamp = pd->pwt.now;
+	stream->delay = pd->pwt.buffered * SPA_USEC_PER_SEC / stream->ss.rate;
 	if (pd->pwt.rate.denom > 0)
-		stream->delay = pd->pwt.delay * SPA_USEC_PER_SEC / pd->pwt.rate.denom;
-	else
-		stream->delay = 0;
+		stream->delay += pd->pwt.delay * SPA_USEC_PER_SEC * pd->pwt.rate.num / pd->pwt.rate.denom;
 
 	if (stream->direction == PW_DIRECTION_OUTPUT) {
 		if (pd->quantum != stream->last_quantum)
@@ -1171,6 +1312,17 @@ do_process_done(struct spa_loop *loop,
 			else
 				stream_send_started(stream);
 		}
+		if (pd->idle) {
+			if (!stream->is_idle) {
+				stream->idle_time = stream->timestamp;
+			} else if (!stream->is_paused &&
+			    stream->idle_timeout_sec > 0 &&
+			    stream->timestamp - stream->idle_time >
+					(stream->idle_timeout_sec * SPA_NSEC_PER_SEC)) {
+				stream_set_paused(stream, true, "long underrun");
+			}
+		}
+		stream->is_idle = pd->idle;
 		stream->playing_for += pd->playing_for;
 		if (stream->underrun_for != (uint64_t)-1)
 			stream->underrun_for += pd->underrun_for;
@@ -1194,7 +1346,7 @@ do_process_done(struct spa_loop *loop,
 			pw_log_warn("%p: [%s] underrun read:%u avail:%d",
 					stream, client->name, index, avail);
 		} else {
-			if (avail > (int32_t)stream->attr.maxlength) {
+			if ((uint32_t)avail > stream->attr.maxlength) {
 				uint32_t skip = avail - stream->attr.fragsize;
 				/* overrun, catch up to latest fragment and send it */
 				pw_log_warn("%p: [%s] overrun recover read:%u avail:%d max:%u skip:%u",
@@ -1203,11 +1355,12 @@ do_process_done(struct spa_loop *loop,
 				stream->read_index += skip;
 				avail = stream->attr.fragsize;
 			}
+			pw_log_trace("avail:%d index:%u", avail, index);
 
-			while (avail > 0) {
-				towrite = avail;
-				if (towrite > stream->attr.fragsize)
-					towrite = stream->attr.fragsize;
+			while ((uint32_t)avail >= stream->attr.fragsize) {
+				towrite = SPA_MIN(avail, MAX_BLOCK);
+				towrite = SPA_MIN(towrite, stream->attr.fragsize);
+				towrite = SPA_ROUND_DOWN(towrite, stream->frame_size);
 
 				msg = message_alloc(impl, stream->channel, towrite);
 				if (msg == NULL)
@@ -1239,7 +1392,8 @@ static void stream_process(void *data)
 	void *p;
 	struct pw_buffer *buffer;
 	struct spa_buffer *buf;
-	uint32_t size, minreq = 0, index;
+	struct spa_data *d;
+	uint32_t offs, size, minreq = 0, index;
 	struct process_data pd;
 	bool do_flush = false;
 
@@ -1252,7 +1406,8 @@ static void stream_process(void *data)
 		return;
 
 	buf = buffer->buffer;
-	if ((p = buf->datas[0].data) == NULL)
+	d = &buf->datas[0];
+	if ((p = d->data) == NULL)
 		return;
 
 	spa_zero(pd);
@@ -1260,8 +1415,7 @@ static void stream_process(void *data)
 	if (stream->direction == PW_DIRECTION_OUTPUT) {
 		int32_t avail = spa_ringbuffer_get_read_index(&stream->ring, &index);
 
-		if (stream->rate_match)
-			minreq = stream->rate_match->size * stream->frame_size;
+		minreq = buffer->requested * stream->frame_size;
 		if (minreq == 0)
 			minreq = stream->attr.minreq;
 
@@ -1270,8 +1424,21 @@ static void stream_process(void *data)
 
 		if (avail < (int32_t)minreq || stream->corked) {
 			/* underrun, produce a silence buffer */
-			size = SPA_MIN(buf->datas[0].maxsize, minreq);
-			memset(p, 0, size);
+			size = SPA_MIN(d->maxsize, minreq);
+			switch (stream->ss.format) {
+			case SPA_AUDIO_FORMAT_U8:
+				memset(p, 0x80, size);
+				break;
+			case SPA_AUDIO_FORMAT_ALAW:
+				memset(p, 0x80 ^ 0x55, size);
+				break;
+			case SPA_AUDIO_FORMAT_ULAW:
+				memset(p, 0x00 ^ 0xff, size);
+				break;
+			default:
+				memset(p, 0, size);
+				break;
+			}
 
 			if (stream->draining && !stream->corked) {
 				stream->draining = false;
@@ -1282,16 +1449,19 @@ static void stream_process(void *data)
 			}
 			if ((stream->attr.prebuf == 0 || do_flush) && !stream->corked) {
 				if (avail > 0) {
+					avail = SPA_MIN((uint32_t)avail, size);
 					spa_ringbuffer_read_data(&stream->ring,
 						stream->buffer, MAXLENGTH,
 						index % MAXLENGTH,
 						p, avail);
 				}
-				pd.playing_for = size;
-				pd.read_inc = size;
 				index += size;
+				pd.read_inc = size;
 				spa_ringbuffer_read_update(&stream->ring, index);
+
+				pd.playing_for = size;
 			}
+			pd.idle = true;
 			pw_log_debug("%p: [%s] underrun read:%u avail:%d max:%u",
 					stream, client->name, index, avail, minreq);
 		} else {
@@ -1306,7 +1476,7 @@ static void stream_process(void *data)
 				pd.read_inc = skip;
 				avail = stream->attr.maxlength;
 			}
-			size = SPA_MIN(buf->datas[0].maxsize, (uint32_t)avail);
+			size = SPA_MIN(d->maxsize, (uint32_t)avail);
 			size = SPA_MIN(size, minreq);
 
 			spa_ringbuffer_read_data(&stream->ring,
@@ -1321,13 +1491,16 @@ static void stream_process(void *data)
 			pd.playing_for = size;
 			pd.underrun = false;
 		}
-		buf->datas[0].chunk->offset = 0;
-		buf->datas[0].chunk->stride = stream->frame_size;
-		buf->datas[0].chunk->size = size;
+		d->chunk->offset = 0;
+		d->chunk->stride = stream->frame_size;
+		d->chunk->size = size;
 		buffer->size = size / stream->frame_size;
 	} else  {
 		int32_t filled = spa_ringbuffer_get_write_index(&stream->ring, &index);
-		size = buf->datas[0].chunk->size;
+
+		offs = SPA_MIN(d->chunk->offset, d->maxsize);
+		size = SPA_MIN(d->chunk->size, d->maxsize - offs);
+
 		if (filled < 0) {
 			/* underrun, can't really happen because we never read more
 			 * than what's available on the other side  */
@@ -1345,7 +1518,7 @@ static void stream_process(void *data)
 		spa_ringbuffer_write_data(&stream->ring,
 				stream->buffer, MAXLENGTH,
 				index % MAXLENGTH,
-				SPA_PTROFF(p, buf->datas[0].chunk->offset, void),
+				SPA_PTROFF(p, offs, void),
 				SPA_MIN(size, MAXLENGTH));
 
 		index += size;
@@ -1357,7 +1530,7 @@ static void stream_process(void *data)
 	if (do_flush)
 		pw_stream_flush(stream->stream, true);
 
-	pw_stream_get_time(stream->stream, &pd.pwt);
+	pw_stream_get_time_n(stream->stream, &pd.pwt, sizeof(pd.pwt));
 
 	pw_loop_invoke(impl->loop,
 			do_process_done, 1, &pd, sizeof(pd), false, stream);
@@ -1373,7 +1546,7 @@ static void stream_drained(void *data)
 		reply_simple_ack(stream->client, stream->drain_tag);
 		stream->drain_tag = 0;
 
-		pw_stream_set_active(stream->stream, true);
+		pw_stream_set_active(stream->stream, !stream->is_paused);
 	}
 }
 
@@ -1401,12 +1574,11 @@ static void log_format_info(struct impl *impl, enum spa_log_level level, struct 
 static int do_create_playback_stream(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
 	struct impl *impl = client->impl;
-	struct pw_manager *manager = client->manager;
 	const char *name = NULL;
 	int res;
-	struct sample_spec ss;
-	struct channel_map map;
-	uint32_t sink_index, syncid, rate = 0;
+	struct sample_spec ss, fix_ss;
+	struct channel_map map, fix_map;
+	uint32_t sink_index, syncid, ss_rate = 0, rate = 0;
 	const char *sink_name;
 	struct buffer_attr attr = { 0 };
 	bool corked = false,
@@ -1434,6 +1606,8 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
 	const struct spa_pod *params[MAX_FORMATS];
 	uint8_t buffer[4096];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+	struct pw_manager_object *o;
+	bool is_monitor;
 
 	props = pw_properties_copy(client->props);
 	if (props == NULL)
@@ -1480,6 +1654,19 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
 				TAG_INVALID) < 0)
 			goto error_protocol;
 	}
+	o = find_device(client, sink_index, sink_name, true, &is_monitor);
+
+	spa_zero(fix_ss);
+	spa_zero(fix_map);
+	if ((fix_format || fix_rate || fix_channels) && o != NULL) {
+		struct device_info dev_info;
+		get_device_info(o, &dev_info, PW_DIRECTION_OUTPUT, is_monitor);
+		fix_ss.format = fix_format ? dev_info.ss.format : 0;
+		fix_ss.rate = fix_rate ? dev_info.ss.rate : 0;
+		fix_ss.channels = fix_channels ? dev_info.ss.channels : 0;
+		fix_map = dev_info.map;
+	}
+
 	if (client->version >= 13) {
 		if (message_get(m,
 				TAG_BOOLEAN, &muted,
@@ -1539,7 +1726,7 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
 					n_params++;
 					n_valid_formats++;
 					if (r > rate)
-						rate = r;
+						ss_rate = rate = r;
 				} else {
 					log_format_info(impl, SPA_LOG_LEVEL_WARN, &format);
 				}
@@ -1548,34 +1735,24 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
 		}
 	}
 	if (sample_spec_valid(&ss)) {
-		if (fix_format || fix_rate || fix_channels) {
-			struct sample_spec sfix = ss;
-			if (fix_format)
-				sfix.format = SPA_AUDIO_FORMAT_UNKNOWN;
-			if (fix_rate)
-				sfix.rate = 0;
-			if (fix_channels)
-				sfix.channels = 0;
-			if (n_params < MAX_FORMATS &&
-			    (params[n_params] = format_build_param(&b,
-					SPA_PARAM_EnumFormat, &sfix,
-					sfix.channels > 0 ? &map : NULL)) != NULL) {
-				n_params++;
-				n_valid_formats++;
-			}
-		}
-		else if (n_params < MAX_FORMATS &&
+		struct sample_spec sfix = ss;
+		struct channel_map mfix = map;
+
+		ss_rate = ss.rate;
+		sample_spec_fix(&sfix, &mfix, &fix_ss, &fix_map, &props->dict);
+		rate = sfix.rate;
+
+		if (n_params < MAX_FORMATS &&
 		    (params[n_params] = format_build_param(&b,
-				SPA_PARAM_EnumFormat, &ss,
-				ss.channels > 0 ? &map : NULL)) != NULL) {
+				SPA_PARAM_EnumFormat, &sfix,
+				sfix.channels > 0 ? &mfix : NULL)) != NULL) {
 			n_params++;
 			n_valid_formats++;
 		} else {
 			pw_log_warn("%p: unsupported format:%s rate:%d channels:%u",
-					impl, format_id2name(ss.format), ss.rate,
-					ss.channels);
+					impl, format_id2name(sfix.format), sfix.rate,
+					sfix.channels);
 		}
-		rate = ss.rate;
 	}
 
 	if (m->offset != m->length)
@@ -1598,8 +1775,13 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
 	stream->is_underrun = true;
 	stream->underrun_for = -1;
 
-	if (rate != 0)
+	if (rate != 0) {
+		struct spa_fraction lat;
+		fix_playback_buffer_attr(stream, &attr, ss_rate, &lat);
 		pw_properties_setf(props, PW_KEY_NODE_RATE, "1/%u", rate);
+		pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%u/%u",
+				lat.num, lat.denom);
+	}
 	if (no_remix)
 		pw_properties_set(props, PW_KEY_STREAM_DONT_REMIX, "true");
 	flags = 0;
@@ -1607,14 +1789,12 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
 		flags |= PW_STREAM_FLAG_DONT_RECONNECT;
 
 	if (sink_name != NULL) {
-		pw_properties_set(props,
-				PW_KEY_NODE_TARGET, sink_name);
+		if (o != NULL)
+			sink_name = pw_properties_get(o->props,
+					PW_KEY_NODE_NAME);
 		pw_properties_set(props,
 				PW_KEY_TARGET_OBJECT, sink_name);
 	} else if (sink_index != SPA_ID_INVALID && sink_index != 0) {
-		pw_properties_setf(props,
-				PW_KEY_NODE_TARGET, "%u",
-				index_to_id(manager, sink_index));
 		pw_properties_setf(props,
 				PW_KEY_TARGET_OBJECT, "%u", sink_index);
 	}
@@ -1664,14 +1844,13 @@ error:
 static int do_create_record_stream(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
 	struct impl *impl = client->impl;
-	struct pw_manager *manager = client->manager;
 	const char *name = NULL;
 	int res;
-	struct sample_spec ss;
-	struct channel_map map;
+	struct sample_spec ss, fix_ss;
+	struct channel_map map, fix_map;
 	uint32_t source_index;
 	const char *source_name;
-	struct buffer_attr attr;
+	struct buffer_attr attr = { 0 };
 	bool corked = false,
 		no_remap = false,
 		no_remix = false,
@@ -1695,10 +1874,12 @@ static int do_create_record_stream(struct client *client, uint32_t command, uint
 	struct pw_properties *props = NULL;
 	uint8_t n_formats = 0;
 	struct stream *stream = NULL;
-	uint32_t n_params = 0, n_valid_formats = 0, flags, id, rate = 0;
+	uint32_t n_params = 0, n_valid_formats = 0, flags, id, ss_rate = 0, rate = 0;
 	const struct spa_pod *params[MAX_FORMATS];
 	uint8_t buffer[4096];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+	struct pw_manager_object *o;
+	bool is_monitor = false;
 
 	props = pw_properties_copy(client->props);
 	if (props == NULL)
@@ -1763,6 +1944,19 @@ static int do_create_record_stream(struct client *client, uint32_t command, uint
 				TAG_INVALID) < 0)
 			goto error_protocol;
 	}
+	o = find_device(client, source_index, source_name, false, &is_monitor);
+
+	spa_zero(fix_ss);
+	spa_zero(fix_map);
+	if ((fix_format || fix_rate || fix_channels) && o != NULL) {
+		struct device_info dev_info;
+		get_device_info(o, &dev_info, PW_DIRECTION_INPUT, is_monitor);
+		fix_ss.format = fix_format ? dev_info.ss.format : 0;
+		fix_ss.rate = fix_rate ? dev_info.ss.rate : 0;
+		fix_ss.channels = fix_channels ? dev_info.ss.channels : 0;
+		fix_map = dev_info.map;
+	}
+
 	if (client->version >= 22) {
 		if (message_get(m,
 				TAG_U8, &n_formats,
@@ -1786,7 +1980,7 @@ static int do_create_record_stream(struct client *client, uint32_t command, uint
 					n_params++;
 					n_valid_formats++;
 					if (r > rate)
-						rate = r;
+						ss_rate = rate = r;
 				} else {
 					log_format_info(impl, SPA_LOG_LEVEL_WARN, &format);
 				}
@@ -1806,34 +2000,24 @@ static int do_create_record_stream(struct client *client, uint32_t command, uint
 		volume_set = false;
 	}
 	if (sample_spec_valid(&ss)) {
-		if (fix_format || fix_rate || fix_channels) {
-			struct sample_spec sfix = ss;
-			if (fix_format)
-				sfix.format = SPA_AUDIO_FORMAT_UNKNOWN;
-			if (fix_rate)
-				sfix.rate = 0;
-			if (fix_channels)
-				sfix.channels = 0;
-			if (n_params < MAX_FORMATS &&
-			    (params[n_params] = format_build_param(&b,
-					SPA_PARAM_EnumFormat, &sfix,
-					sfix.channels > 0 ? &map : NULL)) != NULL) {
-				n_params++;
-				n_valid_formats++;
-			}
-		}
+		struct sample_spec sfix = ss;
+		struct channel_map mfix = map;
+
+		ss_rate = ss.rate;
+		sample_spec_fix(&sfix, &mfix, &fix_ss, &fix_map, &props->dict);
+		rate = sfix.rate;
+
 		if (n_params < MAX_FORMATS &&
 		    (params[n_params] = format_build_param(&b,
-				SPA_PARAM_EnumFormat, &ss,
-				ss.channels > 0 ? &map : NULL)) != NULL) {
+				SPA_PARAM_EnumFormat, &sfix,
+				sfix.channels > 0 ? &mfix : NULL)) != NULL) {
 			n_params++;
 			n_valid_formats++;
 		} else {
 			pw_log_warn("%p: unsupported format:%s rate:%d channels:%u",
-					impl, format_id2name(ss.format), ss.rate,
-					ss.channels);
+					impl, format_id2name(sfix.format), sfix.rate,
+					sfix.channels);
 		}
-		rate = ss.rate;
 	}
 	if (m->offset != m->length)
 		goto error_protocol;
@@ -1856,8 +2040,13 @@ static int do_create_record_stream(struct client *client, uint32_t command, uint
 	if (client->quirks & QUIRK_REMOVE_CAPTURE_DONT_MOVE)
 		no_move = false;
 
-	if (rate != 0)
+	if (rate != 0) {
+		struct spa_fraction lat;
+		fix_record_buffer_attr(stream, &attr, ss_rate, &lat);
 		pw_properties_setf(props, PW_KEY_NODE_RATE, "1/%u", rate);
+		pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%u/%u",
+				lat.num, lat.denom);
+	}
 	if (peak_detect)
 		pw_properties_set(props, PW_KEY_STREAM_MONITOR, "true");
 	if (no_remix)
@@ -1874,26 +2063,23 @@ static int do_create_record_stream(struct client *client, uint32_t command, uint
 	}
 	if (source_index != SPA_ID_INVALID && source_index != 0) {
 		pw_properties_setf(props,
-				PW_KEY_NODE_TARGET, "%u",
-				index_to_id(manager, source_index));
-		pw_properties_setf(props,
 				PW_KEY_TARGET_OBJECT, "%u", source_index);
 	} else if (source_name != NULL) {
+		if (o != NULL)
+			source_name = pw_properties_get(o->props,
+					PW_KEY_NODE_NAME);
 		if (spa_strendswith(source_name, ".monitor")) {
-			pw_properties_setf(props,
-					PW_KEY_NODE_TARGET,
-					"%.*s", (int)strlen(source_name)-8, source_name);
+			is_monitor = true;
 			pw_properties_setf(props,
 					PW_KEY_TARGET_OBJECT,
 					"%.*s", (int)strlen(source_name)-8, source_name);
-			pw_properties_set(props,
-					PW_KEY_STREAM_CAPTURE_SINK, "true");
 		} else {
-			pw_properties_set(props,
-					PW_KEY_NODE_TARGET, source_name);
 			pw_properties_set(props,
 					PW_KEY_TARGET_OBJECT, source_name);
 		}
+		if (is_monitor)
+			pw_properties_set(props,
+					PW_KEY_STREAM_CAPTURE_SINK, "true");
 	}
 
 	stream->stream = pw_stream_new(client->core, name, props);
@@ -1987,7 +2173,7 @@ static int do_get_playback_latency(struct client *client, uint32_t command, uint
 	if (stream == NULL || stream->type != STREAM_TYPE_PLAYBACK)
 		return -ENOENT;
 
-	pw_log_debug("read:%"PRIx64" write:%"PRIx64" queued:%"PRIi64" delay:%"PRIi64
+	pw_log_debug("read:0x%"PRIx64" write:0x%"PRIx64" queued:%"PRIi64" delay:%"PRIi64
 			" playing:%"PRIu64,
 			stream->read_index, stream->write_index,
 			stream->write_index - stream->read_index, stream->delay,
@@ -2035,6 +2221,11 @@ static int do_get_record_latency(struct client *client, uint32_t command, uint32
 	stream = pw_map_lookup(&client->streams, channel);
 	if (stream == NULL || stream->type != STREAM_TYPE_RECORD)
 		return -ENOENT;
+
+	pw_log_debug("read:0x%"PRIx64" write:0x%"PRIx64" queued:%"PRIi64" delay:%"PRIi64,
+			stream->read_index, stream->write_index,
+			stream->write_index - stream->read_index, stream->delay);
+
 
 	gettimeofday(&now, NULL);
 	reply = reply_new(client, tag);
@@ -2275,7 +2466,7 @@ static struct pw_manager_object *find_device(struct client *client,
 		uint32_t index, const char *name, bool sink, bool *is_monitor)
 {
 	struct selector sel;
-	bool monitor = false, find_default = false;
+	bool monitor = false, find_default = false, allow_monitor = false;
 	struct pw_manager_object *o;
 
 	if (name != NULL) {
@@ -2284,10 +2475,13 @@ static struct pw_manager_object *find_device(struct client *client,
 				return NULL;
 			sink = true;
 			find_default = true;
+			monitor = true;
+			allow_monitor = true;
 		} else if (spa_streq(name, DEFAULT_SOURCE)) {
 			if (sink)
 				return NULL;
 			find_default = true;
+			allow_monitor = true;
 		} else if (spa_streq(name, DEFAULT_SINK)) {
 			if (!sink)
 				return NULL;
@@ -2306,8 +2500,10 @@ static struct pw_manager_object *find_device(struct client *client,
 
 	if (name != NULL) {
 		if (spa_strendswith(name, ".monitor")) {
-			name = strndupa(name, strlen(name)-8);
-			monitor = true;
+			if (!sink) {
+				name = strndupa(name, strlen(name)-8);
+				allow_monitor = true;
+			}
 		}
 	} else if (index == SPA_ID_INVALID)
 		return NULL;
@@ -2323,8 +2519,18 @@ static struct pw_manager_object *find_device(struct client *client,
 
 	o = select_object(client->manager, &sel);
 	if (o != NULL) {
-		if (!sink && pw_manager_object_is_monitor(o))
-			monitor = true;
+		if (!sink) {
+			if (pw_manager_object_is_monitor(o)) {
+				if (!allow_monitor)
+					return NULL;
+				monitor = true;
+			}
+			else if (!pw_manager_object_is_source(o))
+				return NULL;
+		} else {
+			if (!pw_manager_object_is_sink(o))
+				return NULL;
+		}
 	}
 	if (is_monitor)
 		*is_monitor = monitor;
@@ -2332,86 +2538,18 @@ static struct pw_manager_object *find_device(struct client *client,
 	return o;
 }
 
-static void sample_play_finish(struct pending_sample *ps)
-{
-	struct client *client = ps->client;
-	pending_sample_free(ps);
-	client_unref(client);
-}
-
-static void sample_play_ready_reply(void *data, struct client *client, uint32_t tag)
-{
-	struct pending_sample *ps = data;
-	struct message *reply;
-	uint32_t index = id_to_index(client->manager, ps->play->id);
-
-	pw_log_info("[%s] PLAY_SAMPLE tag:%u index:%u",
-			client->name, ps->tag, index);
-
-	ps->ready = true;
-
-	reply = reply_new(client, ps->tag);
-	if (client->version >= 13)
-		message_put(reply,
-			TAG_U32, index,
-			TAG_INVALID);
-
-	client_queue_message(client, reply);
-
-	if (ps->done)
-		sample_play_finish(ps);
-}
-
-static void sample_play_ready(void *data, uint32_t id)
-{
-	struct pending_sample *ps = data;
-	struct client *client = ps->client;
-	operation_new_cb(client, ps->tag, sample_play_ready_reply, ps);
-}
-
-static void on_sample_done(void *obj, void *data, int res, uint32_t id)
-{
-	struct pending_sample *ps = obj;
-	ps->done = true;
-	if (ps->ready)
-		sample_play_finish(ps);
-}
-
-static void sample_play_done(void *data, int res)
-{
-	struct pending_sample *ps = data;
-	struct client *client = ps->client;
-	struct impl *impl = client->impl;
-
-	if (res < 0)
-		reply_error(client, COMMAND_PLAY_SAMPLE, ps->tag, res);
-	else
-		pw_log_info("[%s] PLAY_SAMPLE done tag:%u", client->name, ps->tag);
-
-	pw_work_queue_add(impl->work_queue, ps, 0,
-				on_sample_done, client);
-}
-
-static const struct sample_play_events sample_play_events = {
-	VERSION_SAMPLE_PLAY_EVENTS,
-	.ready = sample_play_ready,
-	.done = sample_play_done,
-};
-
 static int do_play_sample(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
 	struct impl *impl = client->impl;
 	uint32_t sink_index, volume;
 	struct sample *sample;
-	struct sample_play *play;
 	const char *sink_name, *name;
-	struct pw_properties *props = NULL;
-	struct pending_sample *ps;
+	spa_autoptr(pw_properties) props = NULL;
 	struct pw_manager_object *o;
 	int res;
 
 	if ((props = pw_properties_new(NULL, NULL)) == NULL)
-		goto error_errno;
+		return -errno;
 
 	if ((res = message_get(m,
 			TAG_U32, &sink_index,
@@ -2419,13 +2557,13 @@ static int do_play_sample(struct client *client, uint32_t command, uint32_t tag,
 			TAG_U32, &volume,
 			TAG_STRING, &name,
 			TAG_INVALID)) < 0)
-		goto error_proto;
+		return -EPROTO;
 
 	if (client->version >= 13) {
 		if ((res = message_get(m,
 				TAG_PROPLIST, props,
 				TAG_INVALID)) < 0)
-			goto error_proto;
+			return -EPROTO;
 
 	}
 	pw_log_info("[%s] %s tag:%u sink_index:%u sink_name:%s name:%s",
@@ -2435,49 +2573,19 @@ static int do_play_sample(struct client *client, uint32_t command, uint32_t tag,
 	pw_properties_update(props, &client->props->dict);
 
 	if (sink_index != SPA_ID_INVALID && sink_name != NULL)
-		goto error_inval;
+		return -EINVAL;
 
 	o = find_device(client, sink_index, sink_name, PW_DIRECTION_OUTPUT, NULL);
 	if (o == NULL)
-		goto error_noent;
+		return -ENOENT;
 
 	sample = find_sample(impl, SPA_ID_INVALID, name);
 	if (sample == NULL)
-		goto error_noent;
+		return -ENOENT;
 
-	pw_properties_setf(props, PW_KEY_NODE_TARGET, "%u", o->id);
 	pw_properties_setf(props, PW_KEY_TARGET_OBJECT, "%"PRIu64, o->serial);
 
-	play = sample_play_new(client->core, sample, props, sizeof(struct pending_sample));
-	props = NULL;
-	if (play == NULL)
-		goto error_errno;
-
-	ps = play->user_data;
-	ps->client = client;
-	ps->play = play;
-	ps->tag = tag;
-	sample_play_add_listener(play, &ps->listener, &sample_play_events, ps);
-	spa_list_append(&client->pending_samples, &ps->link);
-	client->ref++;
-
-	return 0;
-
-error_errno:
-	res = -errno;
-	goto error;
-error_proto:
-	res = -EPROTO;
-	goto error;
-error_inval:
-	res = -EINVAL;
-	goto error;
-error_noent:
-	res = -ENOENT;
-	goto error;
-error:
-	pw_properties_free(props);
-	return res;
+	return pending_sample_new(client, sample, spa_steal_ptr(props), tag);
 }
 
 static int do_remove_sample(struct client *client, uint32_t command, uint32_t tag, struct message *m)
@@ -2536,7 +2644,7 @@ static int do_cork_stream(struct client *client, uint32_t command, uint32_t tag,
 		return -ENOENT;
 
 	stream->corked = cork;
-	pw_stream_set_active(stream->stream, !cork);
+	stream_set_paused(stream, cork, "cork request");
 	if (cork) {
 		stream->is_underrun = true;
 	} else {
@@ -2573,11 +2681,17 @@ static int do_flush_trigger_prebuf_stream(struct client *client, uint32_t comman
 		break;
 	case COMMAND_TRIGGER_PLAYBACK_STREAM:
 	case COMMAND_PREBUF_PLAYBACK_STREAM:
+		if (stream->type != STREAM_TYPE_PLAYBACK)
+			return -ENOENT;
+		if (command == COMMAND_TRIGGER_PLAYBACK_STREAM)
+			stream->in_prebuf = false;
+		else if (stream->attr.prebuf > 0)
+			stream->in_prebuf = true;
+		stream_send_request(stream);
 		break;
 	default:
 		return -EINVAL;
 	}
-
 	return reply_simple_ack(client, tag);
 }
 
@@ -2789,11 +2903,10 @@ done:
 
 static int do_set_volume(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
-	struct impl *impl = client->impl;
 	struct pw_manager *manager = client->manager;
 	struct pw_node_info *info;
-	uint32_t index, card_id = SPA_ID_INVALID;
-	const char *name, *str;
+	uint32_t index;
+	const char *name;
 	struct volume volume;
 	struct pw_manager_object *o, *card = NULL;
 	int res;
@@ -2815,31 +2928,30 @@ static int do_set_volume(struct client *client, uint32_t command, uint32_t tag, 
 	    (index != SPA_ID_INVALID && name != NULL))
 		return -EINVAL;
 
-	if (command == COMMAND_SET_SINK_VOLUME)
+	if (command == COMMAND_SET_SINK_VOLUME) {
+		if (client->quirks & QUIRK_BLOCK_SINK_VOLUME)
+			return -EPERM;
 		direction = PW_DIRECTION_OUTPUT;
-	else
+	} else {
+		if (client->quirks & QUIRK_BLOCK_SOURCE_VOLUME)
+			return -EPERM;
 		direction = PW_DIRECTION_INPUT;
+	}
 
 	o = find_device(client, index, name, direction == PW_DIRECTION_OUTPUT, &is_monitor);
 	if (o == NULL || (info = o->info) == NULL || info->props == NULL)
 		return -ENOENT;
 
-	dev_info = DEVICE_INFO_INIT(direction);
-
-	if ((str = spa_dict_lookup(info->props, PW_KEY_DEVICE_ID)) != NULL)
-		card_id = (uint32_t)atoi(str);
-	if ((str = spa_dict_lookup(info->props, "card.profile.device")) != NULL)
-		dev_info.device = (uint32_t)atoi(str);
-	if (card_id != SPA_ID_INVALID) {
-		struct selector sel = { .id = card_id, .type = pw_manager_object_is_card, };
-		card = select_object(manager, &sel);
-	}
-	collect_device_info(o, card, &dev_info, is_monitor, &impl->defs);
+	get_device_info(o, &dev_info, direction, is_monitor);
 
 	if (dev_info.have_volume &&
 	    volume_compare(&dev_info.volume_info.volume, &volume) == 0)
 		goto done;
 
+	if (dev_info.card_id != SPA_ID_INVALID) {
+		struct selector sel = { .id = dev_info.card_id, .type = pw_manager_object_is_card, };
+		card = select_object(manager, &sel);
+	}
 	if (card != NULL && !is_monitor && dev_info.active_port != SPA_ID_INVALID)
 		res = set_card_volume_mute_delay(card, dev_info.active_port,
 				dev_info.device, &volume, NULL, NULL);
@@ -2855,11 +2967,10 @@ done:
 
 static int do_set_mute(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
-	struct impl *impl = client->impl;
 	struct pw_manager *manager = client->manager;
 	struct pw_node_info *info;
-	uint32_t index, card_id = SPA_ID_INVALID;
-	const char *name, *str;
+	uint32_t index;
+	const char *name;
 	bool mute;
 	struct pw_manager_object *o, *card = NULL;
 	int res;
@@ -2890,21 +3001,16 @@ static int do_set_mute(struct client *client, uint32_t command, uint32_t tag, st
 	if (o == NULL || (info = o->info) == NULL || info->props == NULL)
 		return -ENOENT;
 
-	dev_info = DEVICE_INFO_INIT(direction);
-
-	if ((str = spa_dict_lookup(info->props, PW_KEY_DEVICE_ID)) != NULL)
-		card_id = (uint32_t)atoi(str);
-	if ((str = spa_dict_lookup(info->props, "card.profile.device")) != NULL)
-		dev_info.device = (uint32_t)atoi(str);
-	if (card_id != SPA_ID_INVALID) {
-		struct selector sel = { .id = card_id, .type = pw_manager_object_is_card, };
-		card = select_object(manager, &sel);
-	}
-	collect_device_info(o, card, &dev_info, is_monitor, &impl->defs);
+	get_device_info(o, &dev_info, direction, is_monitor);
 
 	if (dev_info.have_volume &&
 	    dev_info.volume_info.mute == mute)
 		goto done;
+
+	if (dev_info.card_id != SPA_ID_INVALID) {
+		struct selector sel = { .id = dev_info.card_id, .type = pw_manager_object_is_card, };
+		card = select_object(manager, &sel);
+	}
 
 	if (card != NULL && !is_monitor && dev_info.active_port != SPA_ID_INVALID)
 		res = set_card_volume_mute_delay(card, dev_info.active_port,
@@ -3077,11 +3183,8 @@ static int do_set_stream_name(struct client *client, uint32_t command, uint32_t 
 static int do_update_proplist(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
 	uint32_t channel, mode;
-	struct stream *stream;
-	struct pw_properties *props;
-	int res;
 
-	props = pw_properties_new(NULL, NULL);
+	spa_autoptr(pw_properties) props = pw_properties_new(NULL, NULL);
 	if (props == NULL)
 		return -errno;
 
@@ -3089,7 +3192,7 @@ static int do_update_proplist(struct client *client, uint32_t command, uint32_t 
 		if (message_get(m,
 				TAG_U32, &channel,
 				TAG_INVALID) < 0)
-			goto error_protocol;
+			return -EPROTO;
 	} else {
 		channel = SPA_ID_INVALID;
 	}
@@ -3101,43 +3204,32 @@ static int do_update_proplist(struct client *client, uint32_t command, uint32_t 
 			TAG_U32, &mode,
 			TAG_PROPLIST, props,
 			TAG_INVALID) < 0)
-		goto error_protocol;
+		return -EPROTO;
 
 	if (command != COMMAND_UPDATE_CLIENT_PROPLIST) {
-		stream = pw_map_lookup(&client->streams, channel);
+		struct stream *stream = pw_map_lookup(&client->streams, channel);
 		if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
-			goto error_noentity;
+			return -ENOENT;
 
 		pw_stream_update_properties(stream->stream, &props->dict);
 	} else {
 		if (pw_properties_update(client->props, &props->dict) > 0) {
 			client_update_quirks(client);
+			client->name = pw_properties_get(client->props, PW_KEY_APP_NAME);
 			pw_core_update_properties(client->core, &client->props->dict);
 		}
 	}
-	res = reply_simple_ack(client, tag);
-exit:
-	pw_properties_free(props);
-	return res;
 
-error_protocol:
-	res = -EPROTO;
-	goto exit;
-error_noentity:
-	res = -ENOENT;
-	goto exit;
+	return reply_simple_ack(client, tag);
 }
 
 static int do_remove_proplist(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
 	uint32_t i, channel;
-	struct stream *stream;
-	struct pw_properties *props;
 	struct spa_dict dict;
 	struct spa_dict_item *items;
-	int res;
 
-	props = pw_properties_new(NULL, NULL);
+	spa_autoptr(pw_properties) props = pw_properties_new(NULL, NULL);
 	if (props == NULL)
 		return -errno;
 
@@ -3145,7 +3237,7 @@ static int do_remove_proplist(struct client *client, uint32_t command, uint32_t 
 		if (message_get(m,
 				TAG_U32, &channel,
 				TAG_INVALID) < 0)
-			goto error_protocol;
+			return -EPROTO;
 	} else {
 		channel = SPA_ID_INVALID;
 	}
@@ -3159,7 +3251,7 @@ static int do_remove_proplist(struct client *client, uint32_t command, uint32_t 
 		if (message_get(m,
 				TAG_STRING, &key,
 				TAG_INVALID) < 0)
-			goto error_protocol;
+			return -EPROTO;
 		if (key == NULL)
 			break;
 		pw_properties_set(props, key, key);
@@ -3172,26 +3264,17 @@ static int do_remove_proplist(struct client *client, uint32_t command, uint32_t 
 		items[i].value = NULL;
 	}
 
-	if (command != COMMAND_UPDATE_CLIENT_PROPLIST) {
-		stream = pw_map_lookup(&client->streams, channel);
+	if (command != COMMAND_REMOVE_CLIENT_PROPLIST) {
+		struct stream *stream = pw_map_lookup(&client->streams, channel);
 		if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
-			goto error_noentity;
+			return -ENOENT;
 
 		pw_stream_update_properties(stream->stream, &dict);
 	} else {
 		pw_core_update_properties(client->core, &dict);
 	}
-	res = reply_simple_ack(client, tag);
-exit:
-	pw_properties_free(props);
-	return res;
 
-error_protocol:
-	res = -EPROTO;
-	goto exit;
-error_noentity:
-	res = -ENOENT;
-	goto exit;
+	return reply_simple_ack(client, tag);
 }
 
 
@@ -3289,7 +3372,7 @@ static int do_drain_stream(struct client *client, uint32_t command, uint32_t tag
 
 	stream->drain_tag = tag;
 	stream->draining = true;
-	pw_stream_set_active(stream->stream, true);
+	stream_set_paused(stream, false, "drain start");
 
 	return 0;
 }
@@ -3355,7 +3438,7 @@ static int fill_ext_module_info(struct client *client, struct message *m,
 {
 	message_put(m,
 		TAG_U32, module->index,			/* module index */
-		TAG_STRING, module->name,
+		TAG_STRING, module->info->name,
 		TAG_STRING, module->args,
 		TAG_U32, -1,				/* n_used */
 		TAG_INVALID);
@@ -3367,7 +3450,7 @@ static int fill_ext_module_info(struct client *client, struct message *m,
 	}
 	if (client->version >= 15) {
 		message_put(m,
-			TAG_PROPLIST, module->props,
+			TAG_PROPLIST, module->info->properties,
 			TAG_INVALID);
 	}
 	return 0;
@@ -3421,10 +3504,11 @@ static int fill_card_info(struct client *client, struct message *m,
 {
 	struct pw_manager *manager = client->manager;
 	struct pw_device_info *info = o->info;
-	const char *str, *drv_name;
+	const char *str, *drv_name, *card_name;
 	uint32_t module_id = SPA_ID_INVALID, n_profiles, n;
 	struct card_info card_info = CARD_INFO_INIT;
 	struct profile_info *profile_info;
+	char name[128];
 
 	if (!pw_manager_object_is_card(o) || info == NULL || info->props == NULL)
 		return -ENOENT;
@@ -3436,9 +3520,17 @@ static int fill_card_info(struct client *client, struct message *m,
 	if (drv_name && spa_streq("bluez5", drv_name))
 		drv_name = "module-bluez5-device.c"; /* blueman needs this */
 
+	card_name = spa_dict_lookup(info->props, PW_KEY_DEVICE_NAME);
+	if (card_name == NULL)
+		card_name = spa_dict_lookup(info->props, "api.alsa.card.name");
+	if (card_name == NULL) {
+		snprintf(name, sizeof(name), "card_%u", o->index);
+		card_name = name;
+	}
+
 	message_put(m,
 		TAG_U32, o->index,			/* card index */
-		TAG_STRING, spa_dict_lookup(info->props, PW_KEY_DEVICE_NAME),
+		TAG_STRING, card_name,
 		TAG_U32, id_to_index(manager, module_id),
 		TAG_STRING, drv_name,
 		TAG_INVALID);
@@ -3551,20 +3643,45 @@ static int fill_card_info(struct client *client, struct message *m,
 	return 0;
 }
 
+static int fill_sink_info_proplist(struct message *m, const struct spa_dict *sink_props,
+		const struct pw_manager_object *card)
+{
+	struct pw_device_info *card_info = card ? card->info : NULL;
+	spa_autoptr(pw_properties) props = NULL;
+
+	if (card_info && card_info->props) {
+		props = pw_properties_new_dict(sink_props);
+		if (props == NULL)
+			return -ENOMEM;
+
+		pw_properties_add(props, card_info->props);
+		sink_props = &props->dict;
+	}
+
+	message_put(m, TAG_PROPLIST, sink_props, TAG_INVALID);
+
+	return 0;
+}
+
+static bool validate_device_info(struct device_info *dev_info)
+{
+	return sample_spec_valid(&dev_info->ss) &&
+		channel_map_valid(&dev_info->map) &&
+		volume_valid(&dev_info->volume_info.volume);
+}
+
 static int fill_sink_info(struct client *client, struct message *m,
 		struct pw_manager_object *o)
 {
-	struct impl *impl = client->impl;
 	struct pw_node_info *info = o->info;
 	struct pw_manager *manager = client->manager;
 	const char *name, *desc, *str;
 	char *monitor_name = NULL;
 	uint32_t module_id = SPA_ID_INVALID;
-	uint32_t card_id = SPA_ID_INVALID;
 	struct pw_manager_object *card = NULL;
 	uint32_t flags;
 	struct card_info card_info = CARD_INFO_INIT;
-	struct device_info dev_info = DEVICE_INFO_INIT(PW_DIRECTION_OUTPUT);
+	struct device_info dev_info;
 	size_t size;
 
 	if (!pw_manager_object_is_sink(o) || info == NULL || info->props == NULL)
@@ -3588,22 +3705,9 @@ static int fill_sink_info(struct client *client, struct message *m,
 	if (module_id == SPA_ID_INVALID &&
 	    (str = spa_dict_lookup(info->props, "pulse.module.id")) != NULL)
 		module_id = (uint32_t)atoi(str);
-	if ((str = spa_dict_lookup(info->props, PW_KEY_DEVICE_ID)) != NULL)
-		card_id = (uint32_t)atoi(str);
-	if ((str = spa_dict_lookup(info->props, "card.profile.device")) != NULL)
-		dev_info.device = (uint32_t)atoi(str);
-	if (card_id != SPA_ID_INVALID) {
-		struct selector sel = { .id = card_id, .type = pw_manager_object_is_card, };
-		card = select_object(manager, &sel);
-	}
-	if (card)
-		collect_card_info(card, &card_info);
 
-	collect_device_info(o, card, &dev_info, false, &impl->defs);
-
-	if (!sample_spec_valid(&dev_info.ss) ||
-	    !channel_map_valid(&dev_info.map) ||
-	    !volume_valid(&dev_info.volume_info.volume)) {
+	get_device_info(o, &dev_info, PW_DIRECTION_OUTPUT, false);
+	if (!validate_device_info(&dev_info)) {
 		pw_log_warn("%d: sink not ready: sample:%d map:%d volume:%d",
 				o->id, sample_spec_valid(&dev_info.ss),
 				channel_map_valid(&dev_info.map),
@@ -3611,10 +3715,18 @@ static int fill_sink_info(struct client *client, struct message *m,
 		return -ENOENT;
 	}
 
+
+	if (dev_info.card_id != SPA_ID_INVALID) {
+		struct selector sel = { .id = dev_info.card_id, .type = pw_manager_object_is_card, };
+		card = select_object(manager, &sel);
+	}
+	if (card)
+		collect_card_info(card, &card_info);
+
 	flags = SINK_LATENCY | SINK_DYNAMIC_LATENCY | SINK_DECIBEL_VOLUME;
-	if ((str = spa_dict_lookup(info->props, PW_KEY_DEVICE_API)) != NULL)
+	if (!pw_manager_object_is_virtual(o))
 		flags |= SINK_HARDWARE;
-	if ((str = spa_dict_lookup(info->props, PW_KEY_NODE_NETWORK)) != NULL)
+	if (pw_manager_object_is_network(o))
 		flags |= SINK_NETWORK;
 	if (SPA_FLAG_IS_SET(dev_info.volume_info.flags, VOLUME_HW_VOLUME))
 		flags |= SINK_HW_VOLUME_CTRL;
@@ -3643,8 +3755,10 @@ static int fill_sink_info(struct client *client, struct message *m,
 		TAG_INVALID);
 
 	if (client->version >= 13) {
+		int res;
+		if ((res = fill_sink_info_proplist(m, info->props, card)) < 0)
+			return res;
 		message_put(m,
-			TAG_PROPLIST, info->props,
 			TAG_USEC, 0LL,			/* requested latency */
 			TAG_INVALID);
 	}
@@ -3733,23 +3847,27 @@ static int fill_sink_info(struct client *client, struct message *m,
 	return 0;
 }
 
-static int fill_source_info_proplist(struct message *m, struct pw_manager_object *o,
-		struct pw_node_info *info)
+static int fill_source_info_proplist(struct message *m, const struct spa_dict *source_props,
+		const struct pw_manager_object *card, const bool is_monitor)
 {
-	struct pw_properties *props = NULL;
-	struct spa_dict *props_dict = info->props;
+	struct pw_device_info *card_info = card ? card->info : NULL;
+	spa_autoptr(pw_properties) props = NULL;
 
-	if (pw_manager_object_is_monitor(o)) {
-		props = pw_properties_new_dict(info->props);
+	if ((card_info && card_info->props) || is_monitor) {
+		props = pw_properties_new_dict(source_props);
 		if (props == NULL)
 			return -ENOMEM;
 
-		pw_properties_set(props, PW_KEY_DEVICE_CLASS, "monitor");
-		props_dict = &props->dict;
+		if (card_info && card_info->props)
+			pw_properties_add(props, card_info->props);
+
+		if (is_monitor)
+			pw_properties_set(props, PW_KEY_DEVICE_CLASS, "monitor");
+
+		source_props = &props->dict;
 	}
 
-	message_put(m, TAG_PROPLIST, props_dict, TAG_INVALID);
-	pw_properties_free(props);
+	message_put(m, TAG_PROPLIST, source_props, TAG_INVALID);
 
 	return 0;
 }
@@ -3757,7 +3875,6 @@ static int fill_source_info_proplist(struct message *m, struct pw_manager_object
 static int fill_source_info(struct client *client, struct message *m,
 		struct pw_manager_object *o)
 {
-	struct impl *impl = client->impl;
 	struct pw_node_info *info = o->info;
 	struct pw_manager *manager = client->manager;
 	bool is_monitor;
@@ -3765,11 +3882,10 @@ static int fill_source_info(struct client *client, struct message *m,
 	char *monitor_name = NULL;
 	char *monitor_desc = NULL;
 	uint32_t module_id = SPA_ID_INVALID;
-	uint32_t card_id = SPA_ID_INVALID;
 	struct pw_manager_object *card = NULL;
 	uint32_t flags;
 	struct card_info card_info = CARD_INFO_INIT;
-	struct device_info dev_info = DEVICE_INFO_INIT(PW_DIRECTION_INPUT);
+	struct device_info dev_info;
 	size_t size;
 
 	is_monitor = pw_manager_object_is_monitor(o);
@@ -3795,23 +3911,9 @@ static int fill_source_info(struct client *client, struct message *m,
 	if (module_id == SPA_ID_INVALID &&
 	    (str = spa_dict_lookup(info->props, "pulse.module.id")) != NULL)
 		module_id = (uint32_t)atoi(str);
-	if ((str = spa_dict_lookup(info->props, PW_KEY_DEVICE_ID)) != NULL)
-		card_id = (uint32_t)atoi(str);
-	if ((str = spa_dict_lookup(info->props, "card.profile.device")) != NULL)
-		dev_info.device = (uint32_t)atoi(str);
 
-	if (card_id != SPA_ID_INVALID) {
-		struct selector sel = { .id = card_id, .type = pw_manager_object_is_card, };
-		card = select_object(manager, &sel);
-	}
-	if (card)
-		collect_card_info(card, &card_info);
-
-	collect_device_info(o, card, &dev_info, is_monitor, &impl->defs);
-
-	if (!sample_spec_valid(&dev_info.ss) ||
-	    !channel_map_valid(&dev_info.map) ||
-	    !volume_valid(&dev_info.volume_info.volume)) {
+	get_device_info(o, &dev_info, PW_DIRECTION_INPUT, is_monitor);
+	if (!validate_device_info(&dev_info)) {
 		pw_log_warn("%d: source not ready: sample:%d map:%d volume:%d",
 				o->id, sample_spec_valid(&dev_info.ss),
 				channel_map_valid(&dev_info.map),
@@ -3820,9 +3922,17 @@ static int fill_source_info(struct client *client, struct message *m,
 	}
 
 	flags = SOURCE_LATENCY | SOURCE_DYNAMIC_LATENCY | SOURCE_DECIBEL_VOLUME;
-	if ((str = spa_dict_lookup(info->props, PW_KEY_DEVICE_API)) != NULL)
+
+	if (dev_info.card_id != SPA_ID_INVALID) {
+		struct selector sel = { .id = dev_info.card_id, .type = pw_manager_object_is_card, };
+		card = select_object(manager, &sel);
+	}
+	if (card)
+		collect_card_info(card, &card_info);
+
+	if (!pw_manager_object_is_virtual(o))
 		flags |= SOURCE_HARDWARE;
-	if ((str = spa_dict_lookup(info->props, PW_KEY_NODE_NETWORK)) != NULL)
+	if (pw_manager_object_is_network(o))
 		flags |= SOURCE_NETWORK;
 	if (SPA_FLAG_IS_SET(dev_info.volume_info.flags, VOLUME_HW_VOLUME))
 		flags |= SOURCE_HW_VOLUME_CTRL;
@@ -3850,7 +3960,7 @@ static int fill_source_info(struct client *client, struct message *m,
 
 	if (client->version >= 13) {
 		int res;
-		if ((res = fill_source_info_proplist(m, o, info)) < 0)
+		if ((res = fill_source_info_proplist(m, info->props, card, is_monitor)) < 0)
 			return res;
 		message_put(m,
 			TAG_USEC, 0LL,			/* requested latency */
@@ -3929,14 +4039,12 @@ static const char *get_media_name(struct pw_node_info *info)
 static int fill_sink_input_info(struct client *client, struct message *m,
 		struct pw_manager_object *o)
 {
-	struct impl *impl = client->impl;
 	struct pw_node_info *info = o->info;
 	struct pw_manager *manager = client->manager;
-	struct pw_manager_object *peer;
 	const char *str;
 	uint32_t module_id = SPA_ID_INVALID, client_id = SPA_ID_INVALID;
 	uint32_t peer_index;
-	struct device_info dev_info = DEVICE_INFO_INIT(PW_DIRECTION_OUTPUT);
+	struct device_info dev_info;
 
 	if (!pw_manager_object_is_sink_input(o) || info == NULL || info->props == NULL)
 		return -ENOENT;
@@ -3951,18 +4059,19 @@ static int fill_sink_input_info(struct client *client, struct message *m,
 	    (str = spa_dict_lookup(info->props, PW_KEY_CLIENT_ID)) != NULL)
 		client_id = (uint32_t)atoi(str);
 
-	collect_device_info(o, NULL, &dev_info, false, &impl->defs);
-
-	if (!sample_spec_valid(&dev_info.ss) ||
-	    !channel_map_valid(&dev_info.map) ||
-	    !volume_valid(&dev_info.volume_info.volume))
+	get_device_info(o, &dev_info, PW_DIRECTION_OUTPUT, false);
+	if (!validate_device_info(&dev_info))
 		return -ENOENT;
 
-	peer = find_linked(manager, o->id, PW_DIRECTION_OUTPUT);
-	if (peer && pw_manager_object_is_sink(peer))
-		peer_index = peer->index;
-	else
-		peer_index = SPA_ID_INVALID;
+	peer_index = get_temporary_move_target(client, o);
+	if (peer_index == SPA_ID_INVALID) {
+		struct pw_manager_object *peer;
+		peer = find_linked(manager, o->id, PW_DIRECTION_OUTPUT);
+		if (peer && pw_manager_object_is_sink(peer))
+			peer_index = peer->index;
+		else
+			peer_index = SPA_ID_INVALID;
+	}
 
 	message_put(m,
 		TAG_U32, o->index,				/* sink_input index */
@@ -4009,14 +4118,12 @@ static int fill_sink_input_info(struct client *client, struct message *m,
 static int fill_source_output_info(struct client *client, struct message *m,
 		struct pw_manager_object *o)
 {
-	struct impl *impl = client->impl;
 	struct pw_node_info *info = o->info;
 	struct pw_manager *manager = client->manager;
-	struct pw_manager_object *peer;
 	const char *str;
 	uint32_t module_id = SPA_ID_INVALID, client_id = SPA_ID_INVALID;
 	uint32_t peer_index;
-	struct device_info dev_info = DEVICE_INFO_INIT(PW_DIRECTION_INPUT);
+	struct device_info dev_info;
 
 	if (!pw_manager_object_is_source_output(o) || info == NULL || info->props == NULL)
 		return -ENOENT;
@@ -4031,18 +4138,19 @@ static int fill_source_output_info(struct client *client, struct message *m,
 	    (str = spa_dict_lookup(info->props, PW_KEY_CLIENT_ID)) != NULL)
 		client_id = (uint32_t)atoi(str);
 
-	collect_device_info(o, NULL, &dev_info, false, &impl->defs);
-
-	if (!sample_spec_valid(&dev_info.ss) ||
-	    !channel_map_valid(&dev_info.map) ||
-	    !volume_valid(&dev_info.volume_info.volume))
+	get_device_info(o, &dev_info, PW_DIRECTION_INPUT, false);
+	if (!validate_device_info(&dev_info))
 		return -ENOENT;
 
-	peer = find_linked(manager, o->id, PW_DIRECTION_INPUT);
-	if (peer && pw_manager_object_is_source_or_monitor(peer))
-		peer_index = peer->index;
-	else
-		peer_index = SPA_ID_INVALID;
+	peer_index = get_temporary_move_target(client, o);
+	if (peer_index == SPA_ID_INVALID) {
+		struct pw_manager_object *peer;
+		peer = find_linked(manager, o->id, PW_DIRECTION_INPUT);
+		if (peer && pw_manager_object_is_source_or_monitor(peer))
+			peer_index = peer->index;
+		else
+			peer_index = SPA_ID_INVALID;
+	}
 
 	message_put(m,
 		TAG_U32, o->index,				/* source_output index */
@@ -4183,7 +4291,7 @@ error_invalid:
 	goto error;
 error:
 	if (reply)
-		message_free(impl, reply, false, false);
+		message_free(reply, false, false);
 	return res;
 }
 
@@ -4259,7 +4367,7 @@ static int do_get_sample_info(struct client *client, uint32_t command, uint32_t 
 
 error:
 	if (reply)
-		message_free(impl, reply, false, false);
+		message_free(reply, false, false);
 	return res;
 }
 
@@ -4358,7 +4466,6 @@ static int do_set_stream_buffer_attr(struct client *client, uint32_t command, ui
 	struct message *reply;
 	struct buffer_attr attr;
 	bool adjust_latency = false, early_requests = false;
-	uint64_t lat_usec;
 
 	if (message_get(m,
 			TAG_U32, &channel,
@@ -4412,7 +4519,7 @@ static int do_set_stream_buffer_attr(struct client *client, uint32_t command, ui
 	stream->early_requests = early_requests;
 
 	if (command == COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR) {
-		lat_usec = set_playback_buffer_attr(stream, &attr);
+		stream->lat_usec = set_playback_buffer_attr(stream, &attr);
 
 		message_put(reply,
 			TAG_U32, stream->attr.maxlength,
@@ -4422,11 +4529,11 @@ static int do_set_stream_buffer_attr(struct client *client, uint32_t command, ui
 			TAG_INVALID);
 		if (client->version >= 13) {
 			message_put(reply,
-				TAG_USEC, lat_usec,		/* configured_sink_latency */
+				TAG_USEC, stream->lat_usec,		/* configured_sink_latency */
 				TAG_INVALID);
 		}
 	} else {
-		lat_usec = set_record_buffer_attr(stream, &attr);
+		stream->lat_usec = set_record_buffer_attr(stream, &attr);
 
 		message_put(reply,
 			TAG_U32, stream->attr.maxlength,
@@ -4434,7 +4541,7 @@ static int do_set_stream_buffer_attr(struct client *client, uint32_t command, ui
 			TAG_INVALID);
 		if (client->version >= 13) {
 			message_put(reply,
-				TAG_USEC, lat_usec,		/* configured_source_latency */
+				TAG_USEC, stream->lat_usec,		/* configured_source_latency */
 				TAG_INVALID);
 		}
 	}
@@ -4445,7 +4552,7 @@ static int do_update_stream_sample_rate(struct client *client, uint32_t command,
 {
 	uint32_t channel, rate;
 	struct stream *stream;
-	bool match;
+	float corr;
 
 	if (message_get(m,
 			TAG_U32, &channel,
@@ -4460,15 +4567,10 @@ static int do_update_stream_sample_rate(struct client *client, uint32_t command,
 	if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
 		return -ENOENT;
 
-	if (stream->rate_match == NULL)
-		return -ENOTSUP;
-
-	match = rate != stream->ss.rate;
 	stream->rate = rate;
-	stream->rate_match->rate = match ?
-			(double)rate/(double)stream->ss.rate : 1.0;
-	SPA_FLAG_UPDATE(stream->rate_match->flags,
-			SPA_IO_RATE_MATCH_FLAG_ACTIVE, match);
+
+	corr = (double)rate/(double)stream->ss.rate;
+	pw_stream_set_control(stream->stream, SPA_PROP_rate, 1, &corr, NULL);
 
 	return reply_simple_ack(client, tag);
 }
@@ -4589,6 +4691,20 @@ static int do_set_default(struct client *client, uint32_t command, uint32_t tag,
 	if (res < 0)
 		return res;
 
+	/*
+	 * The metadata is not necessarily updated within one server sync.
+	 * Correct functioning of MOVE_* commands requires knowing the current
+	 * default target, so we need to stash temporary values here in case
+	 * the client emits them before metadata gets updated.
+	 */
+	if (sink) {
+		free(client->temporary_default_sink);
+		client->temporary_default_sink = name ? strdup(name) : NULL;
+	} else {
+		free(client->temporary_default_source);
+		client->temporary_default_source = name ? strdup(name) : NULL;
+	}
+
 	return operation_new(client, tag);
 }
 
@@ -4630,6 +4746,7 @@ static int do_move_stream(struct client *client, uint32_t command, uint32_t tag,
 	int target_id;
 	int64_t target_serial;
 	const char *name_device;
+	const char *name;
 	struct pw_node_info *info;
 	struct selector sel;
 	int res;
@@ -4666,7 +4783,13 @@ static int do_move_stream(struct client *client, uint32_t command, uint32_t tag,
 	if ((dev = find_device(client, index_device, name_device, sink, NULL)) == NULL)
 		return -ENOENT;
 
-	dev_default = find_device(client, SPA_ID_INVALID, NULL, sink, NULL);
+	/*
+	 * The client metadata is not necessarily yet updated after SET_DEFAULT command,
+	 * so use the temporary values if they are still set.
+	 */
+	name = sink ? client->temporary_default_sink : client->temporary_default_source;
+	dev_default = find_device(client, SPA_ID_INVALID, name, sink, NULL);
+
 	if (dev == dev_default) {
 		/*
 		 * When moving streams to a node that is equal to the default,
@@ -4691,6 +4814,15 @@ static int do_move_stream(struct client *client, uint32_t command, uint32_t tag,
 			METADATA_TARGET_OBJECT,
 			SPA_TYPE_INFO_BASE"Id", "%"PRIi64, target_serial)) < 0)
 		return res;
+
+	name = spa_dict_lookup(info->props, PW_KEY_NODE_NAME);
+	pw_log_debug("[%s] %s done tag:%u index:%u name:%s target:%d target-serial:%"PRIi64, client->name,
+			commands[command].name, tag, index, name ? name : "<null>",
+			target_id, target_serial);
+
+	/* We will temporarily claim the stream was already moved */
+	set_temporary_move_target(client, o, dev->index);
+	send_object_event(client, o, SUBSCRIPTION_EVENT_CHANGE);
 
 	return reply_simple_ack(client, tag);
 }
@@ -4743,7 +4875,7 @@ static void handle_module_loaded(struct module *module, struct client *client, u
 
 	if (SPA_RESULT_IS_OK(result)) {
 		pw_log_info("[%s] loaded module index:%u name:%s tag:%d",
-				client_name, module->index, module->name, tag);
+				client_name, module->index, module->info->name, tag);
 
 		module->loaded = true;
 
@@ -4764,7 +4896,7 @@ static void handle_module_loaded(struct module *module, struct client *client, u
 	else {
 		pw_log_warn("%p: [%s] failed to load module index:%u name:%s tag:%d result:%d (%s)",
 				impl, client_name,
-				module->index, module->name, tag,
+				module->index, module->info->name, tag,
 				result, spa_strerror(result));
 
 		module_schedule_unload(module);
@@ -4886,6 +5018,7 @@ static int do_load_module(struct client *client, uint32_t command, uint32_t tag,
 		.sync = on_load_module_manager_sync,
 	};
 
+	struct impl *impl = client->impl;
 	const char *name, *argument;
 	struct module *module;
 	struct pending_module *pm;
@@ -4900,7 +5033,7 @@ static int do_load_module(struct client *client, uint32_t command, uint32_t tag,
 	pw_log_info("[%s] %s name:%s argument:%s",
 			client->name, commands[command].name, name, argument);
 
-	module = module_create(client, name, argument);
+	module = module_create(impl, name, argument);
 	if (module == NULL)
 		return -errno;
 
@@ -4914,7 +5047,7 @@ static int do_load_module(struct client *client, uint32_t command, uint32_t tag,
 
 	pw_log_debug("pending module %p: start tag:%d", pm, tag);
 
-	r = module_load(client, module);
+	r = module_load(module);
 
 	module_add_listener(module, &pm->module_listener, &module_events, pm);
 	client_add_listener(client, &pm->client_listener, &client_events, pm);
@@ -4965,12 +5098,9 @@ static int do_send_object_message(struct client *client, uint32_t command, uint3
 	const char *object_path = NULL;
 	const char *message = NULL;
 	const char *params = NULL;
-	char *response = NULL;
-	char *path = NULL;
 	struct message *reply;
 	struct pw_manager_object *o;
 	int len = 0;
-	int res;
 
 	if (message_get(m,
 			TAG_STRING, &object_path,
@@ -4989,11 +5119,13 @@ static int do_send_object_message(struct client *client, uint32_t command, uint3
 	len = strlen(object_path);
 	if (len > 0 && object_path[len - 1] == '/')
 		--len;
-	path = strndup(object_path, len);
+
+	spa_autofree char *path = strndup(object_path, len);
 	if (path == NULL)
 		return -ENOMEM;
 
-	res = -ENOENT;
+	spa_autofree char *response = NULL;
+	int res = -ENOENT;
 
 	spa_list_for_each(o, &manager->object_list, link) {
 		if (o->message_object_path && spa_streq(o->message_object_path, path)) {
@@ -5005,7 +5137,6 @@ static int do_send_object_message(struct client *client, uint32_t command, uint3
 		}
 	}
 
-	free(path);
 	if (res < 0)
 		return res;
 
@@ -5013,7 +5144,7 @@ static int do_send_object_message(struct client *client, uint32_t command, uint3
 
 	reply = reply_new(client, tag);
 	message_put(reply, TAG_STRING, response, TAG_INVALID);
-	free(response);
+
 	return client_queue_message(client, reply);
 }
 
@@ -5215,6 +5346,9 @@ static void impl_clear(struct impl *impl)
 	struct server *s;
 	struct client *c;
 
+	pw_map_for_each(&impl->modules, impl_unload_module, impl);
+	pw_map_clear(&impl->modules);
+
 	spa_list_consume(s, &impl->servers, link)
 		server_free(s);
 
@@ -5222,13 +5356,12 @@ static void impl_clear(struct impl *impl)
 		client_free(c);
 
 	spa_list_consume(msg, &impl->free_messages, link)
-		message_free(impl, msg, true, true);
+		message_free(msg, true, true);
 
 	pw_map_for_each(&impl->samples, impl_free_sample, impl);
 	pw_map_clear(&impl->samples);
 
-	pw_map_for_each(&impl->modules, impl_unload_module, impl);
-	pw_map_clear(&impl->modules);
+	spa_hook_list_clean(&impl->hooks);
 
 #ifdef HAVE_DBUS
 	if (impl->dbus_name) {
@@ -5269,8 +5402,10 @@ static int parse_frac(struct pw_properties *props, const char *key, const char *
 	if (props == NULL ||
 	    (str = pw_properties_get(props, key)) == NULL)
 		str = def;
-	if (sscanf(str, "%u/%u", &res->num, &res->denom) != 2 || res->denom == 0)
-		return -EINVAL;
+	if (sscanf(str, "%u/%u", &res->num, &res->denom) != 2 || res->denom == 0) {
+		pw_log_warn(": invalid fraction %s, default to %s", str, def);
+		sscanf(def, "%u/%u", &res->num, &res->denom);
+	}
 	pw_log_info(": defaults: %s = %u/%u", key, res->num, res->denom);
 	return 0;
 }
@@ -5279,22 +5414,13 @@ static int parse_position(struct pw_properties *props, const char *key, const ch
 		struct channel_map *res)
 {
 	const char *str;
-	struct spa_json it[2];
-	char v[256];
 
 	if (props == NULL ||
 	    (str = pw_properties_get(props, key)) == NULL)
 		str = def;
 
-	spa_json_init(&it[0], str, strlen(str));
-	if (spa_json_enter_array(&it[0], &it[1]) <= 0)
-		spa_json_init(&it[1], str, strlen(str));
+	channel_map_parse_position(str, res);
 
-	res->channels = 0;
-	while (spa_json_get_string(&it[1], v, sizeof(v)) > 0 &&
-	    res->channels < SPA_AUDIO_MAX_CHANNELS) {
-		res->map[res->channels++] = channel_name2id(v);
-	}
 	pw_log_info(": defaults: %s = %s", key, str);
 	return 0;
 }
@@ -5310,7 +5436,21 @@ static int parse_format(struct pw_properties *props, const char *key, const char
 		pw_log_warn(": unknown format %s, default to %s", str, def);
 		res->format = format_name2id(def);
 	}
-	pw_log_info(": defaults: %s = %s", key, str);
+	pw_log_info(": defaults: %s = %s", key, format_id2name(res->format));
+	return 0;
+}
+static int parse_uint32(struct pw_properties *props, const char *key, const char *def,
+		uint32_t *res)
+{
+	const char *str;
+	if (props == NULL ||
+	    (str = pw_properties_get(props, key)) == NULL)
+		str = def;
+	if (!spa_atou32(str, res, 0)) {
+		pw_log_warn(": invalid uint32_t %s, default to %s", str, def);
+		spa_atou32(def, res, 0);
+	}
+	pw_log_info(": defaults: %s = %u", key, *res);
 	return 0;
 }
 
@@ -5324,6 +5464,7 @@ static void load_defaults(struct defs *def, struct pw_properties *props)
 	parse_frac(props, "pulse.min.quantum", DEFAULT_MIN_QUANTUM, &def->min_quantum);
 	parse_format(props, "pulse.default.format", DEFAULT_FORMAT, &def->sample_spec);
 	parse_position(props, "pulse.default.position", DEFAULT_POSITION, &def->channel_map);
+	parse_uint32(props, "pulse.idle.timeout", DEFAULT_IDLE_TIMEOUT, &def->idle_timeout);
 	def->sample_spec.channels = def->channel_map.channels;
 	def->quantum_limit = 8192;
 }
@@ -5350,6 +5491,8 @@ struct pw_protocol_pulse *pw_protocol_pulse_new(struct pw_context *context,
 	support = pw_context_get_support(context, &n_support);
 	cpu = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_CPU);
 
+	pw_context_conf_update_props(context, "pulse.properties", props);
+
 	if ((str = pw_properties_get(props, "vm.overrides")) != NULL) {
 		if (cpu != NULL && spa_cpu_get_vm_type(cpu) != SPA_CPU_VM_NONE)
 			pw_properties_update_string(props, str, strlen(str));
@@ -5358,7 +5501,7 @@ struct pw_protocol_pulse *pw_protocol_pulse_new(struct pw_context *context,
 
 	load_defaults(&impl->defs, props);
 
-	debug_messages = pw_debug_is_category_enabled("connection");
+	debug_messages = pw_log_topic_enabled(SPA_LOG_LEVEL_INFO, pulse_conn);
 
 	impl->context = context;
 	impl->loop = pw_context_get_main_loop(context);
@@ -5366,6 +5509,7 @@ struct pw_protocol_pulse *pw_protocol_pulse_new(struct pw_context *context,
 
 	impl->work_queue = pw_context_get_work_queue(context);
 
+	spa_hook_list_init(&impl->hooks);
 	spa_list_init(&impl->servers);
 	impl->rate_limit.interval = 2 * SPA_NSEC_PER_SEC;
 	impl->rate_limit.burst = 1;
@@ -5400,8 +5544,13 @@ struct pw_protocol_pulse *pw_protocol_pulse_new(struct pw_context *context,
 			&context_events, impl);
 
 #ifdef HAVE_DBUS
-	impl->dbus_name = dbus_request_name(context, "org.pulseaudio.Server");
+	str = pw_properties_get(props, "server.dbus-name");
+	if (str == NULL)
+		str = "org.pulseaudio.Server";
+	if (strlen(str) > 0)
+		impl->dbus_name = dbus_request_name(context, str);
 #endif
+	cmd_run(impl);
 
 	return (struct pw_protocol_pulse *) impl;
 
@@ -5415,6 +5564,13 @@ error_exit:
 		errno = -res;
 
 	return NULL;
+}
+
+void impl_add_listener(struct impl *impl,
+		struct spa_hook *listener,
+		const struct impl_events *events, void *data)
+{
+	spa_hook_list_append(&impl->hooks, listener, events, data);
 }
 
 void *pw_protocol_pulse_get_user_data(struct pw_protocol_pulse *pulse)

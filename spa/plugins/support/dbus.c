@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2018 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <string.h>
 #include <stdio.h>
@@ -93,6 +73,7 @@ static void dispatch_cb(void *userdata)
 	struct connection *conn = userdata;
 	struct impl *impl = conn->impl;
 
+	spa_log_debug(impl->log, "impl:%p", impl);
 	if (dbus_connection_dispatch(conn->conn) == DBUS_DISPATCH_COMPLETE)
 		spa_loop_utils_enable_idle(impl->utils, conn->dispatch_event, false);
 }
@@ -102,6 +83,7 @@ static void dispatch_status(DBusConnection *conn, DBusDispatchStatus status, voi
 	struct connection *c = userdata;
 	struct impl *impl = c->impl;
 
+	spa_log_debug(impl->log, "impl:%p %d", impl, status);
 	spa_loop_utils_enable_idle(impl->utils, c->dispatch_event,
 			status == DBUS_DISPATCH_COMPLETE ? false : true);
 }
@@ -288,6 +270,7 @@ static void wakeup_main(void *userdata)
 	struct connection *this = userdata;
 	struct impl *impl = this->impl;
 
+	spa_log_debug(impl->log, "wakeup main impl:%p", impl);
 	spa_loop_utils_enable_idle(impl->utils, this->dispatch_event, true);
 }
 

@@ -1,26 +1,6 @@
-/* PipeWire
- *
- * Copyright © 2019 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <spa/utils/result.h>
 
@@ -59,13 +39,13 @@ struct resource_data {
 #define pw_metadata_resource_property(r,...)        \
         pw_metadata_resource(r,property,0,__VA_ARGS__)
 
-static int metadata_property(void *object,
+static int metadata_property(void *data,
 			uint32_t subject,
 			const char *key,
 			const char *type,
 			const char *value)
 {
-	struct resource_data *d = object;
+	struct resource_data *d = data;
 	struct pw_resource *resource = d->resource;
 	struct pw_impl_client *client = pw_resource_get_client(resource);
 	struct impl *impl = d->impl;
@@ -166,10 +146,10 @@ static const struct pw_resource_events impl_resource_events = {
 };
 
 static int
-global_bind(void *_data, struct pw_impl_client *client, uint32_t permissions,
+global_bind(void *object, struct pw_impl_client *client, uint32_t permissions,
             uint32_t version, uint32_t id)
 {
-	struct impl *impl = _data;
+	struct impl *impl = object;
 	struct pw_resource *resource;
 	struct resource_data *data;
 
@@ -254,7 +234,7 @@ static const struct pw_resource_events global_resource_events = {
 	.destroy = global_resource_destroy,
 };
 
-void *
+struct pw_metadata *
 pw_metadata_new(struct pw_context *context, struct pw_resource *resource,
 		   struct pw_properties *properties)
 {
@@ -285,6 +265,7 @@ pw_metadata_new(struct pw_context *context, struct pw_resource *resource,
 	impl->global = pw_global_new(context,
 			PW_TYPE_INTERFACE_Metadata,
 			PW_VERSION_METADATA,
+			PW_METADATA_PERM_MASK,
 			properties,
 			global_bind, impl);
 	if (impl->global == NULL) {
@@ -312,5 +293,5 @@ pw_metadata_new(struct pw_context *context, struct pw_resource *resource,
 			&impl->resource_listener,
 			&global_resource_events, impl);
 
-	return impl;
+	return impl->metadata;
 }

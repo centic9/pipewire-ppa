@@ -1,5 +1,8 @@
-if alsa_dep.found()
+if alsa_dep.found() and host_machine.system() == 'linux'
   subdir('alsa')
+endif
+if get_option('avb').require(host_machine.system() == 'linux', error_message: 'AVB support is only available on Linux').allowed()
+  subdir('avb')
 endif
 if get_option('audioconvert').allowed()
   subdir('audioconvert')
@@ -13,7 +16,7 @@ endif
 if get_option('audiotestsrc').allowed()
   subdir('audiotestsrc')
 endif
-if bluez_dep.found()
+if bluez_deps_found
   subdir('bluez5')
 endif
 if avcodec_dep.found()

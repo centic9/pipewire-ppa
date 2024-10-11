@@ -1,22 +1,33 @@
-audioconvert_sources = ['audioadapter.c',
+audioconvert_sources = [
+  'audioadapter.c',
   'audioconvert.c',
-  'fmtconvert.c',
-  'channelmix.c',
-  'merger.c',
-  'plugin.c',
-  'resample.c',
-  'splitter.c']
+  'plugin.c'
+]
 
 simd_cargs = []
 simd_dependencies = []
 
+audioconvert_c = static_library('audioconvert_c',
+  [ 'channelmix-ops-c.c',
+    'biquad.c',
+    'crossover.c',
+    'volume-ops-c.c',
+    'peaks-ops-c.c',
+    'resample-native-c.c',
+    'fmt-ops-c.c' ],
+  c_args : ['-Ofast', '-ffast-math'],
+  dependencies : [ spa_dep ],
+  install : false
+  )
+simd_dependencies += audioconvert_c
+
 if have_sse
   audioconvert_sse = static_library('audioconvert_sse',
     ['resample-native-sse.c',
-      'resample-peaks-sse.c',
       'volume-ops-sse.c',
+      'peaks-ops-sse.c',
       'channelmix-ops-sse.c' ],
-    c_args : [sse_args, '-O3', '-DHAVE_SSE'],
+    c_args : [sse_args, '-Ofast', '-DHAVE_SSE'],
     dependencies : [ spa_dep ],
     install : false
     )
@@ -89,15 +100,12 @@ endif
 
 audioconvert_lib = static_library('audioconvert',
   ['fmt-ops.c',
-    'biquad.c',
-    'crossover.c',
     'channelmix-ops.c',
-    'channelmix-ops-c.c',
+    'peaks-ops.c',
     'resample-native.c',
     'resample-peaks.c',
-    'fmt-ops-c.c',
-    'volume-ops.c',
-    'volume-ops-c.c' ],
+    'wavfile.c',
+    'volume-ops.c' ],
   c_args : [ simd_cargs, '-O3'],
   link_with : simd_dependencies,
   include_directories : [configinc],
@@ -126,6 +134,7 @@ test_apps = [
   'test-audioconvert',
   'test-channelmix',
   'test-fmt-ops',
+  'test-peaks',
   'test-resample',
   ]
 

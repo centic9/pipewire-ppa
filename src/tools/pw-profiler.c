@@ -1,35 +1,16 @@
-/* PipeWire
- *
- * Copyright © 2020 Wim Taymans
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2020 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
 
 #include <stdio.h>
 #include <signal.h>
 #include <getopt.h>
+#include <locale.h>
 
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
 #include <spa/pod/parser.h>
-#include <spa/debug/pod.h>
+#include <spa/debug/types.h>
 
 #include <pipewire/impl.h>
 #include <pipewire/extensions/profiler.h>
@@ -232,7 +213,7 @@ static void dump_point(struct data *d, struct point *point)
 					d4 > 0 ? d4 : 0,
 					d5 > 0 ? d5 : 0,
 					d6 > 0 ? d6 : 0,
-					(d5 > 0 && d4 > 0 && d5 > d4) ? d5 - d4 : 0,
+					(d5 > 0 && d4 >= 0 && d5 > d4) ? d5 - d4 : 0,
 					(d6 > 0 && d5 > 0 && d6 > d5) ? d6 - d5 : 0,
 					point->follower[i].status);
 		}
@@ -261,7 +242,7 @@ static void dump_scripts(struct data *d)
 
 	printf("\ndumping scripts for %d followers\n", d->n_followers);
 
-	out = fopen("Timing1.plot", "w");
+	out = fopen("Timing1.plot", "we");
 	if (out == NULL) {
 		pw_log_error("Can't open Timing1.plot: %m");
 	} else {
@@ -281,7 +262,7 @@ static void dump_scripts(struct data *d)
 		fclose(out);
 	}
 
-	out = fopen("Timing2.plot", "w");
+	out = fopen("Timing2.plot", "we");
 	if (out == NULL) {
 		pw_log_error("Can't open Timing2.plot: %m");
 	} else {
@@ -297,7 +278,7 @@ static void dump_scripts(struct data *d)
 		fclose(out);
 	}
 
-	out = fopen("Timing3.plot", "w");
+	out = fopen("Timing3.plot", "we");
 	if (out == NULL) {
 		pw_log_error("Can't open Timing3.plot: %m");
 	} else {
@@ -327,7 +308,7 @@ static void dump_scripts(struct data *d)
 		fclose(out);
 	}
 
-	out = fopen("Timing4.plot", "w");
+	out = fopen("Timing4.plot", "we");
 	if (out == NULL) {
 		pw_log_error("Can't open Timing4.plot: %m");
 	} else {
@@ -354,7 +335,7 @@ static void dump_scripts(struct data *d)
 		fclose(out);
 	}
 
-	out = fopen("Timing5.plot", "w");
+	out = fopen("Timing5.plot", "we");
 	if (out == NULL) {
 		pw_log_error("Can't open Timing5.plot: %m");
 	} else {
@@ -380,7 +361,7 @@ static void dump_scripts(struct data *d)
 			"unset output\n");
 		fclose(out);
 	}
-	out = fopen("Timings.html", "w");
+	out = fopen("Timings.html", "we");
 	if (out == NULL) {
 		pw_log_error("Can't open Timings.html: %m");
 	} else {
@@ -408,7 +389,7 @@ static void dump_scripts(struct data *d)
 		fclose(out);
 	}
 
-	out = fopen("generate_timings.sh", "w");
+	out = fopen("generate_timings.sh", "we");
 	if (out == NULL) {
 		pw_log_error("Can't open generate_timings.sh: %m");
 	} else {
@@ -565,6 +546,7 @@ int main(int argc, char *argv[])
 	};
 	int c;
 
+	setlocale(LC_ALL, "");
 	pw_init(&argc, &argv);
 
 	while ((c = getopt_long(argc, argv, "hVr:o:", long_options, NULL)) != -1) {
@@ -622,7 +604,7 @@ int main(int argc, char *argv[])
 
 	data.filename = opt_output;
 
-	data.output = fopen(data.filename, "w");
+	data.output = fopen(data.filename, "we");
 	if (data.output == NULL) {
 		fprintf(stderr, "Can't open file %s: %m\n", data.filename);
 		return -1;
