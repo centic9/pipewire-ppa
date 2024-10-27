@@ -1,3 +1,10 @@
+pipewire (1.0.5-1ubuntu2) noble; urgency=medium
+
+  * d/p/snapshot: Fix missing V4L2 sources that manifest in Snapshot failing
+    to find a camera (LP: #2061687).
+
+ -- Nathan Pratta Teodosio <nathan.teodosio@canonical.com>  Tue, 08 Oct 2024 17:02:49 +0200
+
 pipewire (1.0.5-1ubuntu1) noble; urgency=medium
 
   * Patch to handle long SysEx messages in MIDI bridge (LP: #2067338)
