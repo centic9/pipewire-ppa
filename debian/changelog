@@ -1,3 +1,9 @@
+pipewire (1.0.5-1ubuntu3~ppa1) noble; urgency=medium
+
+  * Re-apply patch to disable dontmove.
+
+ -- Dominik Stadler (Ubuntu key) <dominik.stadler@gmx.at>  Sun, 27 Oct 2024 09:48:27 +0100
+
 pipewire (1.0.5-1ubuntu2) noble; urgency=medium
 
   * d/p/snapshot: Fix missing V4L2 sources that manifest in Snapshot failing
@@ -16,7 +22,6 @@ pipewire (1.0.5-1ubuntu2~ppa1) noble; urgency=medium
   * Apply patch to allow moving of all devices to latest pipewire
 
  -- Dominik Stadler (Ubuntu key) <dominik.stadler@gmx.at>  Fri, 11 Oct 2024 13:22:36 +0200
->>>>>>> ppa/1.0.5-1ubuntu1
 
 pipewire (1.0.5-1ubuntu1) noble; urgency=medium
 
