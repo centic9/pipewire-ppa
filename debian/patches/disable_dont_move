@@ -1,0 +1,14 @@
+Index: git/src/modules/module-protocol-pulse/pulse-server.c
+===================================================================
+--- git.orig/src/modules/module-protocol-pulse/pulse-server.c	2024-10-11 13:37:19.514863750 +0200
++++ git/src/modules/module-protocol-pulse/pulse-server.c	2024-10-11 13:39:10.487157563 +0200
+@@ -4774,9 +4774,6 @@
+ 	info = o->info;
+ 	if (info == NULL || info->props == NULL)
+ 		return -EINVAL;
+-	if (spa_atob(spa_dict_lookup(info->props, PW_KEY_NODE_DONT_RECONNECT)))
+-		return -EINVAL;
+-
+ 	if ((dev = find_device(client, index_device, name_device, sink, NULL)) == NULL)
+ 		return -ENOENT;
+ 

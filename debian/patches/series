@@ -25,3 +25,4 @@ snap/snap-policy-fix-memory-leak.patch
 0001_copy-events-to-right-offset.patch
 
 git_fix_videoacl.patch
+disable_dont_move
