@@ -1,68 +1,1233 @@
-Description: Fix Pipewire missing V4L2 sources.
- spa: v4l2: Use systemd-logind to listen for access changes
- ,
- There is a race between logind applying ACLs to allow the active session
- of a locally present user access to devices with a udev uaccess tag
- (like /dev/video# nodes) getting applied vs wireplumber/pipewire starting.
- .
- Wireplumber/pipewire are part of the (user) default.target, which gets
- started as soon as a user logs in and systemd --user is started for that
- user, where as logind only starts applying the ACLs after the gnome-shell
- associated logind session has been created.
- .
- This race may cause pipewire to not see v4l2 video sources at login,
- this can be reproduced with these steps:
- .
- 1. sudo setfacl --remove-all /dev/video*
- 2. systemctl --user restart pipewire
- 3. Now wp-ctl status will not show any video devices
-    (like if pipewire was started before the udev uaccess ACLs got applied)
- 4. Do a switch to another (test) user without logging out, e.g. in GNOME
-    go to the top right system menu press the power on/off icon and select
-    "Switch User..."
- 5. Switch back to your normal user. Run getfacl /dev/video0 this will show
-    your user has access now.
- 6. wp-ctl status should show the camera now, but it does not.
- .
- Fix pipewire not seeing v4l2 sources in this case by making v4l2-udev
- monitor systemd-logind session changes and redoing the access() checks
- on /dev/video# nodes when the session changes.
-Author: Hans de Goede <hdegoede@redhat.com>
-Adjuster: Nathan Pratta Teodosio <nathan.teodosio@canonical.com>
-Bug-Ubuntu: https://launchpad.net/bugs/2061687
-Origin: https://gitlab.freedesktop.org/pipewire/pipewire/-/merge_requests/2118.diff
+From 3a4374ec096dfba10d188764d892f32ab97eab8c Mon Sep 17 00:00:00 2001
+From: Wim Taymans <wtaymans@redhat.com>
+Date: Fri, 26 Jan 2024 13:28:07 +0100
+Subject: [PATCH 01/15] meson: fix build with missing libudev-devel
 
---- pipewire-1.0.5.orig/spa/plugins/v4l2/meson.build
-+++ pipewire-1.0.5/spa/plugins/v4l2/meson.build
-@@ -2,9 +2,14 @@ v4l2_sources = ['v4l2.c',
+(cherry picked from commit b4c7973d495daaa6e011a0ba1a87274252e7b71e)
+---
+ spa/meson.build                   | 3 ++-
+ spa/plugins/alsa/alsa.c           | 5 +++++
+ spa/plugins/alsa/meson.build      | 8 ++++++--
+ spa/plugins/libcamera/meson.build | 2 +-
+ spa/plugins/meson.build           | 5 ++---
+ spa/plugins/v4l2/meson.build      | 9 +++++++--
+ spa/plugins/v4l2/v4l2.c           | 5 +++++
+ 7 files changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/spa/meson.build b/spa/meson.build
+index db0a844258..203ea343c3 100644
+--- a/spa/meson.build
++++ b/spa/meson.build
+@@ -104,7 +104,8 @@ if get_option('spa-plugins').allowed()
+   cdata.set('HAVE_ALSA_COMPRESS_OFFLOAD', compress_offload_option.allowed())
+ 
+   # common dependencies
+-  libudev_dep = dependency('libudev', required: alsa_dep.found() or get_option('udev').enabled() or get_option('v4l2').enabled())
++  libudev_dep = dependency('libudev', required: get_option('udev').enabled())
++  cdata.set('HAVE_LIBUDEV', libudev_dep.found())
+   summary({'Udev': libudev_dep.found()}, bool_yn: true, section: 'Backend')
+ 
+   subdir('plugins')
+diff --git a/spa/plugins/alsa/alsa.c b/spa/plugins/alsa/alsa.c
+index fad5183bc1..9cafa18dda 100644
+--- a/spa/plugins/alsa/alsa.c
++++ b/spa/plugins/alsa/alsa.c
+@@ -38,8 +38,13 @@ int spa_handle_factory_enum(const struct spa_handle_factory **factory, uint32_t
+ 		*factory = &spa_alsa_sink_factory;
+ 		break;
+ 	case 2:
++#ifdef HAVE_LIBUDEV
+ 		*factory = &spa_alsa_udev_factory;
+ 		break;
++#else
++		(*index)++;
++		SPA_FALLTHROUGH;
++#endif
+ 	case 3:
+ 		*factory = &spa_alsa_pcm_device_factory;
+ 		break;
+diff --git a/spa/plugins/alsa/meson.build b/spa/plugins/alsa/meson.build
+index 5eb2a18106..4282e0bbfe 100644
+--- a/spa/plugins/alsa/meson.build
++++ b/spa/plugins/alsa/meson.build
+@@ -1,11 +1,10 @@
+ subdir('acp')
+ subdir('mixer')
+ 
+-spa_alsa_dependencies = [ spa_dep, alsa_dep, libudev_dep, mathlib, epoll_shim_dep, libinotify_dep ]
++spa_alsa_dependencies = [ spa_dep, alsa_dep, mathlib, epoll_shim_dep, libinotify_dep ]
+ 
+ spa_alsa_sources = ['alsa.c',
+                 'alsa.h',
+-                'alsa-udev.c',
+                 'alsa-acp-device.c',
+                 'alsa-pcm-device.c',
+                 'alsa-pcm-sink.c',
+@@ -14,6 +13,11 @@ spa_alsa_sources = ['alsa.c',
+                 'alsa-seq-bridge.c',
+                 'alsa-seq.c']
+ 
++if libudev_dep.found()
++spa_alsa_sources += [ 'alsa-udev.c' ]
++spa_alsa_dependencies += [ libudev_dep ]
++endif
++
+ if compress_offload_option.allowed()
+   spa_alsa_sources += ['alsa-compress-offload-sink.c',
+                        'alsa-compress-offload-device.c',
+diff --git a/spa/plugins/libcamera/meson.build b/spa/plugins/libcamera/meson.build
+index 5f36b286cf..9f396aba2d 100644
+--- a/spa/plugins/libcamera/meson.build
++++ b/spa/plugins/libcamera/meson.build
+@@ -8,6 +8,6 @@ libcamera_sources = [
+ libcameralib = shared_library('spa-libcamera',
+   libcamera_sources,
+   include_directories : [ configinc ],
+-  dependencies : [ spa_dep, libudev_dep, libcamera_dep, pthread_lib  ],
++  dependencies : [ spa_dep, libcamera_dep, pthread_lib  ],
+   install : true,
+   install_dir : spa_plugindir / 'libcamera')
+diff --git a/spa/plugins/meson.build b/spa/plugins/meson.build
+index 2100046918..97ba78af7b 100644
+--- a/spa/plugins/meson.build
++++ b/spa/plugins/meson.build
+@@ -45,10 +45,9 @@ if have_vulkan
+ endif
+ 
+ v4l2_header_found = cc.has_header('linux/videodev2.h', required: get_option('v4l2'))
+-v4l2_supported = libudev_dep.found() and v4l2_header_found
+ summary({'V4L2 kernel header': v4l2_header_found}, bool_yn: true, section: 'Backend')
+-summary({'V4L2 enabled': v4l2_supported}, bool_yn: true, section: 'Backend')
+-if v4l2_supported
++summary({'V4L2 enabled': v4l2_header_found}, bool_yn: true, section: 'Backend')
++if v4l2_header_found
+   subdir('v4l2')
+ endif
+ if libcamera_dep.found()
+diff --git a/spa/plugins/v4l2/meson.build b/spa/plugins/v4l2/meson.build
+index 648583f32c..1dfe92cf89 100644
+--- a/spa/plugins/v4l2/meson.build
++++ b/spa/plugins/v4l2/meson.build
+@@ -1,10 +1,15 @@
+ v4l2_sources = ['v4l2.c',
                  'v4l2-device.c',
-                 'v4l2-udev.c',
+-                'v4l2-udev.c',
                  'v4l2-source.c']
-+v4l2_dependencies = [ spa_dep, libinotify_dep, libudev_dep ]
-+if systemd_dep.found()
-+  v4l2_dependencies += [ systemd_dep ]
++v4l2_dependencies = [ spa_dep, libinotify_dep ]
++
++if libudev_dep.found()
++v4l2_sources += [ 'v4l2-udev.c' ]
++v4l2_dependencies += [ libudev_dep ]
 +endif
  
  v4l2lib = shared_library('spa-v4l2',
                            v4l2_sources,
-+                          include_directories : [ configinc ],
 -                          dependencies : [ spa_dep, libudev_dep, libinotify_dep ],
 +                          dependencies : v4l2_dependencies,
                            install : true,
                            install_dir : spa_plugindir / 'v4l2')
---- pipewire-1.0.5.orig/spa/plugins/v4l2/v4l2-udev.c
-+++ pipewire-1.0.5/spa/plugins/v4l2/v4l2-udev.c
-@@ -23,6 +23,9 @@
+diff --git a/spa/plugins/v4l2/v4l2.c b/spa/plugins/v4l2/v4l2.c
+index 69bd7272a4..6ff7ec6f11 100644
+--- a/spa/plugins/v4l2/v4l2.c
++++ b/spa/plugins/v4l2/v4l2.c
+@@ -27,8 +27,13 @@ int spa_handle_factory_enum(const struct spa_handle_factory **factory,
+ 		*factory = &spa_v4l2_source_factory;
+ 		break;
+ 	case 1:
++#ifdef HAVE_LIBUDEV
+ 		*factory = &spa_v4l2_udev_factory;
+ 		break;
++#else
++		(*index)++;
++		SPA_FALLTHROUGH;
++#endif
+ 	case 2:
+ 		*factory = &spa_v4l2_device_factory;
+ 		break;
+-- 
+GitLab
+
+
+From 5b6fae48d3f5daf3e18e4005f4aefec717fe10b2 Mon Sep 17 00:00:00 2001
+From: Wim Taymans <wtaymans@redhat.com>
+Date: Tue, 6 Feb 2024 22:41:54 +0100
+Subject: [PATCH 02/15] v4l2: include config.h to check for udev
+
+(cherry picked from commit 1de71d96c6c45d8e247ef37e50d7a0f2036dadd1)
+---
+ spa/plugins/v4l2/meson.build | 1 +
+ spa/plugins/v4l2/v4l2.c      | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/spa/plugins/v4l2/meson.build b/spa/plugins/v4l2/meson.build
+index 1dfe92cf89..de1958060b 100644
+--- a/spa/plugins/v4l2/meson.build
++++ b/spa/plugins/v4l2/meson.build
+@@ -10,6 +10,7 @@ endif
+ 
+ v4l2lib = shared_library('spa-v4l2',
+                           v4l2_sources,
++                          include_directories : [ configinc ],
+                           dependencies : v4l2_dependencies,
+                           install : true,
+                           install_dir : spa_plugindir / 'v4l2')
+diff --git a/spa/plugins/v4l2/v4l2.c b/spa/plugins/v4l2/v4l2.c
+index 6ff7ec6f11..c4d83af7bc 100644
+--- a/spa/plugins/v4l2/v4l2.c
++++ b/spa/plugins/v4l2/v4l2.c
+@@ -7,6 +7,7 @@
  #include <spa/support/plugin.h>
+ #include <spa/support/log.h>
+ 
++#include "config.h"
+ #include "v4l2.h"
+ 
+ extern const struct spa_handle_factory spa_v4l2_source_factory;
+-- 
+GitLab
+
+
+From 2a02ef384d51262249d878d96dc5f3f0272749bb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20P=C5=91cze?= <pobrn@protonmail.com>
+Date: Sat, 6 Jan 2024 20:31:32 +0100
+Subject: [PATCH 03/15] spa: v4l2: remove `ignored` flag
+
+Nothing sets it.
+
+(cherry picked from commit 66c7966b75a217bdbd74fe9f7dc2a334640d1e6f)
+---
+ spa/plugins/v4l2/v4l2-udev.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index e1c844ba53..dc82fc4478 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -37,7 +37,6 @@ struct device {
+ 	struct udev_device *dev;
+ 	int inotify_wd;
+ 	unsigned int accessible:1;
+-	unsigned int ignored:1;
+ 	unsigned int emitted:1;
+ };
+ 
+@@ -368,8 +367,6 @@ static void process_device(struct impl *this, uint32_t action, struct udev_devic
+ 		return;
+ 
+ 	device = find_device(this, id);
+-	if (device && device->ignored)
+-		return;
+ 
+ 	switch (action) {
+ 	case ACTION_ADD:
+-- 
+GitLab
+
+
+From 98f2b182774a7fffc58d6b7785e6828275efb942 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20P=C5=91cze?= <pobrn@protonmail.com>
+Date: Sun, 7 Jan 2024 02:36:05 +0100
+Subject: [PATCH 04/15] spa: alsa,v4l2: simplify inotify read loop exit
+ condition
+
+The removed condition is strictly a subset of the condition
+that is checked one line below, so remove it.
+
+(cherry picked from commit 18cfb808bd68c9189c48c78b56dce90ea1553f9c)
+---
+ spa/plugins/alsa/alsa-udev.c | 2 --
+ spa/plugins/v4l2/v4l2-udev.c | 2 --
+ 2 files changed, 4 deletions(-)
+
+diff --git a/spa/plugins/alsa/alsa-udev.c b/spa/plugins/alsa/alsa-udev.c
+index 05e0244797..aa480780ec 100644
+--- a/spa/plugins/alsa/alsa-udev.c
++++ b/spa/plugins/alsa/alsa-udev.c
+@@ -826,8 +826,6 @@ static void impl_on_notify_events(struct spa_source *source)
+ 		void *p, *e;
+ 
+ 		len = read(source->fd, &buf, sizeof(buf));
+-		if (len < 0 && errno != EAGAIN)
+-			break;
+ 		if (len <= 0)
+ 			break;
+ 
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index dc82fc4478..733f3da2a3 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -428,8 +428,6 @@ static void impl_on_notify_events(struct spa_source *source)
+ 		void *p, *e;
+ 
+ 		len = read(source->fd, &buf, sizeof(buf));
+-		if (len < 0 && errno != EAGAIN)
+-			break;
+ 		if (len <= 0)
+ 			break;
+ 
+-- 
+GitLab
+
+
+From dd03036667a5fe159cc5ef2a4c06e7ddae3812fe Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20P=C5=91cze?= <pobrn@protonmail.com>
+Date: Sun, 7 Jan 2024 02:39:48 +0100
+Subject: [PATCH 05/15] spa: alsa: handle `IN_IGNORED` instead of
+ `IN_DELETE_SELF`
+
+`IN_IGNORED` event is sent whenever the watch is removed,
+which includes when the entity is deleted among other things,
+so watch that instead of the more specific `IN_DELETE_SELF`.
+
+(cherry picked from commit 04b8a0c2153d2eeda19151ae502cdad473df0a71)
+---
+ spa/plugins/alsa/alsa-udev.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/spa/plugins/alsa/alsa-udev.c b/spa/plugins/alsa/alsa-udev.c
+index aa480780ec..ca6ce67023 100644
+--- a/spa/plugins/alsa/alsa-udev.c
++++ b/spa/plugins/alsa/alsa-udev.c
+@@ -857,7 +857,7 @@ static void impl_on_notify_events(struct spa_source *source)
+ 					process_card(this, ACTION_DISABLE, card->udev_device);
+ 			}
+ 			/* /dev/snd/ might have been removed */
+-			if ((event->mask & (IN_DELETE_SELF | IN_MOVE_SELF)))
++			if ((event->mask & (IN_IGNORED | IN_MOVE_SELF)))
+ 				deleted = true;
+ 		}
+ 	}
+@@ -876,7 +876,7 @@ static int start_inotify(struct impl *this)
+ 		return -errno;
+ 
+ 	res = inotify_add_watch(notify_fd, "/dev/snd",
+-			IN_ATTRIB | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF);
++			IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVE_SELF);
+ 	if (res < 0) {
+ 		res = -errno;
+ 		close(notify_fd);
+-- 
+GitLab
+
+
+From 6aea34ff72c2c904733b2c3a51056e3409c4cffc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20P=C5=91cze?= <pobrn@protonmail.com>
+Date: Tue, 9 Jan 2024 15:24:49 +0100
+Subject: [PATCH 06/15] spa: alsa,v4l2: use proper enum for action
+
+An enum provides better debugging experience
+and makes the source code easier to grasp.
+
+(cherry picked from commit 5fa34988faa11b12cc9dcad6c0667b6efceb6bc5)
+---
+ spa/plugins/alsa/alsa-udev.c | 10 ++++++----
+ spa/plugins/v4l2/v4l2-udev.c | 10 ++++++----
+ 2 files changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/spa/plugins/alsa/alsa-udev.c b/spa/plugins/alsa/alsa-udev.c
+index ca6ce67023..923b2188c5 100644
+--- a/spa/plugins/alsa/alsa-udev.c
++++ b/spa/plugins/alsa/alsa-udev.c
+@@ -31,9 +31,11 @@
+ 
+ #define MAX_CARDS	64
+ 
+-#define ACTION_ADD	0
+-#define ACTION_REMOVE	1
+-#define ACTION_DISABLE	2
++enum action {
++	ACTION_ADD,
++	ACTION_REMOVE,
++	ACTION_DISABLE,
++};
+ 
+ /* Used for unavailable devices in the card structure. */
+ #define ID_DEVICE_NOT_SUPPORTED 0
+@@ -718,7 +720,7 @@ static bool check_access(struct impl *this, struct card *card)
+ 	return card->accessible;
+ }
+ 
+-static void process_card(struct impl *this, uint32_t action, struct udev_device *udev_device)
++static void process_card(struct impl *this, enum action action, struct udev_device *udev_device)
+ {
+ 	unsigned int card_nr;
+ 	struct card *card;
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index 733f3da2a3..c2a350cd91 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -28,9 +28,11 @@
+ 
+ #define MAX_DEVICES	64
+ 
+-#define ACTION_ADD	0
+-#define ACTION_REMOVE	1
+-#define ACTION_DISABLE	2
++enum action {
++	ACTION_ADD,
++	ACTION_REMOVE,
++	ACTION_DISABLE,
++};
+ 
+ struct device {
+ 	uint32_t id;
+@@ -357,7 +359,7 @@ static bool check_access(struct impl *this, struct device *device)
+ 	return device->accessible;
+ }
+ 
+-static void process_device(struct impl *this, uint32_t action, struct udev_device *dev)
++static void process_device(struct impl *this, enum action action, struct udev_device *dev)
+ {
+ 	uint32_t id;
+ 	struct device *device;
+-- 
+GitLab
+
+
+From d9fd1d4b28b9bb3150123c3a49a4649aa9b8b0ca Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20P=C5=91cze?= <pobrn@protonmail.com>
+Date: Tue, 9 Jan 2024 15:54:52 +0100
+Subject: [PATCH 07/15] spa: v4l2: use proper log topic in udev monitor
+
+(cherry picked from commit 57a5417703e83745a6fb41b7333e47140d14afb2)
+---
+ spa/plugins/v4l2/v4l2-udev.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index c2a350cd91..1358d2c27c 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -24,7 +24,7 @@
  #include <spa/monitor/device.h>
  #include <spa/monitor/utils.h>
+ 
+-#define NAME "v4l2-udev"
++#include "v4l2.h"
+ 
+ #define MAX_DEVICES	64
+ 
+-- 
+GitLab
+
+
+From e19d9784cff3ed00ca4f3e839c50f7b6150b5c49 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20P=C5=91cze?= <pobrn@protonmail.com>
+Date: Tue, 9 Jan 2024 18:00:36 +0100
+Subject: [PATCH 08/15] spa: alsa,v4l2: avoid double lookup on inotify events
+
+Split up `process_{device,card}()` to have a separate function that does
+the lookup based on the udev device, and only use that when there is
+no available reference to the actual device/card object.
+
+(cherry picked from commit 69f9e754587e1e97c6d997a9a7d368cc14923a1a)
+---
+ spa/plugins/alsa/alsa-udev.c | 63 ++++++++++++++++++------------------
+ spa/plugins/v4l2/v4l2-udev.c | 57 ++++++++++++++++----------------
+ 2 files changed, 61 insertions(+), 59 deletions(-)
+
+diff --git a/spa/plugins/alsa/alsa-udev.c b/spa/plugins/alsa/alsa-udev.c
+index 923b2188c5..b2f98c76ba 100644
+--- a/spa/plugins/alsa/alsa-udev.c
++++ b/spa/plugins/alsa/alsa-udev.c
+@@ -720,29 +720,16 @@ static bool check_access(struct impl *this, struct card *card)
+ 	return card->accessible;
+ }
+ 
+-static void process_card(struct impl *this, enum action action, struct udev_device *udev_device)
++static void process_card(struct impl *this, enum action action, struct card *card)
+ {
+-	unsigned int card_nr;
+-	struct card *card;
+-	bool emitted;
+-	int res;
+-
+-	if ((card_nr = get_card_nr(this, udev_device)) == SPA_ID_INVALID)
+-		return;
+-
+-	card = find_card(this, card_nr);
+-	if (card && card->ignored)
++	if (card->ignored)
+ 		return;
+ 
+ 	switch (action) {
+-	case ACTION_ADD:
+-		if (card == NULL)
+-			card = add_card(this, card_nr, udev_device);
+-		if (card == NULL)
+-			return;
++	case ACTION_ADD: {
+ 		if (!check_access(this, card))
+ 			return;
+-		res = emit_added_object_info(this, card);
++		int res = emit_added_object_info(this, card);
+ 		if (res < 0) {
+ 			if (card->ignored)
+ 				spa_log_info(this->log, "ALSA card %u unavailable (%s): it is ignored",
+@@ -761,16 +748,12 @@ static void process_card(struct impl *this, enum action action, struct udev_devi
+ 			card->unavailable = false;
+ 		}
+ 		break;
+-
++	}
+ 	case ACTION_REMOVE: {
+-		uint32_t pcm_device_id, compress_offload_device_id;
++		uint32_t pcm_device_id = card->pcm_device_id;
++		uint32_t compress_offload_device_id = card->compress_offload_device_id;
++		bool emitted = card->emitted;
+ 
+-		if (card == NULL)
+-			return;
+-
+-		emitted = card->emitted;
+-		pcm_device_id = card->pcm_device_id;
+-		compress_offload_device_id = card->compress_offload_device_id;
+ 		remove_card(this, card);
+ 
+ 		if (emitted) {
+@@ -783,8 +766,6 @@ static void process_card(struct impl *this, enum action action, struct udev_devi
+ 	}
+ 
+ 	case ACTION_DISABLE:
+-		if (card == NULL)
+-			return;
+ 		if (card->emitted) {
+ 			uint32_t pcm_device_id, compress_offload_device_id;
+ 
+@@ -802,6 +783,24 @@ static void process_card(struct impl *this, enum action action, struct udev_devi
+ 	}
+ }
+ 
++static void process_udev_device(struct impl *this, enum action action, struct udev_device *udev_device)
++{
++	unsigned int card_nr;
++	struct card *card;
++
++	if ((card_nr = get_card_nr(this, udev_device)) == SPA_ID_INVALID)
++		return;
++
++	card = find_card(this, card_nr);
++	if (action == ACTION_ADD && !card)
++		card = add_card(this, card_nr, udev_device);
++
++	if (!card)
++		return;
++
++	process_card(this, action, card);
++}
++
+ static int stop_inotify(struct impl *this)
+ {
+ 	if (this->notify.fd == -1)
+@@ -854,9 +853,9 @@ static void impl_on_notify_events(struct spa_source *source)
+ 
+ 				access = check_access(this, card);
+ 				if (access && !card->emitted)
+-					process_card(this, ACTION_ADD, card->udev_device);
++					process_card(this, ACTION_ADD, card);
+ 				else if (!access && card->emitted)
+-					process_card(this, ACTION_DISABLE, card->udev_device);
++					process_card(this, ACTION_DISABLE, card);
+ 			}
+ 			/* /dev/snd/ might have been removed */
+ 			if ((event->mask & (IN_IGNORED | IN_MOVE_SELF)))
+@@ -919,9 +918,9 @@ static void impl_on_fd_events(struct spa_source *source)
+ 	start_inotify(this);
+ 
+ 	if (spa_streq(action, "change")) {
+-		process_card(this, ACTION_ADD, udev_device);
++		process_udev_device(this, ACTION_ADD, udev_device);
+ 	} else if (spa_streq(action, "remove")) {
+-		process_card(this, ACTION_REMOVE, udev_device);
++		process_udev_device(this, ACTION_REMOVE, udev_device);
+ 	}
+ 	udev_device_unref(udev_device);
+ }
+@@ -992,7 +991,7 @@ static int enum_cards(struct impl *this)
+ 		if (udev_device == NULL)
+ 			continue;
+ 
+-		process_card(this, ACTION_ADD, udev_device);
++		process_udev_device(this, ACTION_ADD, udev_device);
+ 
+ 		udev_device_unref(udev_device);
+ 	}
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index 1358d2c27c..bc96e450a2 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -359,48 +359,51 @@ static bool check_access(struct impl *this, struct device *device)
+ 	return device->accessible;
+ }
+ 
+-static void process_device(struct impl *this, enum action action, struct udev_device *dev)
++static void process_device(struct impl *this, enum action action, struct device *device)
+ {
+-	uint32_t id;
+-	struct device *device;
+-	bool emitted;
+-
+-	if ((id = get_device_id(this, dev)) == SPA_ID_INVALID)
+-		return;
+-
+-	device = find_device(this, id);
+-
+ 	switch (action) {
+ 	case ACTION_ADD:
+-		if (device == NULL)
+-			device = add_device(this, id, dev);
+-		if (device == NULL)
+-			return;
+ 		if (!check_access(this, device))
+ 			return;
+ 		emit_object_info(this, device);
+ 		break;
++	case ACTION_REMOVE: {
++		bool emitted = device->emitted;
++		uint32_t id = device->id;
+ 
+-	case ACTION_REMOVE:
+-		if (device == NULL)
+-			return;
+-		emitted = device->emitted;
+ 		remove_device(this, device);
++
+ 		if (emitted)
+ 			spa_device_emit_object_info(&this->hooks, id, NULL);
+ 		break;
+-
++	}
+ 	case ACTION_DISABLE:
+-		if (device == NULL)
+-			return;
+ 		if (device->emitted) {
+ 			device->emitted = false;
+-			spa_device_emit_object_info(&this->hooks, id, NULL);
++			spa_device_emit_object_info(&this->hooks, device->id, NULL);
+ 		}
+ 		break;
+ 	}
+ }
+ 
++static void process_udev_device(struct impl *this, enum action action, struct udev_device *udev_device)
++{
++	struct device *device;
++	uint32_t id;
++
++	if ((id = get_device_id(this, udev_device)) == SPA_ID_INVALID)
++		return;
++
++	device = find_device(this, id);
++	if (action == ACTION_ADD && !device)
++		device = add_device(this, id, udev_device);
++
++	if (!device)
++		return;
++
++	process_device(this, action, device);
++}
++
+ static int stop_inotify(struct impl *this)
+ {
+ 	if (this->notify.fd == -1)
+@@ -453,9 +456,9 @@ static void impl_on_notify_events(struct spa_source *source)
+ 
+ 				bool access = check_access(this, device);
+ 				if (access && !device->emitted)
+-					process_device(this, ACTION_ADD, device->dev);
++					process_device(this, ACTION_ADD, device);
+ 				else if (!access && device->emitted)
+-					process_device(this, ACTION_DISABLE, device->dev);
++					process_device(this, ACTION_DISABLE, device);
+ 			}
+ 		}
+ 	}
+@@ -504,9 +507,9 @@ static void impl_on_fd_events(struct spa_source *source)
+ 
+ 	if (spa_streq(action, "add") ||
+ 	    spa_streq(action, "change")) {
+-		process_device(this, ACTION_ADD, dev);
++		process_udev_device(this, ACTION_ADD, dev);
+ 	} else if (spa_streq(action, "remove")) {
+-		process_device(this, ACTION_REMOVE, dev);
++		process_udev_device(this, ACTION_REMOVE, dev);
+ 	}
+ 	udev_device_unref(dev);
+ }
+@@ -576,7 +579,7 @@ static int enum_devices(struct impl *this)
+ 		if (dev == NULL)
+ 			continue;
+ 
+-		process_device(this, ACTION_ADD, dev);
++		process_udev_device(this, ACTION_ADD, dev);
+ 
+ 		udev_device_unref(dev);
+ 	}
+-- 
+GitLab
+
+
+From 37031a21ea72755be6df9ab88ea6c45d850108d9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20P=C5=91cze?= <pobrn@protonmail.com>
+Date: Tue, 9 Jan 2024 18:25:39 +0100
+Subject: [PATCH 09/15] spa: v4l2: handle `IN_IGNORED` events from inotify
+
+(cherry picked from commit 0158b5dcb6259b1cee0c2b90d3d65a774a21dd61)
+---
+ spa/plugins/v4l2/v4l2-udev.c | 21 ++++++++++++---------
+ 1 file changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index bc96e450a2..35305fc03b 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -441,25 +441,28 @@ static void impl_on_notify_events(struct spa_source *source)
+ 		for (p = &buf; p < e;
+ 		    p = SPA_PTROFF(p, sizeof(struct inotify_event) + event->len, void)) {
+ 			event = (const struct inotify_event *) p;
++			struct device *device = NULL;
+ 
+-			if ((event->mask & IN_ATTRIB)) {
+-				struct device *device = NULL;
+-
+-				for (size_t i = 0; i < this->n_devices; i++) {
+-					if (this->devices[i].inotify_wd == event->wd) {
+-						device = &this->devices[i];
+-						break;
+-					}
++			for (size_t i = 0; i < this->n_devices; i++) {
++				if (this->devices[i].inotify_wd == event->wd) {
++					device = &this->devices[i];
++					break;
+ 				}
++			}
+ 
+-				spa_assert(device);
++			if (!device)
++				continue;
+ 
++			if (event->mask & IN_ATTRIB) {
+ 				bool access = check_access(this, device);
+ 				if (access && !device->emitted)
+ 					process_device(this, ACTION_ADD, device);
+ 				else if (!access && device->emitted)
+ 					process_device(this, ACTION_DISABLE, device);
+ 			}
++
++			if (event->mask & IN_IGNORED)
++				device->inotify_wd = -1;
+ 		}
+ 	}
+ }
+-- 
+GitLab
+
+
+From 062a1039e955631cc9a9f7f615ccdb797121125a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20P=C5=91cze?= <pobrn@protonmail.com>
+Date: Mon, 5 Feb 2024 23:32:24 +0100
+Subject: [PATCH 10/15] spa: alsa,v4l2: avoid double access check on inotify
+ events
+
+Previously both `impl_on_notify_events()` and `process_{device,card}()`
+called `check_access()`. Avoid that by merging `ACTION_ADD` and
+`ACTION_DISABLE` into a single `ACTION_CHANGE` and let `process_{device,card}()`
+call `check_access()` and decide what to do.
+
+(cherry picked from commit ad975c93ee633cb0e9c0284e3979cc413af8d898)
+---
+ spa/plugins/alsa/alsa-udev.c | 80 +++++++++++++++---------------------
+ spa/plugins/v4l2/v4l2-udev.c | 36 +++++++---------
+ 2 files changed, 47 insertions(+), 69 deletions(-)
+
+diff --git a/spa/plugins/alsa/alsa-udev.c b/spa/plugins/alsa/alsa-udev.c
+index b2f98c76ba..c386c8d7c9 100644
+--- a/spa/plugins/alsa/alsa-udev.c
++++ b/spa/plugins/alsa/alsa-udev.c
+@@ -32,9 +32,8 @@
+ #define MAX_CARDS	64
+ 
+ enum action {
+-	ACTION_ADD,
++	ACTION_CHANGE,
+ 	ACTION_REMOVE,
+-	ACTION_DISABLE,
+ };
+ 
+ /* Used for unavailable devices in the card structure. */
+@@ -726,26 +725,34 @@ static void process_card(struct impl *this, enum action action, struct card *car
+ 		return;
+ 
+ 	switch (action) {
+-	case ACTION_ADD: {
+-		if (!check_access(this, card))
+-			return;
+-		int res = emit_added_object_info(this, card);
+-		if (res < 0) {
+-			if (card->ignored)
+-				spa_log_info(this->log, "ALSA card %u unavailable (%s): it is ignored",
+-						card->card_nr, spa_strerror(res));
+-			else if (!card->unavailable)
+-				spa_log_info(this->log, "ALSA card %u unavailable (%s): wait for it",
+-						card->card_nr, spa_strerror(res));
+-			else
+-				spa_log_debug(this->log, "ALSA card %u still unavailable (%s)",
+-						card->card_nr, spa_strerror(res));
+-			card->unavailable = true;
+-		} else {
+-			if (card->unavailable)
+-				spa_log_info(this->log, "ALSA card %u now available",
+-						card->card_nr);
+-			card->unavailable = false;
++	case ACTION_CHANGE: {
++		check_access(this, card);
++		if (card->accessible && !card->emitted) {
++			int res = emit_added_object_info(this, card);
++			if (res < 0) {
++				if (card->ignored)
++					spa_log_info(this->log, "ALSA card %u unavailable (%s): it is ignored",
++							card->card_nr, spa_strerror(res));
++				else if (!card->unavailable)
++					spa_log_info(this->log, "ALSA card %u unavailable (%s): wait for it",
++							card->card_nr, spa_strerror(res));
++				else
++					spa_log_debug(this->log, "ALSA card %u still unavailable (%s)",
++							card->card_nr, spa_strerror(res));
++				card->unavailable = true;
++			} else {
++				if (card->unavailable)
++					spa_log_info(this->log, "ALSA card %u now available",
++							card->card_nr);
++				card->unavailable = false;
++			}
++		} else if (!card->accessible && card->emitted) {
++			card->emitted = false;
++
++			if (card->pcm_device_id != ID_DEVICE_NOT_SUPPORTED)
++				spa_device_emit_object_info(&this->hooks, card->pcm_device_id, NULL);
++			if (card->compress_offload_device_id != ID_DEVICE_NOT_SUPPORTED)
++				spa_device_emit_object_info(&this->hooks, card->compress_offload_device_id, NULL);
+ 		}
+ 		break;
+ 	}
+@@ -764,22 +771,6 @@ static void process_card(struct impl *this, enum action action, struct card *car
+ 		}
+ 		break;
+ 	}
+-
+-	case ACTION_DISABLE:
+-		if (card->emitted) {
+-			uint32_t pcm_device_id, compress_offload_device_id;
+-
+-			pcm_device_id = card->pcm_device_id;
+-			compress_offload_device_id = card->compress_offload_device_id;
+-
+-			card->emitted = false;
+-
+-			if (pcm_device_id != ID_DEVICE_NOT_SUPPORTED)
+-				spa_device_emit_object_info(&this->hooks, pcm_device_id, NULL);
+-			if (compress_offload_device_id != ID_DEVICE_NOT_SUPPORTED)
+-				spa_device_emit_object_info(&this->hooks, compress_offload_device_id, NULL);
+-		}
+-		break;
+ 	}
+ }
+ 
+@@ -792,7 +783,7 @@ static void process_udev_device(struct impl *this, enum action action, struct ud
+ 		return;
+ 
+ 	card = find_card(this, card_nr);
+-	if (action == ACTION_ADD && !card)
++	if (action == ACTION_CHANGE && !card)
+ 		card = add_card(this, card_nr, udev_device);
+ 
+ 	if (!card)
+@@ -844,18 +835,13 @@ static void impl_on_notify_events(struct spa_source *source)
+ 
+ 			/* card becomes accessible or not busy */
+ 			if ((event->mask & (IN_ATTRIB | IN_CLOSE_WRITE))) {
+-				bool access;
+ 				if (sscanf(event->name, "controlC%u", &card_nr) != 1 &&
+ 				    sscanf(event->name, "pcmC%uD", &card_nr) != 1)
+ 					continue;
+ 				if ((card = find_card(this, card_nr)) == NULL)
+ 					continue;
+ 
+-				access = check_access(this, card);
+-				if (access && !card->emitted)
+-					process_card(this, ACTION_ADD, card);
+-				else if (!access && card->emitted)
+-					process_card(this, ACTION_DISABLE, card);
++				process_card(this, ACTION_CHANGE, card);
+ 			}
+ 			/* /dev/snd/ might have been removed */
+ 			if ((event->mask & (IN_IGNORED | IN_MOVE_SELF)))
+@@ -918,7 +904,7 @@ static void impl_on_fd_events(struct spa_source *source)
+ 	start_inotify(this);
+ 
+ 	if (spa_streq(action, "change")) {
+-		process_udev_device(this, ACTION_ADD, udev_device);
++		process_udev_device(this, ACTION_CHANGE, udev_device);
+ 	} else if (spa_streq(action, "remove")) {
+ 		process_udev_device(this, ACTION_REMOVE, udev_device);
+ 	}
+@@ -991,7 +977,7 @@ static int enum_cards(struct impl *this)
+ 		if (udev_device == NULL)
+ 			continue;
+ 
+-		process_udev_device(this, ACTION_ADD, udev_device);
++		process_udev_device(this, ACTION_CHANGE, udev_device);
+ 
+ 		udev_device_unref(udev_device);
+ 	}
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index 35305fc03b..a40e3667ef 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -29,9 +29,8 @@
+ #define MAX_DEVICES	64
+ 
+ enum action {
+-	ACTION_ADD,
++	ACTION_CHANGE,
+ 	ACTION_REMOVE,
+-	ACTION_DISABLE,
+ };
+ 
+ struct device {
+@@ -362,10 +361,14 @@ static bool check_access(struct impl *this, struct device *device)
+ static void process_device(struct impl *this, enum action action, struct device *device)
+ {
+ 	switch (action) {
+-	case ACTION_ADD:
+-		if (!check_access(this, device))
+-			return;
+-		emit_object_info(this, device);
++	case ACTION_CHANGE:
++		check_access(this, device);
++		if (device->accessible && !device->emitted) {
++			emit_object_info(this, device);
++		} else if (!device->accessible && device->emitted) {
++			device->emitted = false;
++			spa_device_emit_object_info(&this->hooks, device->id, NULL);
++		}
+ 		break;
+ 	case ACTION_REMOVE: {
+ 		bool emitted = device->emitted;
+@@ -377,12 +380,6 @@ static void process_device(struct impl *this, enum action action, struct device
+ 			spa_device_emit_object_info(&this->hooks, id, NULL);
+ 		break;
+ 	}
+-	case ACTION_DISABLE:
+-		if (device->emitted) {
+-			device->emitted = false;
+-			spa_device_emit_object_info(&this->hooks, device->id, NULL);
+-		}
+-		break;
+ 	}
+ }
+ 
+@@ -395,7 +392,7 @@ static void process_udev_device(struct impl *this, enum action action, struct ud
+ 		return;
+ 
+ 	device = find_device(this, id);
+-	if (action == ACTION_ADD && !device)
++	if (action == ACTION_CHANGE && !device)
+ 		device = add_device(this, id, udev_device);
+ 
+ 	if (!device)
+@@ -453,13 +450,8 @@ static void impl_on_notify_events(struct spa_source *source)
+ 			if (!device)
+ 				continue;
+ 
+-			if (event->mask & IN_ATTRIB) {
+-				bool access = check_access(this, device);
+-				if (access && !device->emitted)
+-					process_device(this, ACTION_ADD, device);
+-				else if (!access && device->emitted)
+-					process_device(this, ACTION_DISABLE, device);
+-			}
++			if (event->mask & IN_ATTRIB)
++				process_device(this, ACTION_CHANGE, device);
+ 
+ 			if (event->mask & IN_IGNORED)
+ 				device->inotify_wd = -1;
+@@ -510,7 +502,7 @@ static void impl_on_fd_events(struct spa_source *source)
+ 
+ 	if (spa_streq(action, "add") ||
+ 	    spa_streq(action, "change")) {
+-		process_udev_device(this, ACTION_ADD, dev);
++		process_udev_device(this, ACTION_CHANGE, dev);
+ 	} else if (spa_streq(action, "remove")) {
+ 		process_udev_device(this, ACTION_REMOVE, dev);
+ 	}
+@@ -582,7 +574,7 @@ static int enum_devices(struct impl *this)
+ 		if (dev == NULL)
+ 			continue;
+ 
+-		process_udev_device(this, ACTION_ADD, dev);
++		process_udev_device(this, ACTION_CHANGE, dev);
+ 
+ 		udev_device_unref(dev);
+ 	}
+-- 
+GitLab
+
+
+From 9599e7e3949126b609f87c2ad4a8b15eaeb7110a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20P=C5=91cze?= <pobrn@protonmail.com>
+Date: Mon, 5 Feb 2024 23:34:59 +0100
+Subject: [PATCH 11/15] spa: alsa: react to "new" udev action as well
+
+Previously, only "change" and "remove" were considered.
+
+(cherry picked from commit 84699032be0a6a8a5e0174c5ca09c1cdc7ae2148)
+---
+ spa/plugins/alsa/alsa-udev.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/spa/plugins/alsa/alsa-udev.c b/spa/plugins/alsa/alsa-udev.c
+index c386c8d7c9..9420401f0b 100644
+--- a/spa/plugins/alsa/alsa-udev.c
++++ b/spa/plugins/alsa/alsa-udev.c
+@@ -903,7 +903,7 @@ static void impl_on_fd_events(struct spa_source *source)
+ 
+ 	start_inotify(this);
+ 
+-	if (spa_streq(action, "change")) {
++	if (spa_streq(action, "add") || spa_streq(action, "change")) {
+ 		process_udev_device(this, ACTION_CHANGE, udev_device);
+ 	} else if (spa_streq(action, "remove")) {
+ 		process_udev_device(this, ACTION_REMOVE, udev_device);
+-- 
+GitLab
+
+
+From 17e6d88a6e15162aa09e6332db9459a4deddfa70 Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Wed, 7 Aug 2024 17:18:31 +0200
+Subject: [PATCH 12/15] spa: v4l2: call start_monitor() before enum_devices()
+
+This fixes 2 races wrt probing v4l2 devices:
+
+1. Before this change there was a window where a new udev device can get
+added between the udev_enumerate_scan_devices() call in enum_devices() and
+the udev_monitor_enable_receiving(this->umonitor); call. If this window was
+hit then enum_devices() would not see the device and no udev-event for it
+would be received either causing the device to not be seen.
+
+Enabling udev event monitoring before calling udev_enumerate_scan_devices()
+fixes this. Note that the code is already prepared to deal with getting
+multiple add/change events for the same udev device, so hitting the new
+race window where PipeWire may receive both an add- or change-event and
+also sees + probes the device from enum_devices() is not a problem.
+
+2. Before this change devices added by enum_devices() would not have
+inotify monitoring activated right away because notify.fd = -1 at this
+time turning start_watching_device() into a no-op.
+
+These devices without inotify monitoring would then have their access
+checked by process_device() calling check_access().
+
+Then after all devices have been enumerated start_monitor() would call
+start_inotify() which calls start_watching_device() for all devices added
+by enum_devices(). This leaves a window where the ACL can change without
+there being an inotify watch for it.
+
+Calling start_monitor() before enum_devices() puts start_inotify()
+notify before enum_devices() so that the add_device() calls done
+by enum_devices() will now successfully call start_watching_device()
+closing this window.
+
+PipeWire is somewhat likely to not notify ACL changes because of this
+because PipeWire is part of the systemd user default.target, where as
+logind only starts applying the ACLs after GNOME has created the seat
+for the GNOME session. So on first login we have PipeWire starting
+and logind applying the ACLs at the same time, which allows for the ACL
+change to hit the small race window where PipeWire is not monitoring
+for ACL changes. Fixing this second race should hopefully resolve
+issue #3960.
+
+Closes: #3960
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+(cherry picked from commit 584168caaba9277545f33b6267e9ec3a6e793ebb)
+---
+ spa/plugins/v4l2/v4l2-udev.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index a40e3667ef..4c9c6cb5cd 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -628,10 +628,10 @@ impl_device_add_listener(void *object, struct spa_hook *listener,
+ 
+ 	emit_device_info(this, true);
+ 
+-	if ((res = enum_devices(this)) < 0)
++	if ((res = start_monitor(this)) < 0)
+ 		return res;
+ 
+-	if ((res = start_monitor(this)) < 0)
++	if ((res = enum_devices(this)) < 0)
+ 		return res;
+ 
+         spa_hook_list_join(&this->hooks, &save);
+-- 
+GitLab
+
+
+From d679ea840fcd911ebbc3911df6c6d99ed65292b9 Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Wed, 7 Aug 2024 19:19:53 +0200
+Subject: [PATCH 13/15] spa: v4l2: Remove start_watching_device() loop from
+ start_inotify()
+
+Now that start_monitor() (which calls start_inotify()) is called before
+enum_devices() it no longer is necessary to call start_watching_device()
+for devices which have been enumerated before start_inotify() gets
+called (since there will not be any such devices anymore).
+
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+(cherry picked from commit 46f89d80095eb6ba0baf74dbfad82a863fa55d93)
+---
+ spa/plugins/v4l2/v4l2-udev.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index 4c9c6cb5cd..7118b62394 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -477,9 +477,6 @@ static int start_inotify(struct impl *this)
+ 
+ 	spa_loop_add_source(this->main_loop, &this->notify);
+ 
+-	for (size_t i = 0; i < this->n_devices; i++)
+-		start_watching_device(this, &this->devices[i]);
+-
+ 	return 0;
+ }
+ 
+-- 
+GitLab
+
+
+From f45926c38e91e64bb7873fc6d54cd2775bcab077 Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Mon, 9 Sep 2024 14:53:14 +0200
+Subject: [PATCH 14/15] spa: v4l2: Remove start_inotify() call from
+ impl_on_fd_events()
+
+The spa_loop_add_source() call for udev event monitoring which uses
+impl_on_fd_events() is done from start_monitor() which also unconditionally
+calls start_inotify().
+
+Since start_monitor() already always calls start_inotify() there is no
+scenario where start_inotify() has not been called yet when
+impl_on_fd_events() gets called. So the start_inotify() call in
+impl_on_fd_events() is redundant, remove it.
+
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+(cherry picked from commit ab245947e540bbcbd040b83af5081f53dd70da7b)
+---
+ spa/plugins/v4l2/v4l2-udev.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index 7118b62394..1f903047e1 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -495,8 +495,6 @@ static void impl_on_fd_events(struct spa_source *source)
+ 
+ 	spa_log_debug(this->log, "action %s", action);
+ 
+-	start_inotify(this);
+-
+ 	if (spa_streq(action, "add") ||
+ 	    spa_streq(action, "change")) {
+ 		process_udev_device(this, ACTION_CHANGE, dev);
+-- 
+GitLab
+
+
+From c5da2e30dc5fb84b63c8f42c0e056e15a1d61332 Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Tue, 10 Sep 2024 11:14:35 +0200
+Subject: [PATCH 15/15] spa: v4l2: Use systemd-logind to listen for access
+ changes
+
+There is a race between logind applying ACLs to allow the active session
+of a locally present user access to devices with a udev uaccess tag
+(like /dev/video# nodes) getting applied vs wireplumber/pipewire starting.
+
+Wireplumber/pipewire are part of the (user) default.target, which gets
+started as soon as a user logs in and systemd --user is started for that
+user, where as logind only starts applying the ACLs after the gnome-shell
+associated logind session has been created.
+
+This race may cause pipewire to not see v4l2 video sources at login,
+this can be reproduced with these steps:
+
+1. sudo setfacl --remove-all /dev/video*
+2. systemctl --user restart pipewire
+3. Now wp-ctl status will not show any video devices
+   (like if pipewire was started before the udev uaccess ACLs got applied)
+4. Do a switch to another (test) user without logging out, e.g. in GNOME
+   go to the top right system menu press the power on/off icon and select
+   "Switch User..."
+5. Switch back to your normal user. Run getfacl /dev/video0 this will show
+   your user has access now.
+6. wp-ctl status should show the camera now, but it does not.
+
+Fix pipewire not seeing v4l2 sources in this case by making v4l2-udev
+monitor systemd-logind session changes and redoing the access() checks
+on /dev/video# nodes when the session changes.
+
+Closes: #3539
+Closes: #3960
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+(cherry picked from commit 2a6ba6126410150d9b11b66f04bbccd48188aa5a)
+---
+ spa/plugins/v4l2/meson.build |  7 +++-
+ spa/plugins/v4l2/v4l2-udev.c | 81 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/spa/plugins/v4l2/meson.build b/spa/plugins/v4l2/meson.build
+index de1958060b..7ce729b0fe 100644
+--- a/spa/plugins/v4l2/meson.build
++++ b/spa/plugins/v4l2/meson.build
+@@ -4,8 +4,11 @@ v4l2_sources = ['v4l2.c',
+ v4l2_dependencies = [ spa_dep, libinotify_dep ]
+ 
+ if libudev_dep.found()
+-v4l2_sources += [ 'v4l2-udev.c' ]
+-v4l2_dependencies += [ libudev_dep ]
++  v4l2_sources += [ 'v4l2-udev.c' ]
++  v4l2_dependencies += [ libudev_dep ]
++  if systemd_dep.found()
++    v4l2_dependencies += [ systemd_dep ]
++  endif
+ endif
+ 
+ v4l2lib = shared_library('spa-v4l2',
+diff --git a/spa/plugins/v4l2/v4l2-udev.c b/spa/plugins/v4l2/v4l2-udev.c
+index 1f903047e1..714188acb6 100644
+--- a/spa/plugins/v4l2/v4l2-udev.c
++++ b/spa/plugins/v4l2/v4l2-udev.c
+@@ -24,8 +24,13 @@
+ #include <spa/monitor/device.h>
+ #include <spa/monitor/utils.h>
+ 
++#include "config.h"
+ #include "v4l2.h"
+ 
 +#ifdef HAVE_SYSTEMD
 +#include <systemd/sd-login.h>
 +#endif
++
+ #define MAX_DEVICES	64
  
- #define NAME "v4l2-udev"
- 
-@@ -61,6 +64,10 @@ struct impl {
+ enum action {
+@@ -61,6 +66,10 @@ struct impl {
  
  	struct spa_source source;
  	struct spa_source notify;
@@ -73,7 +1238,7 @@ Origin: https://gitlab.freedesktop.org/pipewire/pipewire/-/merge_requests/2118.d
  };
  
  static int impl_udev_open(struct impl *this)
-@@ -468,6 +475,12 @@ static int start_inotify(struct impl *th
+@@ -463,6 +472,12 @@ static int start_inotify(struct impl *this)
  {
  	int notify_fd;
  
@@ -86,7 +1251,7 @@ Origin: https://gitlab.freedesktop.org/pipewire/pipewire/-/merge_requests/2118.d
  	if (this->notify.fd != -1)
  		return 0;
  
-@@ -488,6 +501,65 @@ static int start_inotify(struct impl *th
+@@ -480,6 +495,65 @@ static int start_inotify(struct impl *this)
  	return 0;
  }
  
@@ -152,16 +1317,7 @@ Origin: https://gitlab.freedesktop.org/pipewire/pipewire/-/merge_requests/2118.d
  static void impl_on_fd_events(struct spa_source *source)
  {
  	struct impl *this = source->data;
-@@ -503,8 +575,6 @@ static void impl_on_fd_events(struct spa
- 
- 	spa_log_debug(this->log, "action %s", action);
- 
--	start_inotify(this);
--
- 	if (spa_streq(action, "add") ||
- 	    spa_streq(action, "change")) {
- 		process_device(this, ACTION_ADD, dev);
-@@ -537,6 +607,9 @@ static int start_monitor(struct impl *th
+@@ -527,6 +601,9 @@ static int start_monitor(struct impl *this)
  	spa_log_debug(this->log, "monitor %p", this->umonitor);
  	spa_loop_add_source(this->main_loop, &this->source);
  
@@ -171,7 +1327,7 @@ Origin: https://gitlab.freedesktop.org/pipewire/pipewire/-/merge_requests/2118.d
  	if ((res = start_inotify(this)) < 0)
  		return res;
  
-@@ -555,6 +628,7 @@ static int stop_monitor(struct impl *thi
+@@ -545,6 +622,7 @@ static int stop_monitor(struct impl *this)
  	this->umonitor = NULL;
  
  	stop_inotify(this);
@@ -179,7 +1335,7 @@ Origin: https://gitlab.freedesktop.org/pipewire/pipewire/-/merge_requests/2118.d
  
  	return 0;
  }
-@@ -701,6 +775,9 @@ impl_init(const struct spa_handle_factor
+@@ -691,6 +769,9 @@ impl_init(const struct spa_handle_factory *factory,
  
  	this = (struct impl *) handle;
  	this->notify.fd = -1;
@@ -189,3 +1345,6 @@ Origin: https://gitlab.freedesktop.org/pipewire/pipewire/-/merge_requests/2118.d
  
  	this->log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log);
  	this->main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop);
+-- 
+GitLab
+

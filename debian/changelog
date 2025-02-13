@@ -1,3 +1,11 @@
+pipewire (1.0.5-1ubuntu3) noble; urgency=medium
+
+  * debian/patches/git_fix_videoacl.patch:
+    - replace our incomplete cherry pick by the version that landed 
+      upstream as part of merge request #2145 (lp: #2061687)
+
+ -- Nathan Pratta Teodosio <nteodosio@ubuntu.com>  Thu, 13 Feb 2025 21:37:23 +0100
+
 pipewire (1.0.5-1ubuntu2) noble; urgency=medium
 
   * d/p/snapshot: Fix missing V4L2 sources that manifest in Snapshot failing
