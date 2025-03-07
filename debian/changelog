@@ -1,3 +1,9 @@
+pipewire (1.0.5-1ubuntu4~ppa1) noble; urgency=medium
+
+  * Update to latest version on Noble to keep patch for dont_move
+
+ -- Dominik Stadler (Ubuntu key) <dominik.stadler@gmx.at>  Fri, 07 Mar 2025 17:49:11 +0100
+
 pipewire (1.0.5-1ubuntu3) noble; urgency=medium
 
   * debian/patches/git_fix_videoacl.patch:
